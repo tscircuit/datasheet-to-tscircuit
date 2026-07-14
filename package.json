@@ -15,6 +15,7 @@
     "stop": "docker compose down",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "test:docker": "sh scripts/docker-smoke-test.sh",
     "format": "biome format --write .",
     "format:check": "biome format .",
     "check": "bun run typecheck && bun test && bun run build:web"

@@ -15,7 +15,7 @@ FROM oven/bun:1.3.9 AS runtime
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends poppler-utils \
+    && apt-get install -y --no-install-recommends gosu poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 ENV HOST=0.0.0.0 \
@@ -27,11 +27,11 @@ COPY --from=build --chown=bun:bun /app/tsconfig.json ./tsconfig.json
 COPY --from=build --chown=bun:bun /app/node_modules ./node_modules
 COPY --from=build --chown=bun:bun /app/dist ./dist
 COPY --from=build --chown=bun:bun /app/src ./src
+COPY --chmod=755 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN mkdir -p /app/.runtime/jobs && chown -R bun:bun /app/.runtime
 
-USER bun
-
 EXPOSE 3000
 
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["bun", "run", "start:server"]

@@ -33,6 +33,14 @@ After the image has built successfully, start the application:
 bun start
 ```
 
+The startup entrypoint prepares the bind-mounted `.runtime` directory and then
+drops privileges before running the server as the non-root `bun` user. To test
+that behavior without starting the server, run:
+
+```bash
+bun run test:docker
+```
+
 Open `http://localhost:3000`. Compose publishes the port on host loopback only,
 so it is not reachable from other machines. Generated PDFs, TSX, Circuit JSON,
 and `agent.log` files persist under `.runtime/jobs` after the container stops.

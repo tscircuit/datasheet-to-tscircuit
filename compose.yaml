@@ -14,8 +14,12 @@ services:
       - "127.0.0.1:3000:3000"
     volumes:
       - ./.runtime:/app/.runtime
-    user: bun
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
