@@ -58,7 +58,7 @@
     "react-hot-toast": "^2.5.2",
     "react-query": "^3.39.3",
     "tailwind-merge": "^2.6.0",
-    "tsci-agent": "latest",
+    "tsci-agent": "^0.1.7",
     "tscircuit": "latest",
     "zustand": "^4.5.7"
   },
