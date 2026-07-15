@@ -1,7 +1,28 @@
-import { ArrowRight, FileText, Sparkles, UploadCloud, X } from "lucide-react"
+import { ArrowRight, FileText, FlaskConical, Sparkles, UploadCloud, X } from "lucide-react"
 import { useRef, useState } from "react"
 import { createJob } from "../api"
 import type { Job } from "@/shared/job-types"
+
+const MODEL_ENABLED_STORAGE_KEY = "datasheet-create-pspice-model"
+const MODEL_EFFORT_STORAGE_KEY = "datasheet-model-effort"
+
+function getInitialModelEnabled(): boolean {
+  try {
+    const saved = window.localStorage.getItem(MODEL_ENABLED_STORAGE_KEY)
+    return saved === null ? true : saved === "true"
+  } catch {
+    return true
+  }
+}
+
+function getInitialModelEffort(): number {
+  try {
+    const saved = Number(window.localStorage.getItem(MODEL_EFFORT_STORAGE_KEY))
+    return [1, 2, 4, 8].includes(saved) ? saved : 1
+  } catch {
+    return 1
+  }
+}
 
 interface UploadPanelProps {
   on_job_created: (job: Job) => void
@@ -17,8 +38,28 @@ export function UploadPanel({ on_job_created }: UploadPanelProps) {
   const [file, setFile] = useState<File>()
   const [is_dragging, setIsDragging] = useState(false)
   const [additional_instructions, setAdditionalInstructions] = useState("")
+  const [create_pspice_model, setCreatePspiceModel] = useState(getInitialModelEnabled)
+  const [model_effort, setModelEffort] = useState(getInitialModelEffort)
   const [is_uploading, setIsUploading] = useState(false)
   const [error_message, setErrorMessage] = useState<string>()
+
+  const updateCreatePspiceModel = (is_enabled: boolean) => {
+    setCreatePspiceModel(is_enabled)
+    try {
+      window.localStorage.setItem(MODEL_ENABLED_STORAGE_KEY, String(is_enabled))
+    } catch {
+      // The preference is optional when storage is unavailable.
+    }
+  }
+
+  const updateModelEffort = (effort: number) => {
+    setModelEffort(effort)
+    try {
+      window.localStorage.setItem(MODEL_EFFORT_STORAGE_KEY, String(effort))
+    } catch {
+      // The preference is optional when storage is unavailable.
+    }
+  }
 
   const selectFile = (next_file?: File) => {
     setErrorMessage(undefined)
@@ -35,7 +76,12 @@ export function UploadPanel({ on_job_created }: UploadPanelProps) {
     setIsUploading(true)
     setErrorMessage(undefined)
     try {
-      on_job_created(await createJob(file, additional_instructions))
+      on_job_created(
+        await createJob(file, additional_instructions, {
+          create_pspice_model,
+          model_effort_multiplier: model_effort,
+        }),
+      )
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "The upload could not be started.")
       setIsUploading(false)
@@ -117,6 +163,51 @@ export function UploadPanel({ on_job_created }: UploadPanelProps) {
         />
       </label>
 
+      <section className={`upload-model-option ${create_pspice_model ? "enabled" : ""}`}>
+        <button
+          className="model-option-toggle"
+          type="button"
+          role="switch"
+          aria-checked={create_pspice_model}
+          onClick={() => updateCreatePspiceModel(!create_pspice_model)}
+        >
+          <span className="model-option-icon">
+            <FlaskConical size={17} />
+          </span>
+          <span className="model-option-copy">
+            <strong>Create PSpice model</strong>
+            <small>Starts reference setup immediately alongside component generation.</small>
+          </span>
+          <i aria-hidden="true">
+            <b />
+          </i>
+        </button>
+
+        {create_pspice_model && (
+          <div className="upload-effort-section">
+            <span>Refinement effort</span>
+            <p>Setup and component waiting are untimed. Effort only extends model refinement.</p>
+            <div
+              className="effort-picker upload-effort-picker"
+              role="group"
+              aria-label="PSpice modeling effort"
+            >
+              {[1, 2, 4, 8].map((value) => (
+                <button
+                  className={model_effort === value ? "selected" : ""}
+                  type="button"
+                  key={value}
+                  onClick={() => updateModelEffort(value)}
+                >
+                  <strong>{value}×</strong>
+                  <small>{value === 1 ? "Baseline" : `${value}× time`}</small>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </section>
+
       {error_message && (
         <p className="form-error" role="alert">
           {error_message}
@@ -130,7 +221,8 @@ export function UploadPanel({ on_job_created }: UploadPanelProps) {
           </>
         ) : (
           <>
-            Generate component <ArrowRight size={18} />
+            {create_pspice_model ? "Generate component + PSpice model" : "Generate component"}{" "}
+            <ArrowRight size={18} />
           </>
         )}
       </button>

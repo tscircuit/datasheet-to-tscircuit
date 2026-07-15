@@ -113,7 +113,6 @@ export function useActiveJob() {
       } else {
         setJob(job_event.job)
         setJobs((current_jobs) => upsertJobSummary(current_jobs, summarizeJob(job_event.job)))
-        if (job_event.job.is_complete) event_source.close()
       }
     }
 

@@ -12,9 +12,10 @@ export function AgentLogs({
   is_stopping: boolean
   on_cancel: () => void
 }) {
-  const end_ref = useRef<HTMLDivElement>(null)
+  const terminal_ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    end_ref.current?.scrollIntoView({ behavior: "smooth", block: "nearest" })
+    const terminal = terminal_ref.current
+    if (terminal) terminal.scrollTop = terminal.scrollHeight
   }, [job.logs])
 
   const is_running = !job.is_complete
@@ -47,7 +48,7 @@ export function AgentLogs({
           </a>
         </div>
       </header>
-      <div className="terminal-window" aria-live="polite">
+      <div className="terminal-window" ref={terminal_ref} aria-live="polite">
         {job.logs.length === 0 ? <span className="terminal-muted">Waiting for the agent…</span> : null}
         {job.logs.map((log) => (
           <span className={`terminal-chunk terminal-${log.stream}`} key={log.log_id}>
@@ -55,7 +56,6 @@ export function AgentLogs({
           </span>
         ))}
         {is_running && <span className="terminal-cursor" />}
-        <div ref={end_ref} />
       </div>
     </section>
   )
