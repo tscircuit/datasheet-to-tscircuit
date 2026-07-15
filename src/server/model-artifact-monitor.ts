@@ -152,12 +152,27 @@ async function selectCircuitSource(input: {
   current_benchmark?: string
   require_exact?: boolean
 }): Promise<string | undefined> {
-  const benchmark_files = await listFiles(join(input.model_dir, "benchmarks"), ".circuit.tsx")
+  const benchmarks = await readBenchmarkRecords(input.model_dir)
+  const declared_ids = benchmarks.flatMap((benchmark) =>
+    typeof benchmark.id === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(benchmark.id)
+      ? [benchmark.id]
+      : [],
+  )
   const normalized_current = input.current_benchmark?.replace(/\.circuit\.tsx$/i, "")
-  const current_file = benchmark_files.find((file) => basename(file, ".circuit.tsx") === normalized_current)
-  if (current_file) return current_file
+  if (normalized_current && declared_ids.includes(normalized_current)) {
+    const current_file = join(input.model_dir, "benchmarks", `${normalized_current}.circuit.tsx`)
+    if ((await stat(current_file).catch(() => undefined))?.isFile()) return current_file
+  }
   if (input.require_exact) return undefined
-  const newest_benchmark = await newestFile(benchmark_files)
+  const benchmark_files = declared_ids.map((id) => join(input.model_dir, "benchmarks", `${id}.circuit.tsx`))
+  const existing_files = (
+    await Promise.all(
+      benchmark_files.map(async (file) =>
+        (await stat(file).catch(() => undefined))?.isFile() ? file : undefined,
+      ),
+    )
+  ).filter((file): file is string => Boolean(file))
+  const newest_benchmark = await newestFile(existing_files)
   if (newest_benchmark) return newest_benchmark
   const component_file = join(input.model_dir, "component-with-model.circuit.tsx")
   return Bun.file(component_file).size > 0 ? component_file : undefined
@@ -253,15 +268,14 @@ async function readPersistedCircuitPreview(input: {
 }
 
 export async function listModelPreviewOptions(model_dir: string): Promise<ModelPreviewOption[]> {
-  const [benchmarks, benchmark_files] = await Promise.all([
-    readBenchmarkRecords(model_dir),
-    listFiles(join(model_dir, "benchmarks"), ".circuit.tsx"),
-  ])
+  const benchmarks = await readBenchmarkRecords(model_dir)
   return (
     await Promise.all(
-      benchmark_files.map(async (file) => {
-        const benchmark_id = basename(file, ".circuit.tsx")
-        const benchmark = benchmarks.find((candidate) => candidate.id === benchmark_id)
+      benchmarks.map(async (benchmark): Promise<ModelPreviewOption | undefined> => {
+        const benchmark_id = benchmark.id
+        if (!benchmark_id || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(benchmark_id)) return undefined
+        const file = join(model_dir, "benchmarks", `${benchmark_id}.circuit.tsx`)
+        if (!(await stat(file).catch(() => undefined))?.isFile()) return undefined
         return {
           benchmark_id,
           title: benchmark?.title ?? benchmark_id,
@@ -271,7 +285,9 @@ export async function listModelPreviewOptions(model_dir: string): Promise<ModelP
         }
       }),
     )
-  ).sort((first, second) => first.title.localeCompare(second.title))
+  )
+    .filter((option): option is ModelPreviewOption => Boolean(option))
+    .sort((first, second) => first.title.localeCompare(second.title))
 }
 
 export async function loadModelSelectedPreview(input: {
@@ -284,19 +300,24 @@ export async function loadModelSelectedPreview(input: {
     require_exact: true,
   })
   if (!source_path) return undefined
-  const [circuit_preview, reference_preview] = await Promise.all([
-    readPersistedCircuitPreview({
-      model_dir: input.model_dir,
-      source_path,
-      benchmark_id: input.benchmark_id,
-    }),
-    readReferencePreview({
-      model_dir: input.model_dir,
-      current_benchmark: input.benchmark_id,
-      require_exact: true,
-    }),
-  ])
-  return { circuit_preview, reference_preview }
+  try {
+    const [circuit_preview, reference_preview] = await Promise.all([
+      readPersistedCircuitPreview({
+        model_dir: input.model_dir,
+        source_path,
+        benchmark_id: input.benchmark_id,
+      }),
+      readReferencePreview({
+        model_dir: input.model_dir,
+        current_benchmark: input.benchmark_id,
+        require_exact: true,
+      }),
+    ])
+    return { circuit_preview, reference_preview }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+    throw error
+  }
 }
 
 export interface ModelArtifactMonitor {

@@ -14,11 +14,13 @@ import type {
   ModelRunStatus,
   ModelValidationSummary,
 } from "@/shared/job-types"
+import type { BenchmarkLock } from "./model-benchmark-lock"
 
 type ModelRunSubscriber = (event: ModelRunEvent) => void
 
 interface ModelRunRecord extends ModelRun {
   model_dir: string
+  benchmark_lock?: BenchmarkLock
   cancellation_controller: AbortController
   subscriber_set: Set<ModelRunSubscriber>
 }
@@ -207,6 +209,15 @@ export class ModelRunStore {
 
   getCancellationSignal(model_run_id: string): AbortSignal | undefined {
     return this.run_map.get(model_run_id)?.cancellation_controller.signal
+  }
+
+  rememberBenchmarkLock(model_run_id: string, benchmark_lock: BenchmarkLock): void {
+    this.requireRecord(model_run_id).benchmark_lock = structuredClone(benchmark_lock)
+  }
+
+  getRememberedBenchmarkLock(model_run_id: string): BenchmarkLock | undefined {
+    const benchmark_lock = this.run_map.get(model_run_id)?.benchmark_lock
+    return benchmark_lock ? structuredClone(benchmark_lock) : undefined
   }
 
   getRemainingTimeMs(model_run_id: string): number | undefined {

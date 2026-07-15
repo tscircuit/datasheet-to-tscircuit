@@ -55,6 +55,10 @@ extra effort only permits more refinement iterations.
    starting the full simulation suite. Keep trial revisions under
    \`candidates/<revision>/model.lib\`. When you want to run or refresh a viewer,
    use \`tsci build benchmarks/<benchmark-id>.circuit.tsx --ignore-warnings\`.
+   For injected parameter-sweep points, create wrapper TSX only under
+   \`.agent-simulation-runs/<benchmark-id>/\`; never create \`__run_*\` files or any
+   other temporary circuit under \`benchmarks/\`. The server and UI treat
+   \`benchmarks/\` as the immutable manifest-declared suite.
    The embedded \`<analogsimulation>\` runs ngspice and saves Circuit JSON under
    \`../dist/spice/benchmarks/<benchmark-id>/circuit.json\`. The UI only reads
    saved output and never executes TSX. \`tsci simulate analog\` may be useful for
@@ -80,7 +84,8 @@ extra effort only permits more refinement iterations.
 
 ## Required deliverables
 
-- \`model.lib\`: the canonical champion model, containing a .SUBCKT or .MODEL.
+- \`model.lib\`: the canonical champion model, whose first declaration is the
+  manifest-named .SUBCKT. Additional helper .SUBCKTs may follow it.
 - \`model-manifest.json\`: model identity, dialect, entry name, revision, simulator,
   generated time, and explicit component-pin to SPICE-node mapping.
 - \`component-with-model.circuit.tsx\`: a reusable default-exported tscircuit
@@ -315,6 +320,11 @@ same locked benchmark suite; do not reduce tests or loosen tolerances.
 Run or refresh saved viewer output with
 \`tsci build benchmarks/<benchmark-id>.circuit.tsx --ignore-warnings\`. The UI only reads
 persisted Circuit JSON and will not execute the TSX for you.
+For parameter-sweep diagnostics, put injected wrapper circuits under
+\`.agent-simulation-runs/<benchmark-id>/\`, import the locked benchmark from there,
+and delete the wrappers when the diagnostic run finishes. Never add, copy, or
+temporarily write circuit files under \`benchmarks/\`; names such as \`__run_fig*\`
+are internal sweep points, not benchmarks or datasheet graphs.
 
 If champion artifacts already exist, continue from them and preserve their
 history. If a server-owned benchmark lock already exists, do not edit

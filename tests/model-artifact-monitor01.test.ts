@@ -55,6 +55,7 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
   await Promise.all([
     Bun.write(join(benchmark_dir, "transfer.circuit.tsx"), "export default () => <board />\n"),
     Bun.write(join(benchmark_dir, "output.circuit.tsx"), "export default () => <board />\n"),
+    Bun.write(join(benchmark_dir, "__run_transfer_000.circuit.tsx"), "export default () => <board />\n"),
     Bun.write(join(evidence_dir, "transfer.csv"), "x,y\n0,0\n1,1\n"),
     Bun.write(join(evidence_dir, "output.csv"), "x,y\n0,1\n1,2\n"),
     Bun.write(join(model_dir, "model.lib"), modelSourceOne),
@@ -151,6 +152,7 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
   expect(model_run?.reference_preview?.title).toBe("Transfer curve")
   expect(model_run?.reference_preview?.result_points?.[1]).toEqual({ x: 1, y: 0.9 })
   expect(model_run?.preview_options.map((option) => option.benchmark_id)).toEqual(["output", "transfer"])
+  expect(await loadModelSelectedPreview({ model_dir, benchmark_id: "__run_transfer_000" })).toBeUndefined()
 
   const output_mtime_before = (await stat(output_output)).mtimeMs
   const selected_workspace_preview = await loadModelSelectedPreview({

@@ -107,7 +107,14 @@ function parseReducer(value: unknown, fallback: ProbeReducer): ProbeReducer {
   throw new Error("simulation reducer must be last, tail_mean, peak_to_peak, or frequency_hz")
 }
 
-function parseSimulationDefinition(value: unknown): SimulationExtractionDefinition {
+function isJsonValue(value: unknown): value is JsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true
+  if (typeof value === "number") return Number.isFinite(value)
+  if (Array.isArray(value)) return value.every(isJsonValue)
+  return isRecord(value) && Object.values(value).every(isJsonValue)
+}
+
+export function parseSimulationDefinition(value: unknown): SimulationExtractionDefinition {
   if (!isRecord(value)) {
     throw new Error(
       "benchmark has no server-verifiable simulation extraction; add simulation.kind and probe mapping",
@@ -139,13 +146,22 @@ function parseSimulationDefinition(value: unknown): SimulationExtractionDefiniti
       return {
         x: point.x,
         props: (() => {
-          if (!isRecord(point.props)) throw new Error(`simulation point ${index + 1} props must be an object`)
+          if (!isRecord(point.props) || Object.keys(point.props).length === 0) {
+            throw new Error(`simulation point ${index + 1} props must be a non-empty object`)
+          }
+          if (!Object.values(point.props).every(isJsonValue)) {
+            throw new Error(`simulation point ${index + 1} props must contain only finite JSON values`)
+          }
           return point.props as Record<string, JsonValue>
         })(),
       }
     })
     if (new Set(points.map((point) => point.x)).size !== points.length) {
       throw new Error("simulation.points must use unique x values")
+    }
+    const prop_signatures = new Set(points.map((point) => JSON.stringify(Object.keys(point.props).sort())))
+    if (prop_signatures.size !== 1) {
+      throw new Error("simulation.points must inject the same prop keys")
     }
     return {
       kind: "parameter_sweep",
@@ -188,7 +204,7 @@ export async function getSimulationRunCount(model_dir: string): Promise<number> 
   return run_count
 }
 
-async function readSimulationDefinition(
+export async function readSimulationDefinition(
   model_dir: string,
   benchmark_id: string,
 ): Promise<SimulationExtractionDefinition> {
@@ -201,6 +217,13 @@ async function readSimulationDefinition(
   )
   if (!isRecord(benchmark)) throw new Error(`benchmarks.json has no ${benchmark_id} benchmark`)
   return parseSimulationDefinition(benchmark.simulation)
+}
+
+export async function validateSimulationDefinitions(
+  model_dir: string,
+  benchmark_ids: string[],
+): Promise<void> {
+  await Promise.all(benchmark_ids.map((benchmark_id) => readSimulationDefinition(model_dir, benchmark_id)))
 }
 
 function parseSimulationOutput(value: unknown): { graphs: SimulationGraph[]; errors: string[] } {
@@ -244,13 +267,13 @@ function normalizeModelSource(source: string): string {
   return source.replace(/\r\n?/g, "\n").trim()
 }
 
-function parseSubcircuitPinSets(model_source: string): string[][] {
+function parseSubcircuits(model_source: string): Array<{ name: string; pins: string[] }> {
   const lines = model_source.replace(/\r\n?/g, "\n").split("\n")
-  const pin_sets: string[][] = []
+  const subcircuits: Array<{ name: string; pins: string[] }> = []
   for (let index = 0; index < lines.length; index += 1) {
-    const match = lines[index]!.match(/^\s*\.\s*subckt\s+\S+(?:\s+(.*))?$/i)
+    const match = lines[index]!.match(/^\s*\.\s*subckt\s+(\S+)(?:\s+(.*))?$/i)
     if (!match) continue
-    const tokens = (match[1] ?? "").trim().split(/\s+/).filter(Boolean)
+    const tokens = (match[2] ?? "").trim().split(/\s+/).filter(Boolean)
     while (index + 1 < lines.length) {
       const continuation = lines[index + 1]!.match(/^\s*\+\s*(.*)$/)
       if (!continuation) break
@@ -260,9 +283,12 @@ function parseSubcircuitPinSets(model_source: string): string[][] {
     const parameter_index = tokens.findIndex(
       (token) => /^params?:/i.test(token) || token.includes("=") || /^[;$]/.test(token),
     )
-    pin_sets.push(parameter_index < 0 ? tokens : tokens.slice(0, parameter_index))
+    subcircuits.push({
+      name: match[1]!,
+      pins: parameter_index < 0 ? tokens : tokens.slice(0, parameter_index),
+    })
   }
-  return pin_sets
+  return subcircuits
 }
 
 function assertNoSyntheticBenchmarkChannel(model_source: string): void {
@@ -358,14 +384,16 @@ function assertCanonicalDutSimulation(
   ) {
     throw new Error("DUT SPICE pin mapping does not resolve exclusively to DUT ports")
   }
-  const normalized_mapping = mapped_spice_pins.map((pin) => pin.toLowerCase()).sort()
-  const has_exact_subcircuit_mapping = parseSubcircuitPinSets(model_source).some(
-    (pins) =>
-      pins.length > 0 &&
-      JSON.stringify(pins.map((pin) => pin.toLowerCase()).sort()) === JSON.stringify(normalized_mapping),
-  )
-  if (!has_exact_subcircuit_mapping) {
-    throw new Error("DUT SPICE pin mapping must cover every .SUBCKT pin exactly once")
+  const first_subcircuit = parseSubcircuits(model_source)[0]
+  const sorted_mapping = [...mapped_spice_pins].sort()
+  if (
+    !first_subcircuit ||
+    first_subcircuit.pins.length === 0 ||
+    JSON.stringify([...first_subcircuit.pins].sort()) !== JSON.stringify(sorted_mapping)
+  ) {
+    throw new Error(
+      "DUT SPICE pin mapping must cover every .SUBCKT pin in the first declaration exactly once with matching case",
+    )
   }
 
   const probes = records.filter(

@@ -33,8 +33,13 @@ async function createLockedFixture(model_dir: string): Promise<void> {
         benchmarks: [
           {
             id: "transfer",
+            title: "Transfer",
+            source: { page: 3 },
+            critical: true,
+            weight: 1,
             tolerance: 0.05,
             reference_file: "evidence/curves/transfer.csv",
+            result_file: "results/champion/transfer.csv",
             simulation: { kind: "transient_voltage", probe_name: "VOUT", dut_spice_node: "OUT" },
           },
         ],
@@ -97,6 +102,31 @@ test("benchmark locks reject synthetic channels and unconsumed sweep props", asy
   }
   await Bun.write(join(model_dir, "benchmarks.json"), JSON.stringify(manifest))
   await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("must stay under evidence")
+
+  await rm(job_dir, { recursive: true, force: true })
+})
+
+test("benchmark locks reject incomplete manifests, malformed references, and invalid TSX", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-benchmark-schema-"))
+  const model_dir = join(job_dir, "spice")
+  await createLockedFixture(model_dir)
+
+  const manifest = JSON.parse(await Bun.file(join(model_dir, "benchmarks.json")).text())
+  delete manifest.benchmarks[0].weight
+  await Bun.write(join(model_dir, "benchmarks.json"), JSON.stringify(manifest))
+  await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("invalid weight")
+
+  manifest.benchmarks[0].weight = 1
+  await Bun.write(join(model_dir, "benchmarks.json"), JSON.stringify(manifest))
+  await Bun.write(join(model_dir, "evidence", "curves", "transfer.csv"), "x,y\n0,0\n0,1\n")
+  await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("duplicate x=0")
+
+  await Bun.write(join(model_dir, "evidence", "curves", "transfer.csv"), "x,y\n0,0\n1,1\n")
+  await Bun.write(
+    join(model_dir, "benchmarks", "transfer.circuit.tsx"),
+    benchmarkSource.replace("</board>", "</board"),
+  )
+  await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("invalid TSX")
 
   await rm(job_dir, { recursive: true, force: true })
 })

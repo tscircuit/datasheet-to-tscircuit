@@ -238,13 +238,11 @@ async function getModelRun(request_url: URL, context: ModelRunApiContext): Promi
   if (!model_run) {
     return errorResponse("model_run_not_found", "This job has no SPICE model run.", 404)
   }
-  if (model_run.preview_options.length === 0) {
-    const model_dir = context.model_run_store.getModelDir(model_run.model_run_id)
-    if (model_dir) {
-      const preview_options = await listModelPreviewOptions(model_dir)
-      if (preview_options.length > 0) {
-        model_run = context.model_run_store.updatePreviewOptions(model_run.model_run_id, preview_options)
-      }
+  const model_dir = context.model_run_store.getModelDir(model_run.model_run_id)
+  if (model_dir) {
+    const preview_options = await listModelPreviewOptions(model_dir)
+    if (JSON.stringify(preview_options) !== JSON.stringify(model_run.preview_options)) {
+      model_run = context.model_run_store.updatePreviewOptions(model_run.model_run_id, preview_options)
     }
   }
   return jsonResponse({ model_run })

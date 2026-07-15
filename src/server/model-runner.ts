@@ -4,6 +4,7 @@ import type { JobLogStream, ModelManifest, ModelProgress, ModelProgressPhase } f
 import type { JobStore } from "./job-store"
 import { startModelArtifactMonitor, type ModelArtifactMonitor } from "./model-artifact-monitor"
 import {
+  type BenchmarkLock,
   createOrVerifyBenchmarkLock,
   hasBenchmarkLock,
   hasBenchmarkManifest,
@@ -18,13 +19,14 @@ import {
   writeModelScaffold,
 } from "./model-scaffold"
 import type { ModelRunStore } from "./model-run-store"
-import { scoreModelBenchmarks } from "./model-scorer"
+import { parseBenchmarkManifest, scoreModelBenchmarks } from "./model-scorer"
 import {
   clearVerifiedSimulationResults,
   getModelSimulationSourceSignature,
   getSimulationBuildPlan,
   getSimulationRunCount,
   getVerifiedResultsDirectory,
+  hasCompleteVerifiedSimulationReport,
   type SimulationBenchmarkVerification,
   verifySimulationBenchmark,
   writeSimulationValidationReport,
@@ -213,14 +215,12 @@ function parseSubcircuitHeaders(model_source: string): Array<{ name: string; pin
   return headers
 }
 
-function validateManifestAgainstModel(manifest: ModelManifest, model_source: string): void {
+export function validateManifestAgainstModel(manifest: ModelManifest, model_source: string): void {
   const headers = parseSubcircuitHeaders(model_source)
-  const subcircuit = headers.find(
-    (candidate) => candidate.name.toLowerCase() === manifest.entry_name.toLowerCase(),
-  )
-  if (!subcircuit) {
+  const subcircuit = headers[0]
+  if (!subcircuit || subcircuit.name.toLowerCase() !== manifest.entry_name.toLowerCase()) {
     throw new Error(
-      `model-manifest.json entry_name ${manifest.entry_name} does not match a model.lib .SUBCKT`,
+      `model-manifest.json entry_name ${manifest.entry_name} must match the first model.lib .SUBCKT`,
     )
   }
   if (subcircuit.pins.length === 0) throw new Error("model.lib .SUBCKT declaration has no pins")
@@ -232,10 +232,8 @@ function validateManifestAgainstModel(manifest: ModelManifest, model_source: str
   ) {
     throw new Error("model-manifest.json pin mappings must be one-to-one")
   }
-  const normalized_header = subcircuit.pins.map((pin) => pin.toLowerCase()).sort()
-  const normalized_manifest = manifest_nodes.map((pin) => pin.toLowerCase()).sort()
-  if (JSON.stringify(normalized_header) !== JSON.stringify(normalized_manifest)) {
-    throw new Error("model-manifest.json must map every .SUBCKT pin exactly once")
+  if (JSON.stringify([...subcircuit.pins].sort()) !== JSON.stringify([...manifest_nodes].sort())) {
+    throw new Error("model-manifest.json must map every first-.SUBCKT pin exactly once with matching case")
   }
 }
 
@@ -311,7 +309,7 @@ async function publishAvailableModelCheckpoint(
   const model_file = await recoverBestModelFile(model_dir)
   if (!model_file) return false
   const model_source = await readFile(model_file, "utf8")
-  if (!/^\s*\.\s*(subckt|model)\b/im.test(model_source)) return false
+  if (!/^\s*\.\s*subckt\b/im.test(model_source)) return false
   const manifest = await readFile(join(model_dir, "model-manifest.json"), "utf8")
     .then((text) => parseModelManifest(JSON.parse(text) as unknown))
     .catch(() => undefined)
@@ -346,6 +344,24 @@ async function findPrematureRefinementArtifacts(model_dir: string): Promise<stri
   )
   const candidate_files = await listCandidateModelFiles(join(model_dir, "candidates"))
   return [...present.filter((file): file is string => Boolean(file)), ...candidate_files]
+}
+
+async function clearIncompleteBenchmarkFinalization(model_dir: string): Promise<void> {
+  await Promise.all([
+    rm(join(model_dir, "benchmarks.json"), { force: true }),
+    rm(join(model_dir, "benchmarks"), { recursive: true, force: true }),
+  ])
+  await mkdir(join(model_dir, "benchmarks"), { recursive: true })
+}
+
+async function clearEphemeralBenchmarkRuns(model_dir: string): Promise<void> {
+  const benchmark_dir = join(model_dir, "benchmarks")
+  const entries = await readdir(benchmark_dir, { withFileTypes: true }).catch(() => [])
+  await Promise.all(
+    entries
+      .filter((entry) => entry.isFile() && /^__run_.+\.circuit\.tsx$/i.test(entry.name))
+      .map((entry) => rm(join(benchmark_dir, entry.name), { force: true })),
+  )
 }
 
 function waitForComponent(
@@ -594,7 +610,14 @@ async function runParameterSweepBuilds(input: {
 }
 
 async function validateChampion(
-  input: { model_run_id: string; job_id: string; job_dir: string; model_dir: string; signal: AbortSignal },
+  input: {
+    model_run_id: string
+    job_id: string
+    job_dir: string
+    model_dir: string
+    benchmark_lock: BenchmarkLock
+    signal: AbortSignal
+  },
   context: ModelRunnerContext,
 ): Promise<{
   manifest: ModelManifest
@@ -614,7 +637,7 @@ async function validateChampion(
   ])
   const manifest = parseModelManifest(manifest_value)
   validateManifestAgainstModel(manifest, model_source)
-  await verifyBenchmarkLock(input.model_dir)
+  await verifyBenchmarkLock(input.model_dir, input.benchmark_lock)
   await writeServerIntegratedComponent({ model_dir: input.model_dir, manifest, model_source })
 
   const append = async (stream: JobLogStream, message: string) => {
@@ -709,6 +732,7 @@ async function validateChampion(
     }
   }
   await writeSimulationValidationReport(input.model_dir, simulation_verifications)
+  await verifyBenchmarkLock(input.model_dir, input.benchmark_lock)
   return {
     manifest,
     model_source,
@@ -823,8 +847,8 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
       }
     }
     await copyComponentIntoModelWorkspace({ job_dir, model_dir })
-    const benchmark_manifest_exists = await hasBenchmarkManifest(model_dir)
     const benchmark_lock_exists = await hasBenchmarkLock(model_dir)
+    let benchmark_lock = context.model_run_store.getRememberedBenchmarkLock(input.model_run_id)
     if (!benchmark_lock_exists) {
       const premature_artifacts = await findPrematureRefinementArtifacts(model_dir)
       if (premature_artifacts.length > 0) {
@@ -832,8 +856,7 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
           `Cannot establish a pre-refinement benchmark lock because model artifacts already exist: ${premature_artifacts.join(", ")}`,
         )
       }
-    }
-    if (!benchmark_manifest_exists) {
+      await clearIncompleteBenchmarkFinalization(model_dir)
       context.model_run_store.updateModelRun(input.model_run_id, {
         status: "setting_up",
         is_complete: false,
@@ -863,17 +886,22 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
       if (benchmark_exit_code !== 0) {
         throw new Error(`Benchmark-finalization agent exited with code ${benchmark_exit_code}`)
       }
-      const premature_artifacts = await findPrematureRefinementArtifacts(model_dir)
-      if (premature_artifacts.length > 0) {
+      const finalized_premature_artifacts = await findPrematureRefinementArtifacts(model_dir)
+      if (finalized_premature_artifacts.length > 0) {
         throw new Error(
-          `Benchmark finalization created forbidden model artifacts before the suite was locked: ${premature_artifacts.join(", ")}`,
+          `Benchmark finalization created forbidden model artifacts before the suite was locked: ${finalized_premature_artifacts.join(", ")}`,
         )
       }
       if (!(await hasBenchmarkManifest(model_dir))) {
         throw new Error("The benchmark-finalization agent did not create benchmarks.json")
       }
+      benchmark_lock = await createOrVerifyBenchmarkLock(model_dir)
+      context.model_run_store.rememberBenchmarkLock(input.model_run_id, benchmark_lock)
+    } else {
+      await clearEphemeralBenchmarkRuns(model_dir)
+      benchmark_lock = await verifyBenchmarkLock(model_dir, benchmark_lock)
+      context.model_run_store.rememberBenchmarkLock(input.model_run_id, benchmark_lock)
     }
-    await createOrVerifyBenchmarkLock(model_dir)
     await append("system", "The server locked the benchmark manifest, evidence, and test benches.\n")
 
     context.model_run_store.startSegment(input.model_run_id)
@@ -937,18 +965,23 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
         )
       }
 
-      if (await hasBenchmarkManifest(model_dir)) await verifyBenchmarkLock(model_dir)
+      await clearEphemeralBenchmarkRuns(model_dir)
+      await verifyBenchmarkLock(model_dir, benchmark_lock)
       const agent_controller = new AbortController()
       let validation_reserve_reached = false
+      let reserve_at_stop_ms = validation_reserve_ms
       const cancel_agent = () => agent_controller.abort()
       process_controller.signal.addEventListener("abort", cancel_agent, { once: true })
-      const refinement_timer = setTimeout(
-        () => {
+      const refinement_monitor = setInterval(() => {
+        const remaining_time_ms = context.model_run_store.getRemainingTimeMs(input.model_run_id) ?? 0
+        const current_reserve_ms =
+          context.model_run_store.getFinalizationReserveMs(input.model_run_id, simulation_run_count) ?? 0
+        if (remaining_time_ms <= current_reserve_ms) {
           validation_reserve_reached = true
+          reserve_at_stop_ms = current_reserve_ms
           agent_controller.abort()
-        },
-        Math.max(1, remaining_before_agent - validation_reserve_ms),
-      )
+        }
+      }, 250)
       let agent_exit_code: number
       try {
         agent_exit_code = await streamModelProcess({
@@ -958,7 +991,7 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
           on_chunk: append,
         })
       } finally {
-        clearTimeout(refinement_timer)
+        clearInterval(refinement_monitor)
         process_controller.signal.removeEventListener("abort", cancel_agent)
       }
       if (cancellation_signal.aborted) {
@@ -985,11 +1018,12 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
         }
         throw new Error("The agent did not create benchmarks.json")
       }
-      await createOrVerifyBenchmarkLock(model_dir)
+      await clearEphemeralBenchmarkRuns(model_dir)
+      await verifyBenchmarkLock(model_dir, benchmark_lock)
       if (validation_reserve_reached) {
         await append(
           "system",
-          `Stopped refinement with ${Math.round(validation_reserve_ms / 1000)} seconds reserved for independent validation.\n`,
+          `Stopped refinement with ${Math.round(reserve_at_stop_ms / 1000)} seconds reserved for independent validation.\n`,
         )
       }
       if (agent_exit_code !== 0 && !budget_exhausted && !validation_reserve_reached) {
@@ -1035,10 +1069,18 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
             job_id: model_run.job_id,
             job_dir,
             model_dir,
+            benchmark_lock,
             signal: validation_controller.signal,
           },
           context,
         )
+        await verifyBenchmarkLock(model_dir, benchmark_lock)
+        if (
+          final_champion.simulation_verifications.every((verification) => verification.passed) &&
+          !(await hasCompleteVerifiedSimulationReport(model_dir))
+        ) {
+          throw new Error("The server-verified simulation artifacts changed before scoring")
+        }
         final_validation = await scoreModelBenchmarks(model_dir, {
           results_directory_override: getVerifiedResultsDirectory(model_dir),
         })
@@ -1111,6 +1153,7 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
     }
     const validation_complete = final_validation?.all_passed === true && !final_champion?.integration_error
     if (validation_complete && final_champion && final_validation) {
+      await verifyBenchmarkLock(model_dir, benchmark_lock)
       await rm(join(model_dir, "validation-feedback.md"), { force: true })
       await attachModelToGeneratedComponent({
         job_id: model_run.job_id,
@@ -1220,7 +1263,8 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
 }
 
 export async function listModelBenchFiles(model_dir: string): Promise<string[]> {
-  const bench_dir = join(model_dir, "benchmarks")
-  const entries = await readdir(bench_dir).catch(() => [])
-  return entries.filter((entry) => entry.endsWith(".circuit.tsx")).sort()
+  const manifest_value: unknown = JSON.parse(await readFile(join(model_dir, "benchmarks.json"), "utf8"))
+  return parseBenchmarkManifest(manifest_value)
+    .benchmarks.map((benchmark) => `${benchmark.id}.circuit.tsx`)
+    .sort()
 }

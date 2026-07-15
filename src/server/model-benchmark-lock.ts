@@ -2,13 +2,15 @@ import { createHash } from "node:crypto"
 import { mkdir, readFile, readdir, rename } from "node:fs/promises"
 import { dirname, isAbsolute, join, resolve, sep } from "node:path"
 import ts from "typescript"
+import { parseBenchmarkManifest, validateBenchmarkReferenceFiles } from "./model-scorer"
+import { validateSimulationDefinitions } from "./model-simulation-validator"
 
 interface LockedFile {
   file: string
   sha256: string
 }
 
-interface BenchmarkLock {
+export interface BenchmarkLock {
   version: 1
   locked_at: string
   benchmark_ids: string[]
@@ -56,28 +58,11 @@ function assertEvidenceFile(model_dir: string, file: string): void {
 }
 
 function parseBenchmarkRecords(value: unknown): BenchmarkRecord[] {
-  if (!isRecord(value) || value.version !== 1 || typeof value.locked_at !== "string") {
-    throw new Error("benchmarks.json must contain a version 1 locked benchmark manifest")
-  }
-  if (!Array.isArray(value.benchmarks) || value.benchmarks.length === 0) {
-    throw new Error("benchmarks.json must contain at least one benchmark")
-  }
-  const records = value.benchmarks.map((entry, index): BenchmarkRecord => {
-    if (
-      !isRecord(entry) ||
-      typeof entry.id !== "string" ||
-      !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(entry.id) ||
-      typeof entry.reference_file !== "string" ||
-      !entry.reference_file.startsWith("evidence/")
-    ) {
-      throw new Error(`Benchmark ${index + 1} has an invalid id or evidence reference`)
-    }
-    return { id: entry.id, reference_file: entry.reference_file, simulation: entry.simulation }
-  })
-  if (new Set(records.map((record) => record.id)).size !== records.length) {
-    throw new Error("Benchmark ids must be unique")
-  }
-  return records
+  return parseBenchmarkManifest(value).benchmarks.map((entry) => ({
+    id: entry.id,
+    reference_file: entry.reference_file,
+    simulation: entry.simulation,
+  }))
 }
 
 function assertSourceUsesSweepProps(source: string, benchmark: BenchmarkRecord): void {
@@ -245,7 +230,23 @@ function sourceConsumesInjectedProp(source: string, identifier: string): boolean
   return found
 }
 
+function assertSourceParses(source: string, benchmark_id: string): void {
+  const source_file = ts.createSourceFile(
+    `${benchmark_id}.circuit.tsx`,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
+  ) as ts.SourceFile & { parseDiagnostics?: readonly ts.Diagnostic[] }
+  const diagnostic = source_file.parseDiagnostics?.[0]
+  if (!diagnostic) return
+  throw new Error(
+    `Benchmark ${benchmark_id} has invalid TSX: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n")}`,
+  )
+}
+
 function assertBenchmarkSourceContract(source: string, benchmark: BenchmarkRecord): void {
+  assertSourceParses(source, benchmark.id)
   if (
     !isRecord(benchmark.simulation) ||
     typeof benchmark.simulation.probe_name !== "string" ||
@@ -287,8 +288,15 @@ async function readCurrentLock(model_dir: string): Promise<{
   files: Array<LockedFile & { text: string }>
 }> {
   const manifest_text = await readFile(join(model_dir, "benchmarks.json"), "utf8")
-  const records = parseBenchmarkRecords(JSON.parse(manifest_text) as unknown)
+  const manifest_value = JSON.parse(manifest_text) as unknown
+  const manifest = parseBenchmarkManifest(manifest_value)
+  const records = parseBenchmarkRecords(manifest_value)
   for (const record of records) assertEvidenceFile(model_dir, record.reference_file)
+  await validateBenchmarkReferenceFiles(model_dir, manifest)
+  await validateSimulationDefinitions(
+    model_dir,
+    records.map((record) => record.id),
+  )
   const benchmark_entries = await readdir(join(model_dir, "benchmarks")).catch(() => [])
   const benchmark_files = benchmark_entries.filter((entry) => entry.endsWith(".circuit.tsx")).sort()
   const expected_files = records.map((record) => `${record.id}.circuit.tsx`).sort()
@@ -384,16 +392,28 @@ export async function createOrVerifyBenchmarkLock(model_dir: string): Promise<Be
   return lock
 }
 
-export async function verifyBenchmarkLock(model_dir: string): Promise<BenchmarkLock> {
+export async function verifyBenchmarkLock(
+  model_dir: string,
+  expected_lock?: BenchmarkLock,
+): Promise<BenchmarkLock> {
   const value: unknown = JSON.parse(await readFile(getLockFile(model_dir), "utf8"))
   const lock = parseLock(value)
-  const current = await readCurrentLock(model_dir)
   if (
-    JSON.stringify(lock.benchmark_ids) !== JSON.stringify(current.benchmark_ids) ||
-    JSON.stringify(lock.files.map(({ file, sha256 }) => ({ file, sha256 }))) !==
+    expected_lock &&
+    (expected_lock.locked_at !== lock.locked_at ||
+      JSON.stringify(expected_lock.benchmark_ids) !== JSON.stringify(lock.benchmark_ids) ||
+      JSON.stringify(expected_lock.files) !== JSON.stringify(lock.files))
+  ) {
+    throw new Error("The server-owned benchmark lock changed while the model workflow was running")
+  }
+  const current = await readCurrentLock(model_dir)
+  const trusted_lock = expected_lock ?? lock
+  if (
+    JSON.stringify(trusted_lock.benchmark_ids) !== JSON.stringify(current.benchmark_ids) ||
+    JSON.stringify(trusted_lock.files.map(({ file, sha256 }) => ({ file, sha256 }))) !==
       JSON.stringify(current.files.map(({ file, sha256 }) => ({ file, sha256 })))
   ) {
     throw new Error("The server-owned benchmark lock no longer matches the model workspace")
   }
-  return lock
+  return trusted_lock
 }
