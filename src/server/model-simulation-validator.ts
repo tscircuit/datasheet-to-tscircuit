@@ -13,10 +13,17 @@ interface ParameterSweepPoint {
 }
 
 type SimulationExtractionDefinition =
-  | { kind: "transient_voltage"; probe_name: string; scale: number; offset: number }
+  | {
+      kind: "transient_voltage"
+      probe_name: string
+      dut_spice_node: string
+      scale: number
+      offset: number
+    }
   | {
       kind: "parameter_sweep"
       probe_name: string
+      dut_spice_node: string
       reducer: ProbeReducer
       scale: number
       offset: number
@@ -110,6 +117,7 @@ function parseSimulationDefinition(value: unknown): SimulationExtractionDefiniti
     return {
       kind: "transient_voltage",
       probe_name: requiredString(value.probe_name, "simulation.probe_name"),
+      dut_spice_node: requiredString(value.dut_spice_node, "simulation.dut_spice_node"),
       scale: optionalFiniteNumber(value.scale, 1, "simulation.scale"),
       offset: optionalFiniteNumber(value.offset, 0, "simulation.offset"),
     }
@@ -123,23 +131,27 @@ function parseSimulationDefinition(value: unknown): SimulationExtractionDefiniti
     if (!Array.isArray(value.points) || value.points.length < 2) {
       throw new Error("simulation.points must contain at least two parameter-sweep points")
     }
+    const points = value.points.map((point, index) => {
+      if (!isRecord(point)) throw new Error(`simulation point ${index + 1} must be an object`)
+      if (typeof point.x !== "number" || !Number.isFinite(point.x)) {
+        throw new Error(`simulation point ${index + 1} has an invalid x value`)
+      }
+      return {
+        x: point.x,
+        props: (() => {
+          if (!isRecord(point.props)) throw new Error(`simulation point ${index + 1} props must be an object`)
+          return point.props as Record<string, JsonValue>
+        })(),
+      }
+    })
+    if (new Set(points.map((point) => point.x)).size !== points.length) {
+      throw new Error("simulation.points must use unique x values")
+    }
     return {
       kind: "parameter_sweep",
-      points: value.points.map((point, index) => {
-        if (!isRecord(point)) throw new Error(`simulation point ${index + 1} must be an object`)
-        if (typeof point.x !== "number" || !Number.isFinite(point.x)) {
-          throw new Error(`simulation point ${index + 1} has an invalid x value`)
-        }
-        return {
-          x: point.x,
-          props: (() => {
-            if (!isRecord(point.props))
-              throw new Error(`simulation point ${index + 1} props must be an object`)
-            return point.props as Record<string, JsonValue>
-          })(),
-        }
-      }),
+      points,
       probe_name: requiredString(value.probe_name, "simulation.probe_name"),
+      dut_spice_node: requiredString(value.dut_spice_node, "simulation.dut_spice_node"),
       reducer: parseReducer(value.reducer, "tail_mean"),
       scale: optionalFiniteNumber(value.scale, 1, "simulation.scale"),
       offset: optionalFiniteNumber(value.offset, 0, "simulation.offset"),
@@ -302,6 +314,7 @@ function assertCanonicalDutSimulation(
   circuit_json: AnyCircuitElement[],
   model_source: string,
   probe_name: string,
+  dut_spice_node: string,
 ): void {
   const records = circuit_json.map((element) => element as unknown).filter(isRecord)
   const dut_components = records.filter(
@@ -383,8 +396,43 @@ function assertCanonicalDutSimulation(
     ]
     connectivity.connect(connected)
   }
-  if (![...dut_port_ids].some((port_id) => connectivity.connected(signal_key, portKey(port_id)))) {
-    throw new Error(`${probe_name} is not electrically connected to the canonical DUT`)
+  const expected_mapping = Object.entries(spice_model.spice_pin_to_source_port_map).find(
+    ([spice_pin]) => spice_pin.toLowerCase() === dut_spice_node.toLowerCase(),
+  )
+  const expected_port_id = expected_mapping?.[1]
+  if (typeof expected_port_id !== "string") {
+    throw new Error(`simulation.dut_spice_node ${dut_spice_node} is not mapped by the canonical DUT`)
+  }
+  if (!connectivity.connected(signal_key, portKey(expected_port_id))) {
+    throw new Error(
+      `${probe_name} must measure canonical DUT SPICE node ${dut_spice_node}, not another DUT pin`,
+    )
+  }
+
+  const voltage_source_endpoint_keys = records
+    .filter((element) => element.type === "simulation_voltage_source")
+    .flatMap((source) => {
+      const keys: string[] = []
+      for (const field of [
+        "positive_source_port_id",
+        "negative_source_port_id",
+        "terminal1_source_port_id",
+        "terminal2_source_port_id",
+      ] as const) {
+        if (typeof source[field] === "string") keys.push(portKey(source[field]))
+      }
+      for (const field of [
+        "positive_source_net_id",
+        "negative_source_net_id",
+        "terminal1_source_net_id",
+        "terminal2_source_net_id",
+      ] as const) {
+        if (typeof source[field] === "string") keys.push(netKey(source[field]))
+      }
+      return keys
+    })
+  if (voltage_source_endpoint_keys.some((endpoint) => connectivity.connected(signal_key, endpoint))) {
+    throw new Error(`${probe_name} is tied directly to an independent voltage source`)
   }
 }
 
@@ -559,7 +607,28 @@ export async function verifySimulationBenchmark(input: {
     const job_dir = dirname(input.model_dir)
     const source_path = join(input.model_dir, "benchmarks", `${input.benchmark_id}.circuit.tsx`)
     const circuit_json_path = join(job_dir, "dist", "spice", "benchmarks", input.benchmark_id, "circuit.json")
-    const paths = input.circuit_json_paths?.length ? input.circuit_json_paths : [{ path: circuit_json_path }]
+    const definition = await readSimulationDefinition(input.model_dir, input.benchmark_id)
+    const supplied_paths: Array<{ path: string; x?: number }> = input.circuit_json_paths?.length
+      ? input.circuit_json_paths
+      : [{ path: circuit_json_path }]
+    const paths =
+      definition.kind === "parameter_sweep"
+        ? definition.points.map((point) => {
+            const matches = supplied_paths.filter((candidate) => Object.is(candidate.x, point.x))
+            if (matches.length !== 1) {
+              throw new Error(`parameter sweep must provide exactly one simulator output for x=${point.x}`)
+            }
+            return matches[0]!
+          })
+        : (() => {
+            if (supplied_paths.length !== 1) {
+              throw new Error("transient voltage validation requires exactly one simulator output")
+            }
+            return supplied_paths
+          })()
+    if (definition.kind === "parameter_sweep" && supplied_paths.length !== definition.points.length) {
+      throw new Error("parameter sweep simulator output count does not match simulation.points")
+    }
     const [source_text, model_source, ...circuit_texts] = await Promise.all([
       readFile(source_path, "utf8"),
       readFile(join(input.model_dir, "model.lib"), "utf8"),
@@ -582,13 +651,17 @@ export async function verifySimulationBenchmark(input: {
         (await getModelSimulationSourceSignature(input.model_dir, input.benchmark_id)),
     }
 
-    const definition = await readSimulationDefinition(input.model_dir, input.benchmark_id)
     const parsed = circuit_jsons.map((json) => parseSimulationOutput(json))
     const errors = parsed.flatMap(({ errors }) => errors)
     if (errors.length > 0) throw new Error(errors.join("; "))
     assertNoSyntheticBenchmarkChannel(model_source)
     for (const circuit of circuit_jsons) {
-      assertCanonicalDutSimulation(circuit as AnyCircuitElement[], model_source, definition.probe_name)
+      assertCanonicalDutSimulation(
+        circuit as AnyCircuitElement[],
+        model_source,
+        definition.probe_name,
+        definition.dut_spice_node,
+      )
     }
 
     const points =
@@ -745,6 +818,14 @@ export async function hasCompleteVerifiedSimulationReport(model_dir: string): Pr
   ) {
     return false
   }
+  const definitions_are_current = await Promise.all(
+    benchmark_ids.map((benchmark_id) =>
+      readSimulationDefinition(model_dir, benchmark_id)
+        .then(() => true)
+        .catch(() => false),
+    ),
+  )
+  if (definitions_are_current.some((is_current) => !is_current)) return false
   const artifacts = await Promise.all(
     report.benchmarks.map(async (benchmark) => {
       const [artifact, current_signature] = await Promise.all([

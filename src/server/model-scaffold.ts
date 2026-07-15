@@ -20,8 +20,9 @@ Work only inside this directory. The source files are:
 - \`model-progress.json\`: your structured live progress checkpoint, streamed to
   the user by the server.
 
-Your task has an untimed setup phase followed by a time-budgeted refinement
-phase. Setup and waiting for component.circuit.tsx do not consume effort. Every
+Your task has untimed evidence setup, component waiting, and benchmark-finalization
+phases followed by a time-budgeted refinement phase. Those untimed phases do not
+consume effort. Every
 effort level uses the same setup, locked benchmarks, scorer, and refinement loop;
 extra effort only permits more refinement iterations.
 
@@ -39,13 +40,15 @@ extra effort only permits more refinement iterations.
    Write \`benchmark-draft.json\` with graph sources, conditions, and proposed
    tolerances, then write \`setup-complete.json\`. Do not create or tune a model
    during setup.
-3. When component.circuit.tsx becomes available, verify its pinout and convert the
-   draft into locked \`benchmarks.json\` before tuning the model. The benchmark set,
-   conditions, tolerances, and critical flags must not be weakened to improve a
-   score. When the first refinement pass exits, the server snapshots the complete
-   manifest, evidence CSVs, and benchmark TSX outside this workspace. Later passes
-   must change only the model and its documentation; any benchmark drift is rejected.
-4. Create a baseline model and one executable tscircuit test bench per benchmark.
+3. When component.circuit.tsx becomes available, the server starts a separate,
+   untimed benchmark-finalization pass. During that pass, verify the pinout and
+   convert the draft into \`benchmarks.json\` plus one executable tscircuit test
+   bench per benchmark. Do not create, tune, or run a model in this pass. When the
+   pass exits, the server snapshots the manifest, evidence CSVs, and benchmark TSX
+   outside this workspace before any refinement is allowed to begin.
+4. Only after the server reports that the benchmark lock exists, create a baseline
+   model. The benchmark set, conditions, tolerances, critical flags, evidence, and
+   test benches are immutable during modeling; any drift is rejected.
    Every locked benchmark must include the server-verifiable \`simulation\`
    extraction mapping described below. Write the first usable baseline immediately to canonical
    \`model.lib\`, with its manifest, integration component, and model card, before
@@ -63,8 +66,8 @@ extra effort only permits more refinement iterations.
    Promote a candidate only
    when it improves, in order: syntax/pin validity, critical tests passing,
    convergence failures, worst error, weighted score, and model simplicity.
-6. Only after component.circuit.tsx is available, the server starts the refinement
-   timer. Re-read \`run-control.json\`. While enough time remains for a full iteration and
+6. Only after the benchmark lock exists, the server starts the refinement timer.
+   Re-read \`run-control.json\`. While enough time remains for a full iteration and
    finalization, diagnose the largest residual, refine, simulate the entire locked
    suite, score, and checkpoint the champion. Prefer bounded numeric parameter
    tuning before changing topology.
@@ -185,6 +188,7 @@ workspace and every referenced CSV contains numeric \`x,y\` rows:
     "simulation": {
       "kind": "parameter_sweep",
       "probe_name": "RESULT",
+      "dut_spice_node": "OUT",
       "reducer": "tail_mean",
       "points": [
         { "x": 0, "props": { "sweepValue": 0 } },
@@ -195,10 +199,14 @@ workspace and every referenced CSV contains numeric \`x,y\` rows:
 }
 \`\`\`
 
-Use \`simulation.kind: "transient_voltage"\` with \`probe_name\`, optional
+Use \`simulation.kind: "transient_voltage"\` with \`probe_name\`,
+\`dut_spice_node\`, optional
 \`scale\`, and optional \`offset\` when the reference x axis is elapsed time in
 milliseconds. For a parameter sweep, use \`kind: "parameter_sweep"\`. The
-benchmark must contain exactly one DUT and one common voltage probe. Export a
+benchmark must contain exactly one DUT and one common voltage probe.
+\`dut_spice_node\` is the exact canonical \`.SUBCKT\` pin whose behavior the
+probe measures. The probe must resolve to that DUT pin and must not be tied
+directly to an independent voltage source. Export a
 props-based benchmark (for example \`function Benchmark({ sweepValue = 0 })\`) and
 the server runs that same TSX once per point using tscircuit's \`--inject-props\`
 build option. Never clone the DUT, groups, sources, or probes for sweep points,
@@ -248,7 +256,11 @@ export async function copyComponentIntoModelWorkspace(input: {
   job_dir: string
   model_dir: string
 }): Promise<void> {
-  await copyFile(join(input.job_dir, "index.circuit.tsx"), join(input.model_dir, "component.circuit.tsx"))
+  const preserved_original = join(input.job_dir, "component.circuit.tsx")
+  const source_file = (await Bun.file(preserved_original).exists())
+    ? preserved_original
+    : join(input.job_dir, "index.circuit.tsx")
+  await copyFile(source_file, join(input.model_dir, "component.circuit.tsx"))
 }
 
 export function buildModelSetupPrompt(): string {
@@ -269,14 +281,32 @@ with a version, completion timestamp, evidence-file count, and draft-benchmark
 count, then exit. The server will wait for and provide the component.`
 }
 
+export function buildModelBenchmarkPrompt(): string {
+  return `Finalize and freeze the benchmark suite for this SPICE behavioral-model run.
+
+The authoritative component.circuit.tsx is now available. Read AGENTS.md,
+benchmark-draft.json, component.circuit.tsx, and the evidence package. Create the
+complete benchmarks.json manifest and exactly one benchmarks/<id>.circuit.tsx per
+benchmark. Every benchmark must declare its server-verifiable simulation mapping,
+including probe_name and dut_spice_node, and must cite immutable evidence under
+evidence/. Update model-progress.json while working.
+
+This is an untimed benchmark-only pass. Do not create or modify model.lib,
+model-manifest.json, component-with-model.circuit.tsx, candidates/,
+iteration-history.json, model-card.md, validation-report.json, or any simulated
+result CSV. Do not fit, tune, or run a model. Exit as soon as the complete
+benchmark suite is ready; the server will validate and lock it before refinement.`
+}
+
 export function buildModelAgentPrompt(): string {
   return `Develop and validate the ngspice-tested SPICE behavioral model in this workspace.
 
-The untimed setup phase is complete and the authoritative
-component.circuit.tsx is now available. The refinement timer is running. Read
-AGENTS.md, benchmark-draft.json, component.circuit.tsx, and run-control.json
-first. Lock the complete benchmark suite, then follow the simulation,
-deterministic scoring, champion-promotion, and checkpoint workflow.
+The untimed setup phase is complete, the authoritative component.circuit.tsx is
+available, and the server has already locked the complete benchmark suite. The
+refinement timer is running. Read AGENTS.md,
+benchmarks.json, component.circuit.tsx, and run-control.json first. Do not modify
+benchmarks.json, benchmark TSX, or evidence. Follow the simulation, deterministic
+scoring, champion-promotion, and checkpoint workflow.
 Continue the existing model-progress.json sequence and update it before and after
 every benchmark simulation, score, candidate decision, and champion promotion.
 Re-read run-control.json before every refinement iteration because the user may

@@ -49,6 +49,7 @@ test("simulation verification rejects solver errors and hashes extracted simulat
           simulation: {
             kind: "transient_voltage",
             probe_name: "VOUT",
+            dut_spice_node: "OUT",
             scale: 2,
             offset: 1,
           },
@@ -92,6 +93,37 @@ test("simulation verification rejects solver errors and hashes extracted simulat
   await Bun.write(join(circuit_dir, "circuit.json"), JSON.stringify(incomplete_mapping))
   const incomplete = await verifySimulationBenchmark({ model_dir, benchmark_id: "transient" })
   expect(incomplete.error_message).toContain("cover every .SUBCKT pin")
+
+  const manifest = JSON.parse(await Bun.file(join(model_dir, "benchmarks.json")).text())
+  manifest.benchmarks[0].simulation.dut_spice_node = "IN"
+  await Bun.write(join(model_dir, "benchmarks.json"), JSON.stringify(manifest))
+  const directly_driven = verifiedCircuit("VOUT", [
+    {
+      type: "simulation_voltage_source",
+      simulation_voltage_source_id: "stimulus",
+      is_dc_source: true,
+      positive_source_port_id: "stimulus_positive",
+      negative_source_net_id: "ground",
+      voltage: 1,
+    },
+    {
+      type: "source_trace",
+      connected_source_port_ids: ["stimulus_positive", "dut_in"],
+      connected_source_net_ids: [],
+    },
+    {
+      type: "simulation_transient_voltage_graph",
+      name: "VOUT",
+      timestamps_ms: [0, 1],
+      voltage_levels: [0, 1],
+    },
+  ])
+  ;(directly_driven[4] as { signal_input_source_port_id: string }).signal_input_source_port_id = "dut_in"
+  await Bun.write(join(circuit_dir, "circuit.json"), JSON.stringify(directly_driven))
+  const bypassed = await verifySimulationBenchmark({ model_dir, benchmark_id: "transient" })
+  expect(bypassed.error_message).toContain("tied directly to an independent voltage source")
+  manifest.benchmarks[0].simulation.dut_spice_node = "OUT"
+  await Bun.write(join(model_dir, "benchmarks.json"), JSON.stringify(manifest))
 
   await Bun.write(
     join(circuit_dir, "circuit.json"),
@@ -156,6 +188,7 @@ test("parameter sweeps reuse one circuit and combine separately persisted runs",
           simulation: {
             kind: "parameter_sweep",
             probe_name: "RESULT",
+            dut_spice_node: "OUT",
             reducer: "last",
             points: [
               { x: 0, props: { sweepValue: 0 } },
@@ -185,8 +218,8 @@ test("parameter sweeps reuse one circuit and combine separately persisted runs",
     model_dir,
     benchmark_id: "sweep",
     circuit_json_paths: [
-      { path: first, x: 0 },
       { path: second, x: 1 },
+      { path: first, x: 0 },
     ],
   })
   expect(result.passed).toBe(true)

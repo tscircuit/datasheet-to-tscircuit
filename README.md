@@ -94,14 +94,16 @@ effort budget. Model creation is enabled by default, and the toggle/effort choic
 is retained locally for the next task. Its setup agent starts alongside component conversion and extracts
 datasheet curves, provenance, and benchmark references without consuming the
 effort budget. If setup finishes first, the model run waits for the authoritative
-component pinout. The refinement timer starts only after that component is
-available; higher effort uses the same locked benchmarks and scoring process for
-more refinement iterations.
+component pinout. Once the component is available, a separate untimed pass
+finalizes the benchmark circuits and evidence, and the server locks them before
+any model artifact may be created. The refinement timer starts only after that
+lock exists; higher effort uses the same locked benchmarks and scoring process
+for more refinement iterations.
 
 Model work is stored under `.runtime/jobs/<job_id>/spice`. The server immutably
-snapshots the first refinement pass's benchmark manifest, evidence, and test
-benches outside the agent workspace. It owns the numeric benchmark scorer, reruns
-every generated tscircuit analog test bench, and
+snapshots the benchmark-finalization pass's manifest, evidence, and test benches
+outside the agent workspace before refinement. It owns the numeric benchmark
+scorer, reruns every generated tscircuit analog test bench, and
 keeps the best checkpointed model when time expires. The model tab streams
 structured progress checkpoints live, including datasheet/graph evidence counts,
 the active benchmark, iteration number, and current champion score, alongside the

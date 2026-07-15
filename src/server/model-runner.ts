@@ -5,12 +5,14 @@ import type { JobStore } from "./job-store"
 import { startModelArtifactMonitor, type ModelArtifactMonitor } from "./model-artifact-monitor"
 import {
   createOrVerifyBenchmarkLock,
+  hasBenchmarkLock,
   hasBenchmarkManifest,
   verifyBenchmarkLock,
 } from "./model-benchmark-lock"
 import { startModelProgressMonitor, type ModelProgressMonitor } from "./model-progress"
 import {
   buildModelAgentPrompt,
+  buildModelBenchmarkPrompt,
   buildModelSetupPrompt,
   copyComponentIntoModelWorkspace,
   writeModelScaffold,
@@ -138,7 +140,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function parseModelManifest(value: unknown): ModelManifest {
+export function parseModelManifest(value: unknown): ModelManifest {
   if (!isRecord(value) || value.version !== 1) throw new Error("model-manifest.json must be version 1")
   const required_strings = [
     "part_number",
@@ -156,6 +158,9 @@ function parseModelManifest(value: unknown): ModelManifest {
   if (value.model_file !== "model.lib") throw new Error('model-manifest.json model_file must be "model.lib"')
   if (value.dialect !== "pspice" && value.dialect !== "ngspice" && value.dialect !== "portable") {
     throw new Error("model-manifest.json has an unsupported dialect")
+  }
+  if (value.simulator !== "ngspice") {
+    throw new Error('model-manifest.json simulator must be "ngspice" for this validation workflow')
   }
   if (!Array.isArray(value.pins) || value.pins.length === 0) {
     throw new Error("model-manifest.json must contain an explicit pin mapping")
@@ -180,7 +185,7 @@ function parseModelManifest(value: unknown): ModelManifest {
     entry_name: value.entry_name as string,
     model_file: "model.lib",
     revision: value.revision as string,
-    simulator: value.simulator as string,
+    simulator: "ngspice",
     generated_at: value.generated_at as string,
     pins,
   }
@@ -323,6 +328,24 @@ async function publishAvailableModelCheckpoint(
 
 async function hasCompletedSetup(model_dir: string): Promise<boolean> {
   return Bun.file(join(model_dir, "setup-complete.json")).exists()
+}
+
+async function findPrematureRefinementArtifacts(model_dir: string): Promise<string[]> {
+  const canonical_files = [
+    "model.lib",
+    "model-manifest.json",
+    "component-with-model.circuit.tsx",
+    "iteration-history.json",
+    "model-card.md",
+    "validation-report.json",
+  ]
+  const present = await Promise.all(
+    canonical_files.map(async (file) =>
+      (await Bun.file(join(model_dir, file)).exists()) ? file : undefined,
+    ),
+  )
+  const candidate_files = await listCandidateModelFiles(join(model_dir, "candidates"))
+  return [...present.filter((file): file is string => Boolean(file)), ...candidate_files]
 }
 
 function waitForComponent(
@@ -800,14 +823,65 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
       }
     }
     await copyComponentIntoModelWorkspace({ job_dir, model_dir })
-    if (await hasBenchmarkManifest(model_dir)) await createOrVerifyBenchmarkLock(model_dir)
+    const benchmark_manifest_exists = await hasBenchmarkManifest(model_dir)
+    const benchmark_lock_exists = await hasBenchmarkLock(model_dir)
+    if (!benchmark_lock_exists) {
+      const premature_artifacts = await findPrematureRefinementArtifacts(model_dir)
+      if (premature_artifacts.length > 0) {
+        throw new Error(
+          `Cannot establish a pre-refinement benchmark lock because model artifacts already exist: ${premature_artifacts.join(", ")}`,
+        )
+      }
+    }
+    if (!benchmark_manifest_exists) {
+      context.model_run_store.updateModelRun(input.model_run_id, {
+        status: "setting_up",
+        is_complete: false,
+        has_errors: false,
+      })
+      updateServerProgress(
+        input.model_run_id,
+        context.model_run_store,
+        "locking_benchmarks",
+        "Finalizing the benchmark suite before model refinement",
+      )
+      await append(
+        "system",
+        "Starting the untimed benchmark-finalization pass. Model refinement has not started.\n",
+      )
+      const benchmark_exit_code = await streamModelProcess({
+        command: [context.agent_bin, "do", "--prompt", buildModelBenchmarkPrompt(), "--dir", model_dir],
+        cwd: model_dir,
+        signal: process_controller.signal,
+        on_chunk: append,
+      })
+      if (cancellation_signal.aborted) {
+        await append("system", "\nBenchmark finalization was stopped. Draft evidence was preserved.\n")
+        markModelRunCancelled(input.model_run_id, context.model_run_store)
+        return
+      }
+      if (benchmark_exit_code !== 0) {
+        throw new Error(`Benchmark-finalization agent exited with code ${benchmark_exit_code}`)
+      }
+      const premature_artifacts = await findPrematureRefinementArtifacts(model_dir)
+      if (premature_artifacts.length > 0) {
+        throw new Error(
+          `Benchmark finalization created forbidden model artifacts before the suite was locked: ${premature_artifacts.join(", ")}`,
+        )
+      }
+      if (!(await hasBenchmarkManifest(model_dir))) {
+        throw new Error("The benchmark-finalization agent did not create benchmarks.json")
+      }
+    }
+    await createOrVerifyBenchmarkLock(model_dir)
+    await append("system", "The server locked the benchmark manifest, evidence, and test benches.\n")
 
     context.model_run_store.startSegment(input.model_run_id)
     updateServerProgress(
       input.model_run_id,
       context.model_run_store,
-      "locking_benchmarks",
-      "The component is ready; locking benchmarks before baseline modeling",
+      "building_baseline",
+      "The benchmark suite is locked; starting baseline model refinement",
     )
     await append(
       "system",

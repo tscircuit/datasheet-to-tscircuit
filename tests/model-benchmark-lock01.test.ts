@@ -35,7 +35,7 @@ async function createLockedFixture(model_dir: string): Promise<void> {
             id: "transfer",
             tolerance: 0.05,
             reference_file: "evidence/curves/transfer.csv",
-            simulation: { kind: "transient_voltage", probe_name: "VOUT" },
+            simulation: { kind: "transient_voltage", probe_name: "VOUT", dut_spice_node: "OUT" },
           },
         ],
       }),
@@ -74,16 +74,27 @@ test("benchmark locks reject synthetic channels and unconsumed sweep props", asy
   manifest.benchmarks[0].simulation = {
     kind: "parameter_sweep",
     probe_name: "VOUT",
+    dut_spice_node: "OUT",
     points: [
       { x: 0, props: { sweepValue: 0 } },
       { x: 1, props: { sweepValue: 1 } },
     ],
   }
   await Bun.write(join(model_dir, "benchmarks.json"), JSON.stringify(manifest))
-  await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("does not consume injected prop")
+  await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("does not use injected prop")
+
+  await Bun.write(
+    join(model_dir, "benchmarks", "transfer.circuit.tsx"),
+    `${benchmarkSource}\n// sweepValue is intentionally mentioned only in a comment\n`,
+  )
+  await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("does not use injected prop")
 
   manifest.benchmarks[0].reference_file = "evidence/../benchmarks/transfer.circuit.tsx"
-  manifest.benchmarks[0].simulation = { kind: "transient_voltage", probe_name: "VOUT" }
+  manifest.benchmarks[0].simulation = {
+    kind: "transient_voltage",
+    probe_name: "VOUT",
+    dut_spice_node: "OUT",
+  }
   await Bun.write(join(model_dir, "benchmarks.json"), JSON.stringify(manifest))
   await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("must stay under evidence")
 

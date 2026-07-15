@@ -181,7 +181,7 @@ test("verified simulation artifacts and dropdown previews survive a server resta
             tolerance: 0.1,
             reference_file: "evidence/curves/transfer.csv",
             result_file: "results/champion/transfer.csv",
-            simulation: { kind: "transient_voltage", probe_name: "VOUT" },
+            simulation: { kind: "transient_voltage", probe_name: "VOUT", dut_spice_node: "OUT" },
           },
         ],
       }),

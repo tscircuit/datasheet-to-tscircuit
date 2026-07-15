@@ -77,7 +77,7 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
             y_scale: "linear",
             reference_file: "evidence/curves/transfer.csv",
             result_file: "results/champion/transfer.csv",
-            simulation: { kind: "transient_voltage", probe_name: "RESULT" },
+            simulation: { kind: "transient_voltage", probe_name: "RESULT", dut_spice_node: "OUT" },
           },
           {
             id: "output",
@@ -90,7 +90,7 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
             y_scale: "linear",
             reference_file: "evidence/curves/output.csv",
             result_file: "results/champion/output.csv",
-            simulation: { kind: "transient_voltage", probe_name: "RESULT" },
+            simulation: { kind: "transient_voltage", probe_name: "RESULT", dut_spice_node: "OUT" },
           },
         ],
       }),

@@ -3,8 +3,12 @@ import { chmod, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { JobStore } from "@/server/job-store"
-import { buildModelAgentPrompt, buildModelSetupPrompt } from "@/server/model-scaffold"
-import { runModel } from "@/server/model-runner"
+import {
+  buildModelAgentPrompt,
+  buildModelBenchmarkPrompt,
+  buildModelSetupPrompt,
+} from "@/server/model-scaffold"
+import { parseModelManifest, runModel } from "@/server/model-runner"
 import { ModelRunStore } from "@/server/model-run-store"
 
 const lockedBenchmarkSource = `import Component from "../component-with-model.circuit"
@@ -22,7 +26,7 @@ export default function Benchmark() {
 
 test("model prompt keeps benchmarks fixed while effort only extends iteration time", () => {
   const prompt = buildModelAgentPrompt()
-  expect(prompt).toContain("Lock the complete benchmark suite")
+  expect(prompt).toContain("already locked")
   expect(prompt).toContain("refinement timer is running")
   expect(prompt).toContain("Re-read run-control.json")
   expect(prompt).toContain("do not reduce tests or loosen tolerances")
@@ -35,6 +39,77 @@ test("model prompt keeps benchmarks fixed while effort only extends iteration ti
   expect(setup_prompt).toContain("Do not guess the final pin mapping")
   expect(setup_prompt).toContain("setup-complete.json")
   expect(setup_prompt).toContain("model-progress.json")
+  const benchmark_prompt = buildModelBenchmarkPrompt()
+  expect(benchmark_prompt).toContain("benchmark-only pass")
+  expect(benchmark_prompt).toContain("dut_spice_node")
+  expect(benchmark_prompt).toContain("Do not create or modify model.lib")
+})
+
+test("model manifests cannot claim an unexecuted simulator", () => {
+  expect(() =>
+    parseModelManifest({
+      version: 1,
+      part_number: "PART",
+      dialect: "pspice",
+      entry_name: "PART",
+      model_file: "model.lib",
+      revision: "r0001",
+      simulator: "PSpice",
+      generated_at: new Date().toISOString(),
+      pins: [{ component_pin: "pin1", spice_node: "IN" }],
+    }),
+  ).toThrow('simulator must be "ngspice"')
+})
+
+test("benchmark finalization cannot create model artifacts before the server lock", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-model-prelock-"))
+  const model_dir = join(job_dir, "spice")
+  const agent_path = join(job_dir, "prelock-agent")
+  const tsci_path = join(job_dir, "unused-tsci")
+  await Promise.all([
+    Bun.write(join(job_dir, "datasheet.pdf"), "%PDF-1.7\nfixture"),
+    Bun.write(join(job_dir, "index.circuit.tsx"), 'export default () => <chip name="U1" />\n'),
+    Bun.write(
+      agent_path,
+      `#!/usr/bin/env bun
+import { mkdir } from "node:fs/promises"
+const args = process.argv.slice(2)
+const dir = args[args.indexOf("--dir") + 1]
+await mkdir(dir + "/benchmarks", { recursive: true })
+await mkdir(dir + "/evidence/curves", { recursive: true })
+await Bun.write(dir + "/benchmarks/transfer.circuit.tsx", ${JSON.stringify(lockedBenchmarkSource)})
+await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: new Date().toISOString(), benchmarks: [{ id: "transfer", title: "Transfer", source: { page: 3 }, critical: true, weight: 1, tolerance: 0.05, reference_file: "evidence/curves/transfer.csv", result_file: "results/champion/transfer.csv", simulation: { kind: "transient_voltage", probe_name: "VOUT_PROBE", dut_spice_node: "OUT" } }] }))
+await Bun.write(dir + "/evidence/curves/transfer.csv", "x,y\\n0,0\\n1,1\\n")
+await Bun.write(dir + "/model.lib", ".subckt TOO_EARLY IN OUT\\nR1 IN OUT 1k\\n.ends TOO_EARLY\\n")
+`,
+    ),
+    Bun.write(tsci_path, "#!/usr/bin/env bun\nprocess.exit(99)\n"),
+  ])
+  await Promise.all([chmod(agent_path, 0o755), chmod(tsci_path, 0o755)])
+  const job_store = new JobStore()
+  const model_run_store = new ModelRunStore()
+  job_store.createJob({ job_id: "job_prelock", job_dir, file_name: "part.pdf" })
+  job_store.updateJob("job_prelock", { display_status: "complete", is_complete: true })
+  model_run_store.createModelRun({
+    model_run_id: "model_prelock",
+    job_id: "job_prelock",
+    model_dir,
+    effort_multiplier: 1,
+    base_effort_ms: 2_000,
+  })
+  await Bun.write(join(model_dir, "setup-complete.json"), JSON.stringify({ version: 1 }))
+
+  await runModel(
+    { model_run_id: "model_prelock" },
+    { job_store, model_run_store, agent_bin: agent_path, tsci_bin: tsci_path },
+  )
+
+  const run = model_run_store.getModelRun("model_prelock")
+  expect(run?.status).toBe("failed")
+  expect(run?.elapsed_time_ms).toBe(0)
+  expect(run?.error_message).toContain("forbidden model artifacts")
+  expect(await Bun.file(join(job_dir, ".model-benchmark-lock", "lock.json")).exists()).toBe(false)
+  await rm(job_dir, { recursive: true, force: true })
 })
 
 test("model runner validates and publishes the checkpointed champion", async () => {
@@ -61,12 +136,20 @@ if (prompt.includes("untimed evidence")) {
   console.log("setup checkpointed")
   process.exit(0)
 }
+if (prompt.includes("benchmark-only pass")) {
+  await Bun.write(dir + "/benchmarks/transfer.circuit.tsx", ${JSON.stringify(lockedBenchmarkSource)})
+  await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: new Date().toISOString(), benchmarks: [{ id: "transfer", title: "Transfer", source: { page: 3 }, critical: true, weight: 1, tolerance: 0.05, reference_file: "evidence/curves/transfer.csv", result_file: "results/champion/transfer.csv", simulation: { kind: "transient_voltage", probe_name: "VOUT_PROBE", dut_spice_node: "OUT" } }] }))
+  await Bun.write(dir + "/evidence/curves/transfer.csv", "x,y\\n0,0\\n1,1\\n")
+  await Bun.write(dir + "/model-progress.json", JSON.stringify({ sequence: 3, phase: "locking_benchmarks", message: "Finalized transfer benchmark", updated_at: new Date().toISOString(), iteration: 0, benchmark: { current: "transfer", completed: 1, total: 1 } }))
+  console.log("benchmarks finalized")
+  process.exit(0)
+}
+if (!(await Bun.file(dir + "/../.model-benchmark-lock/lock.json").exists())) {
+  throw new Error("refinement started before the server benchmark lock")
+}
 await Bun.write(dir + "/model.lib", ".subckt SENSOR IN OUT\\nR1 IN OUT 1k\\n.ends SENSOR\\n")
 await Bun.write(dir + "/model-manifest.json", JSON.stringify({ version: 1, part_number: "SENSOR", dialect: "portable", entry_name: "SENSOR", model_file: "model.lib", revision: "r0001", simulator: "ngspice", generated_at: new Date().toISOString(), pins: [{ component_pin: "pin1", spice_node: "IN" }, { component_pin: "pin2", spice_node: "OUT" }] }))
 await Bun.write(dir + "/component-with-model.circuit.tsx", "export default () => <chip name=\\"U1\\" footprint=\\"soic8\\" spiceModel={<spicemodel source={\\".model D D\\"} spicePinMapping={{ D: \\"pin1\\" }} />} />\\n")
-await Bun.write(dir + "/benchmarks/transfer.circuit.tsx", ${JSON.stringify(lockedBenchmarkSource)})
-await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: new Date().toISOString(), benchmarks: [{ id: "transfer", title: "Transfer", source: { page: 3 }, critical: true, weight: 1, tolerance: 0.05, reference_file: "evidence/curves/transfer.csv", result_file: "results/champion/transfer.csv", simulation: { kind: "transient_voltage", probe_name: "VOUT_PROBE" } }] }))
-await Bun.write(dir + "/evidence/curves/transfer.csv", "x,y\\n0,0\\n1,1\\n")
 await Bun.write(dir + "/results/champion/transfer.csv", "x,y\\n0,0\\n1,1\\n")
 await Bun.write(dir + "/iteration-history.json", JSON.stringify([{ revision: "r0001", decision: "promoted" }]))
 await Bun.write(dir + "/model-card.md", "# SENSOR model\\nValidated with ngspice.\\n")
@@ -162,6 +245,17 @@ console.log("simulation ok")
     ).text(),
   ).toBe(lockedBenchmarkSource)
 
+  const extension = model_run_store.extendModelRun("model_1", 1)
+  expect(extension.should_start).toBe(true)
+  await runModel(
+    { model_run_id: "model_1" },
+    { job_store, model_run_store, agent_bin: agent_path, tsci_bin: tsci_path },
+  )
+  expect(model_run_store.getModelRun("model_1")?.status).toBe("complete")
+  const restored_component = await Bun.file(join(model_dir, "component.circuit.tsx")).text()
+  expect(restored_component).toContain('<chip name="U1" footprint="soic8" />')
+  expect(restored_component).not.toContain('import Component from "./component.circuit"')
+
   await rm(job_dir, { recursive: true, force: true })
 }, 20_000)
 
@@ -179,6 +273,17 @@ test("model runner returns failed validation to the agent until the verified sui
 import { mkdir } from "node:fs/promises"
 const args = process.argv.slice(2)
 const dir = args[args.indexOf("--dir") + 1]
+const prompt = args[args.indexOf("--prompt") + 1]
+if (prompt.includes("benchmark-only pass")) {
+  await mkdir(dir + "/benchmarks", { recursive: true })
+  await mkdir(dir + "/evidence/curves", { recursive: true })
+  await Bun.write(dir + "/benchmarks/transfer.circuit.tsx", ${JSON.stringify(
+    lockedBenchmarkSource.replaceAll("VOUT_PROBE", "VOUT"),
+  )})
+  await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: new Date().toISOString(), benchmarks: [{ id: "transfer", title: "Transfer", source: { page: 3 }, critical: true, weight: 1, tolerance: 0.05, reference_file: "evidence/curves/transfer.csv", result_file: "results/champion/transfer.csv", simulation: { kind: "transient_voltage", probe_name: "VOUT", dut_spice_node: "OUT" } }] }))
+  await Bun.write(dir + "/evidence/curves/transfer.csv", "x,y\\n0,0\\n1,1\\n")
+  process.exit(0)
+}
 const attemptFile = dir + "/agent-attempt.txt"
 const previous = Number(await Bun.file(attemptFile).text().catch(() => "0"))
 const attempt = previous + 1
@@ -195,13 +300,6 @@ await mkdir(dir + "/results/champion", { recursive: true })
 await Bun.write(dir + "/model.lib", ".subckt LOOP IN OUT\\nR1 IN OUT 1k\\n.ends LOOP\\n")
 await Bun.write(dir + "/model-manifest.json", JSON.stringify({ version: 1, part_number: "LOOP", dialect: "portable", entry_name: "LOOP", model_file: "model.lib", revision: "r000" + attempt, simulator: "ngspice", generated_at: new Date().toISOString(), pins: [{ component_pin: "pin1", spice_node: "IN" }, { component_pin: "pin2", spice_node: "OUT" }] }))
 await Bun.write(dir + "/component-with-model.circuit.tsx", "export default () => <chip name=\\"U1\\" />\\n")
-if (attempt === 1) {
-  await Bun.write(dir + "/benchmarks/transfer.circuit.tsx", ${JSON.stringify(
-    lockedBenchmarkSource.replaceAll("VOUT_PROBE", "VOUT"),
-  )})
-  await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: new Date().toISOString(), benchmarks: [{ id: "transfer", title: "Transfer", source: { page: 3 }, critical: true, weight: 1, tolerance: 0.05, reference_file: "evidence/curves/transfer.csv", result_file: "results/champion/transfer.csv", simulation: { kind: "transient_voltage", probe_name: "VOUT" } }] }))
-  await Bun.write(dir + "/evidence/curves/transfer.csv", "x,y\\n0,0\\n1,1\\n")
-}
 await Bun.write(dir + "/results/champion/transfer.csv", "x,y\\n0,0\\n1," + (attempt === 1 ? "2" : "1") + "\\n")
 await Bun.write(dir + "/iteration-history.json", JSON.stringify(Array.from({ length: attempt }, (_, index) => ({ revision: "r000" + (index + 1), decision: "promoted" }))))
 await Bun.write(dir + "/model-card.md", "# LOOP model\\n")
@@ -273,6 +371,15 @@ test("model runner recovers the latest promoted model when the effort deadline i
 import { mkdir } from "node:fs/promises"
 const args = process.argv.slice(2)
 const dir = args[args.indexOf("--dir") + 1]
+const prompt = args[args.indexOf("--prompt") + 1]
+if (prompt.includes("benchmark-only pass")) {
+  await mkdir(dir + "/benchmarks", { recursive: true })
+  await mkdir(dir + "/evidence/curves", { recursive: true })
+  await Bun.write(dir + "/benchmarks/transfer.circuit.tsx", ${JSON.stringify(lockedBenchmarkSource)})
+  await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: new Date().toISOString(), benchmarks: [{ id: "transfer", title: "Transfer", source: { page: 3 }, critical: true, weight: 1, tolerance: 0.05, reference_file: "evidence/curves/transfer.csv", result_file: "results/champion/transfer.csv", simulation: { kind: "transient_voltage", probe_name: "VOUT_PROBE", dut_spice_node: "OUT" } }] }))
+  await Bun.write(dir + "/evidence/curves/transfer.csv", "x,y\\n0,0\\n1,1\\n")
+  process.exit(0)
+}
 await mkdir(dir + "/candidates/r0001", { recursive: true })
 await Bun.write(dir + "/candidates/r0001/model.lib", ".subckt RECOVERED IN OUT\\nR1 IN OUT 1k\\n.ends RECOVERED\\n")
 await Bun.write(dir + "/iteration-history.json", JSON.stringify([{ revision: "r0001", decision: "promoted" }]))
@@ -305,7 +412,7 @@ await Bun.sleep(30_000)
   expect(recovered_run?.model_source).toContain(".subckt RECOVERED")
   expect(await Bun.file(join(model_dir, "model.lib")).text()).toContain(".subckt RECOVERED")
   expect(recovered_run?.elapsed_time_ms).toBeLessThan(1_000)
-  expect(recovered_run?.error_message).toContain("validation reserve")
+  expect(recovered_run?.error_message).toContain("independent-validation window")
 
   await rm(job_dir, { recursive: true, force: true })
 }, 10_000)
@@ -337,14 +444,18 @@ export default function SweepBenchmark({ sweepValue = 0 }: { sweepValue?: number
 import { mkdir } from "node:fs/promises"
 const args = process.argv.slice(2)
 const dir = args[args.indexOf("--dir") + 1]
+const prompt = args[args.indexOf("--prompt") + 1]
 await mkdir(dir + "/benchmarks", { recursive: true })
 await mkdir(dir + "/evidence/curves", { recursive: true })
+if (prompt.includes("benchmark-only pass")) {
+  await Bun.write(dir + "/benchmarks/sweep.circuit.tsx", ${JSON.stringify(sweep_source)})
+  await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: new Date().toISOString(), benchmarks: [{ id: "sweep", title: "Sweep", source: { page: 2 }, critical: true, weight: 1, tolerance: 0.01, reference_file: "evidence/curves/sweep.csv", result_file: "results/champion/sweep.csv", simulation: { kind: "parameter_sweep", probe_name: "VOUT", dut_spice_node: "OUT", reducer: "last", points: [{ x: 0, props: { sweepValue: 0 } }, { x: 1, props: { sweepValue: 1 } }] } }] }))
+  await Bun.write(dir + "/evidence/curves/sweep.csv", "x,y\\n0,0\\n1,2\\n")
+  process.exit(0)
+}
 await Bun.write(dir + "/model.lib", ".subckt SWEEP IN OUT\\nR1 IN OUT 1k\\n.ends SWEEP\\n")
 await Bun.write(dir + "/model-manifest.json", JSON.stringify({ version: 1, part_number: "SWEEP", dialect: "portable", entry_name: "SWEEP", model_file: "model.lib", revision: "r0001", simulator: "ngspice", generated_at: new Date().toISOString(), pins: [{ component_pin: "pin1", spice_node: "IN" }, { component_pin: "pin2", spice_node: "OUT" }] }))
 await Bun.write(dir + "/component-with-model.circuit.tsx", "export default () => <chip name=\\"untrusted\\" />\\n")
-await Bun.write(dir + "/benchmarks/sweep.circuit.tsx", ${JSON.stringify(sweep_source)})
-await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: new Date().toISOString(), benchmarks: [{ id: "sweep", title: "Sweep", source: { page: 2 }, critical: true, weight: 1, tolerance: 0.01, reference_file: "evidence/curves/sweep.csv", result_file: "results/champion/sweep.csv", simulation: { kind: "parameter_sweep", probe_name: "VOUT", reducer: "last", points: [{ x: 0, props: { sweepValue: 0 } }, { x: 1, props: { sweepValue: 1 } }] } }] }))
-await Bun.write(dir + "/evidence/curves/sweep.csv", "x,y\\n0,0\\n1,2\\n")
 await Bun.write(dir + "/iteration-history.json", JSON.stringify([{ revision: "r0001", decision: "promoted" }]))
 await Bun.write(dir + "/model-card.md", "# SWEEP model\\n")
 `,

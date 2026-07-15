@@ -332,7 +332,8 @@ export function ModelPanel({ job }: { job: Job }) {
         <h2>Build and validate a simulation model.</h2>
         <p>
           Reference extraction starts immediately and runs alongside component generation. When the component
-          is ready, the agent locks one benchmark suite and starts the time-budgeted refinement loop.
+          is ready, a separate untimed pass finalizes the benchmark suite; the server locks it before starting
+          the time-budgeted refinement loop.
         </p>
         <div className="effort-picker" role="group" aria-label="Modeling effort">
           {[1, 2, 4, 8].map((value) => (
