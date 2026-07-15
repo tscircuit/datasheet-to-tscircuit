@@ -78,8 +78,48 @@ Both stdout and stderr are streamed to the browser and persisted to
 turn, tool, retry, compaction, assistant-text, and thinking events, so a separate
 `--log-file` flag is not required.
 
+The server also checkpoints task metadata to `job.json` and model-run state to
+`spice/model-run.json`. At startup it scans `.runtime/jobs` and restores every
+recoverable task, log, generated component, model checkpoint, and preview. A run
+that was interrupted by the restart is shown as failed and can be retried from
+its preserved files. Deleting a task removes its in-memory component/model jobs
+and its complete `.runtime/jobs/<job_id>` directory, so it does not return after
+the next restart.
+
 After the agent exits successfully, the server runs `tsci build` and returns the
 generated `index.circuit.tsx` and Circuit JSON to the browser.
+
+The New Task form can also launch a PSpice model run with a 1×, 2×, 4×, or 8×
+effort budget. Model creation is enabled by default, and the toggle/effort choice
+is retained locally for the next task. Its setup agent starts alongside component conversion and extracts
+datasheet curves, provenance, and benchmark references without consuming the
+effort budget. If setup finishes first, the model run waits for the authoritative
+component pinout. The refinement timer starts only after that component is
+available; higher effort uses the same locked benchmarks and scoring process for
+more refinement iterations.
+
+Model work is stored under `.runtime/jobs/<job_id>/spice`. The server owns the
+numeric benchmark scorer, reruns every generated tscircuit analog test bench, and
+keeps the best checkpointed model when time expires. The model tab streams
+structured progress checkpoints live, including datasheet/graph evidence counts,
+the active benchmark, iteration number, and current champion score, alongside the
+complete agent log. As benchmark TSX and numeric evidence appear, the server
+builds a live runframe and plots the reference curve with the current model result.
+Candidate CSVs written by the agent are not trusted for final scoring or display:
+the server reruns each analog circuit, rejects Circuit JSON simulation errors,
+extracts probe graphs into hashed `results/verified` CSVs, and scores and plots
+only those verified files. The preview dropdown switches the circuit and its paired reference/result curve
+together. SPICE runframes expose only Analog Simulation, Code, and Schematic, with
+Analog Simulation selected initially. A failed validation pass is sent back to
+the agent for another correction pass until every locked benchmark passes or the
+effort budget ends; timed-out runs still expose the latest checkpoint. Reference and model-result traces use
+complementary dash phases so both remain visible when their values overlap.
+The canonical or last promoted model is published before bounded independent
+validation, so a validation timeout cannot hide an available checkpoint. A
+successfully built model wrapper is attached back to the generated component.
+Set `MODEL_BASE_EFFORT_MS` to change the local duration represented by 1× effort
+(30 minutes by default). Refinement and independent validation share that effort
+window; reference setup and waiting for the component remain untimed.
 
 The task sidebar can start and monitor multiple conversions concurrently. Each
 job has an independent process group and cancel control, so stopping one task

@@ -6,3 +6,4 @@ dist
 .cursor
 bun.lockb
 *.log
+.tscircuit/cache

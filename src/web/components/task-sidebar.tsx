@@ -113,7 +113,7 @@ export function TaskSidebar({
                     </span>
                   </button>
                   <span className="task-entry-actions">
-                    {task.display_status === "cancelled" && (
+                    {(task.display_status === "cancelled" || task.display_status === "failed") && (
                       <button
                         className="task-retry"
                         type="button"

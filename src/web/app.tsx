@@ -1,7 +1,8 @@
-import { LoaderCircle, WandSparkles } from "lucide-react"
+import { Boxes, FlaskConical, LoaderCircle, WandSparkles } from "lucide-react"
 import { useEffect, useState } from "react"
 import { AgentLogs } from "./components/agent-logs"
 import { CircuitPreview } from "./components/circuit-preview"
+import { ModelPanel } from "./components/model-panel"
 import { TaskSidebar } from "./components/task-sidebar"
 import { UploadPanel } from "./components/upload-panel"
 import { useActiveJob } from "./use-active-job"
@@ -11,6 +12,14 @@ function getInitialSidebarState(): boolean {
     return window.localStorage.getItem("datasheet-sidebar-collapsed") === "true"
   } catch {
     return false
+  }
+}
+
+function getInitialWorkspaceTab(): "component" | "model" {
+  try {
+    return window.localStorage.getItem("datasheet-workspace-tab") === "model" ? "model" : "component"
+  } catch {
+    return "component"
   }
 }
 
@@ -32,6 +41,7 @@ export default function App() {
     deleteTask,
   } = useActiveJob()
   const [is_sidebar_collapsed, setIsSidebarCollapsed] = useState(getInitialSidebarState)
+  const [workspace_tab, setWorkspaceTab] = useState<"component" | "model">(getInitialWorkspaceTab)
 
   useEffect(() => {
     try {
@@ -40,6 +50,14 @@ export default function App() {
       // The preference is optional when storage is unavailable.
     }
   }, [is_sidebar_collapsed])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("datasheet-workspace-tab", workspace_tab)
+    } catch {
+      // The preference is optional when storage is unavailable.
+    }
+  }, [workspace_tab])
 
   return (
     <div className={`app-shell ${is_sidebar_collapsed ? "sidebar-collapsed" : ""}`}>
@@ -81,16 +99,36 @@ export default function App() {
           </main>
         ) : (
           <main className="job-main">
-            <div className="workspace-grid">
-              <AgentLogs
-                job={job}
-                is_stopping={job.display_status === "cancelling" || cancelling_job_ids.has(job.job_id)}
-                on_cancel={() => cancelTask(job.job_id)}
-              />
-              <div className="preview-column">
-                <CircuitPreview job={job} />
+            <nav className="workspace-tabs" aria-label="Datasheet artifacts">
+              <button
+                className={workspace_tab === "component" ? "active" : ""}
+                type="button"
+                onClick={() => setWorkspaceTab("component")}
+              >
+                <Boxes size={15} /> Component
+              </button>
+              <button
+                className={workspace_tab === "model" ? "active" : ""}
+                type="button"
+                onClick={() => setWorkspaceTab("model")}
+              >
+                <FlaskConical size={15} /> SPICE Model
+              </button>
+            </nav>
+            {workspace_tab === "component" ? (
+              <div className="workspace-grid">
+                <AgentLogs
+                  job={job}
+                  is_stopping={job.display_status === "cancelling" || cancelling_job_ids.has(job.job_id)}
+                  on_cancel={() => cancelTask(job.job_id)}
+                />
+                <div className="preview-column">
+                  <CircuitPreview job={job} />
+                </div>
               </div>
-            </div>
+            ) : (
+              <ModelPanel job={job} />
+            )}
           </main>
         )}
       </div>

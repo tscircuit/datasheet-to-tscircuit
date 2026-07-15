@@ -1,13 +1,17 @@
 import { mkdir } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import { createJobApiHandler } from "./job-api"
+import { restorePersistedJobs } from "./job-restorer"
 import { JobStore } from "./job-store"
+import { createModelRunApiHandler } from "./model-run-api"
+import { ModelRunStore } from "./model-run-store"
 
 export interface AppServerOptions {
   hostname?: string
   port?: number
   root_dir?: string
   job_store?: JobStore
+  model_run_store?: ModelRunStore
 }
 
 export function resolveServerHostname(
@@ -38,18 +42,23 @@ export async function createAppServer(options: AppServerOptions = {}) {
   await mkdir(jobs_root, { recursive: true })
 
   const job_store = options.job_store ?? new JobStore()
-  const handleApiRequest = createJobApiHandler({
+  const model_run_store = options.model_run_store ?? new ModelRunStore()
+  await restorePersistedJobs({ jobs_root, job_store, model_run_store })
+  const runner_context = {
     jobs_root,
     job_store,
+    model_run_store,
     agent_bin: process.env.TSCI_AGENT_BIN ?? join(root_dir, "node_modules", ".bin", "tsci-agent"),
     tsci_bin: process.env.TSCI_BIN ?? join(root_dir, "node_modules", ".bin", "tsci"),
-  })
+  }
+  const handleModelRunApiRequest = createModelRunApiHandler(runner_context)
+  const handleJobApiRequest = createJobApiHandler(runner_context)
 
   return Bun.serve({
     hostname: resolveServerHostname(options.hostname),
     port: options.port ?? Number(process.env.PORT ?? 3000),
     async fetch(request) {
-      const api_response = await handleApiRequest(request)
+      const api_response = (await handleModelRunApiRequest(request)) ?? (await handleJobApiRequest(request))
       return api_response ?? getStaticResponse(request, root_dir)
     },
   })

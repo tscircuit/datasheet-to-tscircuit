@@ -1,4 +1,5 @@
 import { appendFile } from "node:fs/promises"
+import { mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import type { Job, JobEvent, JobListEvent, JobLog, JobLogStream, JobSummary } from "@/shared/job-types"
 
@@ -26,6 +27,18 @@ export interface CreateJobInput {
   job_dir: string
   file_name: string
   additional_instructions?: string
+}
+
+export interface RestoreJobInput extends CreateJobInput {
+  created_at: string
+  completed_at?: string
+  display_status: Job["display_status"]
+  is_complete: boolean
+  has_errors: boolean
+  error_message?: string
+  logs: JobLog[]
+  component_code?: string
+  circuit_json?: Job["circuit_json"]
 }
 
 export type JobUpdate = Partial<
@@ -89,9 +102,23 @@ export class JobStore {
       subscriber_set: new Set(),
     }
     this.job_map.set(job_record.job_id, job_record)
+    this.persist(job_record)
     const job = getPublicJob(job_record)
     this.publishJobList({ event_type: "job_updated", job: getJobSummary(job_record) })
     return job
+  }
+
+  restoreJob(input: RestoreJobInput): Job {
+    const existing = this.job_map.get(input.job_id)
+    if (existing) return getPublicJob(existing)
+    const job_record: JobRecord = {
+      ...input,
+      cancellation_controller: new AbortController(),
+      subscriber_set: new Set(),
+    }
+    this.job_map.set(job_record.job_id, job_record)
+    this.persist(job_record)
+    return getPublicJob(job_record)
   }
 
   getJob(job_id: string): Job | undefined {
@@ -132,6 +159,7 @@ export class JobStore {
     if (job_record.cancellation_controller.signal.aborted) return "already_requested"
 
     job_record.display_status = "cancelling"
+    this.persist(job_record)
     const job = getPublicJob(job_record)
     this.publish(job_record, { event_type: "job_updated", job })
     this.publishJobList({ event_type: "job_updated", job: getJobSummary(job_record) })
@@ -143,6 +171,7 @@ export class JobStore {
     const job_record = this.job_map.get(job_id)
     if (!job_record) throw new Error(`Job ${job_id} was not found`)
     Object.assign(job_record, job_update)
+    this.persist(job_record)
     const job = getPublicJob(job_record)
     this.publish(job_record, { event_type: "job_updated", job })
     this.publishJobList({ event_type: "job_updated", job: getJobSummary(job_record) })
@@ -195,5 +224,28 @@ export class JobStore {
 
   private publishJobList(job_event: JobListEvent): void {
     for (const subscriber of this.job_list_subscriber_set) subscriber(job_event)
+  }
+
+  private persist(job_record: JobRecord): void {
+    mkdirSync(job_record.job_dir, { recursive: true })
+    writeFileSync(
+      join(job_record.job_dir, "job.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          job_id: job_record.job_id,
+          file_name: job_record.file_name,
+          created_at: job_record.created_at,
+          completed_at: job_record.completed_at,
+          display_status: job_record.display_status,
+          is_complete: job_record.is_complete,
+          has_errors: job_record.has_errors,
+          error_message: job_record.error_message,
+          additional_instructions: job_record.additional_instructions,
+        },
+        null,
+        2,
+      )}\n`,
+    )
   }
 }
