@@ -1,18 +1,31 @@
 import { appendFile } from "node:fs/promises"
 import { join } from "node:path"
-import type { Job, JobEvent, JobLog, JobLogStream } from "@/shared/job-types"
+import type { Job, JobEvent, JobListEvent, JobLog, JobLogStream, JobSummary } from "@/shared/job-types"
 
 type JobSubscriber = (job_event: JobEvent) => void
+type JobListSubscriber = (job_event: JobListEvent) => void
 
 interface JobRecord extends Job {
   job_dir: string
+  additional_instructions?: string
+  cancellation_controller: AbortController
   subscriber_set: Set<JobSubscriber>
 }
+
+export interface JobRetrySource {
+  job_dir: string
+  file_name: string
+  additional_instructions?: string
+  display_status: Job["display_status"]
+}
+
+export type JobCancellationResult = "requested" | "already_requested" | "already_complete" | "not_found"
 
 export interface CreateJobInput {
   job_id: string
   job_dir: string
   file_name: string
+  additional_instructions?: string
 }
 
 export type JobUpdate = Partial<
@@ -44,23 +57,41 @@ function getPublicJob(job_record: JobRecord): Job {
   }
 }
 
+function getJobSummary(job_record: JobRecord): JobSummary {
+  return {
+    job_id: job_record.job_id,
+    file_name: job_record.file_name,
+    created_at: job_record.created_at,
+    completed_at: job_record.completed_at,
+    display_status: job_record.display_status,
+    is_complete: job_record.is_complete,
+    has_errors: job_record.has_errors,
+    error_message: job_record.error_message,
+  }
+}
+
 export class JobStore {
   private job_map = new Map<string, JobRecord>()
+  private job_list_subscriber_set = new Set<JobListSubscriber>()
 
   createJob(input: CreateJobInput): Job {
     const job_record: JobRecord = {
       job_id: input.job_id,
       job_dir: input.job_dir,
       file_name: input.file_name,
+      additional_instructions: input.additional_instructions,
       created_at: new Date().toISOString(),
       display_status: "queued",
       is_complete: false,
       has_errors: false,
       logs: [],
+      cancellation_controller: new AbortController(),
       subscriber_set: new Set(),
     }
     this.job_map.set(job_record.job_id, job_record)
-    return getPublicJob(job_record)
+    const job = getPublicJob(job_record)
+    this.publishJobList({ event_type: "job_updated", job: getJobSummary(job_record) })
+    return job
   }
 
   getJob(job_id: string): Job | undefined {
@@ -68,8 +99,44 @@ export class JobStore {
     return job_record ? getPublicJob(job_record) : undefined
   }
 
+  listJobs(): JobSummary[] {
+    return [...this.job_map.values()]
+      .reverse()
+      .map(getJobSummary)
+      .sort((first, second) => second.created_at.localeCompare(first.created_at))
+  }
+
   getJobDir(job_id: string): string | undefined {
     return this.job_map.get(job_id)?.job_dir
+  }
+
+  getJobRetrySource(job_id: string): JobRetrySource | undefined {
+    const job_record = this.job_map.get(job_id)
+    if (!job_record) return undefined
+    return {
+      job_dir: job_record.job_dir,
+      file_name: job_record.file_name,
+      additional_instructions: job_record.additional_instructions,
+      display_status: job_record.display_status,
+    }
+  }
+
+  getCancellationSignal(job_id: string): AbortSignal | undefined {
+    return this.job_map.get(job_id)?.cancellation_controller.signal
+  }
+
+  requestCancellation(job_id: string): JobCancellationResult {
+    const job_record = this.job_map.get(job_id)
+    if (!job_record) return "not_found"
+    if (job_record.is_complete) return "already_complete"
+    if (job_record.cancellation_controller.signal.aborted) return "already_requested"
+
+    job_record.display_status = "cancelling"
+    const job = getPublicJob(job_record)
+    this.publish(job_record, { event_type: "job_updated", job })
+    this.publishJobList({ event_type: "job_updated", job: getJobSummary(job_record) })
+    job_record.cancellation_controller.abort()
+    return "requested"
   }
 
   updateJob(job_id: string, job_update: JobUpdate): Job {
@@ -78,6 +145,7 @@ export class JobStore {
     Object.assign(job_record, job_update)
     const job = getPublicJob(job_record)
     this.publish(job_record, { event_type: "job_updated", job })
+    this.publishJobList({ event_type: "job_updated", job: getJobSummary(job_record) })
     return job
   }
 
@@ -108,7 +176,24 @@ export class JobStore {
     return () => job_record.subscriber_set.delete(subscriber)
   }
 
+  subscribeToJobList(subscriber: JobListSubscriber): () => void {
+    this.job_list_subscriber_set.add(subscriber)
+    return () => this.job_list_subscriber_set.delete(subscriber)
+  }
+
+  deleteJob(job_id: string): boolean {
+    const job_record = this.job_map.get(job_id)
+    if (!job_record || !job_record.is_complete) return false
+    this.job_map.delete(job_id)
+    this.publishJobList({ event_type: "job_deleted", job_id })
+    return true
+  }
+
   private publish(job_record: JobRecord, job_event: JobEvent): void {
     for (const subscriber of job_record.subscriber_set) subscriber(job_event)
+  }
+
+  private publishJobList(job_event: JobListEvent): void {
+    for (const subscriber of this.job_list_subscriber_set) subscriber(job_event)
   }
 }

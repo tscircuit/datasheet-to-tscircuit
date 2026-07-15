@@ -9,20 +9,32 @@ const CircuitJsonPreview = lazy(async () => {
 })
 
 function EmptyPreview({ job }: { job: Job }) {
-  const copy = job.has_errors
-    ? (job.error_message ?? "The agent could not build a preview.")
-    : job.display_status === "building"
-      ? "Compiling TSX into Circuit JSON…"
-      : "The preview will appear as soon as the component builds."
+  const is_cancelled = job.display_status === "cancelled"
+  const is_terminal = job.has_errors || is_cancelled
+  const copy = is_cancelled
+    ? "This conversion was cancelled before a preview was built."
+    : job.has_errors
+      ? (job.error_message ?? "The agent could not build a preview.")
+      : job.display_status === "building"
+        ? "Compiling TSX into Circuit JSON…"
+        : "The preview will appear as soon as the component builds."
 
   return (
-    <div className={`empty-preview ${job.has_errors ? "preview-error" : ""}`}>
+    <div
+      className={`empty-preview ${job.has_errors ? "preview-error" : ""} ${is_cancelled ? "preview-cancelled" : ""}`}
+    >
       <span className="preview-loader-ring">
-        {job.has_errors ? <Boxes size={27} /> : <LoaderCircle className="spin" size={27} />}
+        {is_terminal ? <Boxes size={27} /> : <LoaderCircle className="spin" size={27} />}
       </span>
-      <strong>{job.has_errors ? "Preview unavailable" : "Preparing component preview"}</strong>
+      <strong>
+        {is_cancelled
+          ? "Conversion cancelled"
+          : job.has_errors
+            ? "Preview unavailable"
+            : "Preparing component preview"}
+      </strong>
       <p>{copy}</p>
-      {!job.has_errors && (
+      {!is_terminal && (
         <div className="preview-skeleton">
           <i />
           <i />

@@ -1,6 +1,6 @@
-import { mkdir } from "node:fs/promises"
+import { copyFile, mkdir, rm } from "node:fs/promises"
 import { join } from "node:path"
-import type { ApiError, JobEvent } from "@/shared/job-types"
+import type { ApiError, JobEvent, JobListEvent } from "@/shared/job-types"
 import { writeJobScaffold } from "./job-scaffold"
 import { runJob, type JobRunnerContext } from "./job-runner"
 import type { JobStore } from "./job-store"
@@ -78,6 +78,49 @@ function createEventStream(job_id: string, job_store: JobStore): Response {
   })
 }
 
+function createJobListEventStream(job_store: JobStore): Response {
+  const encoder = new TextEncoder()
+  let unsubscribe: (() => void) | undefined
+  let heartbeat: ReturnType<typeof setInterval> | undefined
+
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const send = (job_event: JobListEvent) => {
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(job_event)}\n\n`))
+        } catch {
+          unsubscribe?.()
+          if (heartbeat) clearInterval(heartbeat)
+        }
+      }
+
+      send({ event_type: "jobs_snapshot", jobs: job_store.listJobs() })
+      unsubscribe = job_store.subscribeToJobList(send)
+      heartbeat = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(": keep-alive\n\n"))
+        } catch {
+          unsubscribe?.()
+          if (heartbeat) clearInterval(heartbeat)
+        }
+      }, 15_000)
+    },
+    cancel() {
+      unsubscribe?.()
+      if (heartbeat) clearInterval(heartbeat)
+    },
+  })
+
+  return new Response(body, {
+    headers: {
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "Content-Type": "text/event-stream",
+      "X-Accel-Buffering": "no",
+    },
+  })
+}
+
 async function createJobFromRequest(request: Request, context: JobApiContext): Promise<Response> {
   let form: FormData
   try {
@@ -101,25 +144,119 @@ async function createJobFromRequest(request: Request, context: JobApiContext): P
   await writeJobScaffold(job_dir)
   await Bun.write(join(job_dir, "datasheet.pdf"), pdf_bytes)
 
-  const job = context.job_store.createJob({ job_id, job_dir, file_name: datasheet.name })
+  const additional_instructions_value = form.get("additional_instructions")
+  const additional_instructions =
+    typeof additional_instructions_value === "string"
+      ? additional_instructions_value.trim().slice(0, 4_000) || undefined
+      : undefined
+  const job = context.job_store.createJob({
+    job_id,
+    job_dir,
+    file_name: datasheet.name,
+    additional_instructions,
+  })
   await context.job_store.appendLog(
     job_id,
     "system",
     `Uploaded ${datasheet.name} (${datasheet.size} bytes).\n`,
   )
 
-  const additional_instructions = form.get("additional_instructions")
   const runner = context.run_job ?? runJob
   void runner(
     {
       job_id,
-      additional_instructions:
-        typeof additional_instructions === "string" ? additional_instructions.slice(0, 4_000) : undefined,
+      additional_instructions,
     },
     context,
   )
 
   return jsonResponse({ job }, 202)
+}
+
+async function retryJob(request_url: URL, context: JobApiContext): Promise<Response> {
+  const source_job_id = getJobId(request_url)
+  if (!source_job_id) return errorResponse("job_id_required", "job_id is required.", 400)
+
+  const source = context.job_store.getJobRetrySource(source_job_id)
+  if (!source) return errorResponse("job_not_found", `No job exists for ${source_job_id}.`, 404)
+  if (source.display_status !== "cancelled") {
+    return errorResponse("job_not_cancelled", "Only stopped tasks can be retried.", 409)
+  }
+
+  const job_id = crypto.randomUUID()
+  const job_dir = join(context.jobs_root, job_id)
+  await mkdir(job_dir, { recursive: true })
+  await writeJobScaffold(job_dir)
+  await copyFile(join(source.job_dir, "datasheet.pdf"), join(job_dir, "datasheet.pdf"))
+
+  const job = context.job_store.createJob({
+    job_id,
+    job_dir,
+    file_name: source.file_name,
+    additional_instructions: source.additional_instructions,
+  })
+  await context.job_store.appendLog(job_id, "system", `Retrying stopped task ${source_job_id}.\n`)
+
+  const runner = context.run_job ?? runJob
+  void runner({ job_id, additional_instructions: source.additional_instructions }, context)
+  return jsonResponse({ job }, 202)
+}
+
+function waitForJobCompletion(job_id: string, job_store: JobStore, timeout_ms = 5_000): Promise<boolean> {
+  if (job_store.getJob(job_id)?.is_complete) return Promise.resolve(true)
+
+  return new Promise((resolve) => {
+    let unsubscribe: (() => void) | undefined
+    const finish = (is_complete: boolean) => {
+      clearTimeout(timeout)
+      unsubscribe?.()
+      resolve(is_complete)
+    }
+    const timeout = setTimeout(() => finish(false), timeout_ms)
+    unsubscribe = job_store.subscribe(job_id, (job_event) => {
+      if (job_event.event_type !== "log" && job_event.job.is_complete) finish(true)
+    })
+    if (!unsubscribe) finish(false)
+  })
+}
+
+async function deleteJob(request_url: URL, context: JobApiContext): Promise<Response> {
+  const job_id = getJobId(request_url)
+  if (!job_id) return errorResponse("job_id_required", "job_id is required.", 400)
+
+  const job_dir = context.job_store.getJobDir(job_id)
+  const job = context.job_store.getJob(job_id)
+  if (!job_dir || !job) return errorResponse("job_not_found", `No job exists for ${job_id}.`, 404)
+
+  if (!job.is_complete) {
+    context.job_store.requestCancellation(job_id)
+    if (!(await waitForJobCompletion(job_id, context.job_store))) {
+      return errorResponse("job_stop_timeout", "The task could not be stopped before deletion.", 409)
+    }
+  }
+
+  if (!context.job_store.deleteJob(job_id)) {
+    return errorResponse("job_delete_conflict", "The task is still active and cannot be deleted.", 409)
+  }
+  await rm(job_dir, { recursive: true, force: true })
+  return new Response(null, { status: 204 })
+}
+
+function cancelJob(request_url: URL, context: JobApiContext): Response {
+  const job_id = getJobId(request_url)
+  if (!job_id) return errorResponse("job_id_required", "job_id is required.", 400)
+
+  const cancellation_result = context.job_store.requestCancellation(job_id)
+  if (cancellation_result === "not_found") {
+    return errorResponse("job_not_found", `No job exists for ${job_id}.`, 404)
+  }
+  if (cancellation_result === "already_complete") {
+    return errorResponse("job_already_complete", "This job has already finished.", 409)
+  }
+
+  const job = context.job_store.getJob(job_id)
+  if (!job) return errorResponse("job_not_found", `No job exists for ${job_id}.`, 404)
+  return jsonResponse({ job }, cancellation_result === "requested" ? 202 : 200)
 }
 
 function getJobFile(request_url: URL, context: JobApiContext): Response {
@@ -156,6 +293,21 @@ export function createJobApiHandler(context: JobApiContext) {
     if (request.method === "OPTIONS") return new Response(null, { status: 204 })
     if (request_url.pathname === "/api/job/create" && request.method === "POST") {
       return createJobFromRequest(request, context)
+    }
+    if (request_url.pathname === "/api/jobs" && request.method === "GET") {
+      return jsonResponse({ jobs: context.job_store.listJobs() })
+    }
+    if (request_url.pathname === "/api/jobs/events" && request.method === "GET") {
+      return createJobListEventStream(context.job_store)
+    }
+    if (request_url.pathname === "/api/job/cancel" && request.method === "POST") {
+      return cancelJob(request_url, context)
+    }
+    if (request_url.pathname === "/api/job/retry" && request.method === "POST") {
+      return retryJob(request_url, context)
+    }
+    if (request_url.pathname === "/api/job/delete" && request.method === "DELETE") {
+      return deleteJob(request_url, context)
     }
     if (request_url.pathname === "/api/job/get" && request.method === "GET") {
       const job_id = getJobId(request_url)

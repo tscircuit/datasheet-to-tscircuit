@@ -1,4 +1,4 @@
-import { ArrowRight, FileText, ShieldCheck, Sparkles, UploadCloud, X } from "lucide-react"
+import { ArrowRight, FileText, Sparkles, UploadCloud, X } from "lucide-react"
 import { useRef, useState } from "react"
 import { createJob } from "../api"
 import type { Job } from "@/shared/job-types"
@@ -134,14 +134,6 @@ export function UploadPanel({ on_job_created }: UploadPanelProps) {
           </>
         )}
       </button>
-
-      <div className="trust-row">
-        <span>
-          <ShieldCheck size={15} /> Isolated job workspace
-        </span>
-        <span className="trust-dot" />
-        <span>Every agent event is streamed</span>
-      </div>
     </section>
   )
 }

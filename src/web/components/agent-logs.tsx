@@ -1,9 +1,17 @@
-import { Download, Terminal } from "lucide-react"
+import { Download, Square, Terminal } from "lucide-react"
 import { useEffect, useRef } from "react"
 import type { Job } from "@/shared/job-types"
 import { getJobFileUrl } from "../api"
 
-export function AgentLogs({ job }: { job: Job }) {
+export function AgentLogs({
+  job,
+  is_stopping,
+  on_cancel,
+}: {
+  job: Job
+  is_stopping: boolean
+  on_cancel: () => void
+}) {
   const end_ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
     end_ref.current?.scrollIntoView({ behavior: "smooth", block: "nearest" })
@@ -16,13 +24,19 @@ export function AgentLogs({ job }: { job: Job }) {
       <header className="card-toolbar dark-toolbar">
         <div className="toolbar-title">
           <Terminal size={16} />
-          <span>Agent activity</span>
+          <span title={job.file_name}>{job.file_name.replace(/\.pdf$/i, "")}</span>
         </div>
         <div className="toolbar-actions">
           {is_running && (
-            <span className="live-indicator">
-              <i /> LIVE
+            <span className="run-indicator">
+              <i /> {is_stopping ? "STOPPING…" : "RUNNING"}
             </span>
+          )}
+          {is_running && (
+            <button className="stop-run-button" type="button" disabled={is_stopping} onClick={on_cancel}>
+              <Square size={9} fill="currentColor" />
+              {is_stopping ? "Stopping…" : "Stop run"}
+            </button>
           )}
           <a
             className="toolbar-icon-link"
