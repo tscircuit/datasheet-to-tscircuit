@@ -1,4 +1,5 @@
-import { ArrowLeft, BookOpen, FileText, GitBranch, WandSparkles } from "lucide-react"
+import { ArrowLeft, BookOpen, FileText, GitBranch, Square, WandSparkles } from "lucide-react"
+import type { JobDisplayStatus } from "@/shared/job-types"
 import { AgentLogs } from "./components/agent-logs"
 import { Brand } from "./components/brand"
 import { CircuitPreview } from "./components/circuit-preview"
@@ -22,12 +23,15 @@ function AppHeader() {
   )
 }
 
-function ProgressSteps({
-  display_status,
-}: {
-  display_status: "queued" | "agent_running" | "building" | "complete" | "failed"
-}) {
-  const stage = display_status === "queued" ? 1 : display_status === "agent_running" ? 2 : 3
+function ProgressSteps({ display_status }: { display_status: JobDisplayStatus }) {
+  const stage =
+    display_status === "queued"
+      ? 1
+      : display_status === "agent_running" ||
+          display_status === "cancelling" ||
+          display_status === "cancelled"
+        ? 2
+        : 3
   return (
     <div className="progress-steps" aria-label="Conversion progress">
       {[
@@ -45,7 +49,8 @@ function ProgressSteps({
 }
 
 export default function App() {
-  const { job, load_error, selectJob, clearJob } = useActiveJob()
+  const { job, load_error, action_error, is_cancelling, selectJob, clearJob, cancelActiveJob } =
+    useActiveJob()
 
   return (
     <div className="app-shell">
@@ -87,11 +92,28 @@ export default function App() {
             <ProgressSteps display_status={job.display_status} />
             <div className="job-heading-actions">
               <StatusPill display_status={job.display_status} />
+              {!job.is_complete && (
+                <button
+                  className="cancel-button"
+                  type="button"
+                  disabled={is_cancelling || job.display_status === "cancelling"}
+                  onClick={cancelActiveJob}
+                >
+                  <Square size={12} fill="currentColor" />
+                  {is_cancelling || job.display_status === "cancelling" ? "Stopping…" : "Cancel"}
+                </button>
+              )}
               <button className="secondary-button" type="button" onClick={clearJob}>
                 <ArrowLeft size={15} /> New datasheet
               </button>
             </div>
           </section>
+
+          {action_error && (
+            <p className="job-action-error" role="alert">
+              {action_error}
+            </p>
+          )}
 
           <div className="workspace-grid">
             <AgentLogs job={job} />

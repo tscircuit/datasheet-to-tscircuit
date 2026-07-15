@@ -122,6 +122,23 @@ async function createJobFromRequest(request: Request, context: JobApiContext): P
   return jsonResponse({ job }, 202)
 }
 
+function cancelJob(request_url: URL, context: JobApiContext): Response {
+  const job_id = getJobId(request_url)
+  if (!job_id) return errorResponse("job_id_required", "job_id is required.", 400)
+
+  const cancellation_result = context.job_store.requestCancellation(job_id)
+  if (cancellation_result === "not_found") {
+    return errorResponse("job_not_found", `No job exists for ${job_id}.`, 404)
+  }
+  if (cancellation_result === "already_complete") {
+    return errorResponse("job_already_complete", "This job has already finished.", 409)
+  }
+
+  const job = context.job_store.getJob(job_id)
+  if (!job) return errorResponse("job_not_found", `No job exists for ${job_id}.`, 404)
+  return jsonResponse({ job }, cancellation_result === "requested" ? 202 : 200)
+}
+
 function getJobFile(request_url: URL, context: JobApiContext): Response {
   const job_id = getJobId(request_url)
   const file_kind = request_url.searchParams.get("file")
@@ -156,6 +173,9 @@ export function createJobApiHandler(context: JobApiContext) {
     if (request.method === "OPTIONS") return new Response(null, { status: 204 })
     if (request_url.pathname === "/api/job/create" && request.method === "POST") {
       return createJobFromRequest(request, context)
+    }
+    if (request_url.pathname === "/api/job/cancel" && request.method === "POST") {
+      return cancelJob(request_url, context)
     }
     if (request_url.pathname === "/api/job/get" && request.method === "GET") {
       const job_id = getJobId(request_url)

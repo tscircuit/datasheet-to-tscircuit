@@ -6,8 +6,11 @@ type JobSubscriber = (job_event: JobEvent) => void
 
 interface JobRecord extends Job {
   job_dir: string
+  cancellation_controller: AbortController
   subscriber_set: Set<JobSubscriber>
 }
+
+export type JobCancellationResult = "requested" | "already_requested" | "already_complete" | "not_found"
 
 export interface CreateJobInput {
   job_id: string
@@ -57,6 +60,7 @@ export class JobStore {
       is_complete: false,
       has_errors: false,
       logs: [],
+      cancellation_controller: new AbortController(),
       subscriber_set: new Set(),
     }
     this.job_map.set(job_record.job_id, job_record)
@@ -70,6 +74,23 @@ export class JobStore {
 
   getJobDir(job_id: string): string | undefined {
     return this.job_map.get(job_id)?.job_dir
+  }
+
+  getCancellationSignal(job_id: string): AbortSignal | undefined {
+    return this.job_map.get(job_id)?.cancellation_controller.signal
+  }
+
+  requestCancellation(job_id: string): JobCancellationResult {
+    const job_record = this.job_map.get(job_id)
+    if (!job_record) return "not_found"
+    if (job_record.is_complete) return "already_complete"
+    if (job_record.cancellation_controller.signal.aborted) return "already_requested"
+
+    job_record.display_status = "cancelling"
+    const job = getPublicJob(job_record)
+    this.publish(job_record, { event_type: "job_updated", job })
+    job_record.cancellation_controller.abort()
+    return "requested"
   }
 
   updateJob(job_id: string, job_update: JobUpdate): Job {

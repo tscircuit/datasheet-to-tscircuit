@@ -38,6 +38,13 @@ export async function getJob(job_id: string): Promise<Job> {
   return job_response.job
 }
 
+export async function cancelJob(job_id: string): Promise<Job> {
+  const response = await fetch(`/api/job/cancel?job_id=${encodeURIComponent(job_id)}`, { method: "POST" })
+  if (!response.ok) throw new Error(await readApiError(response))
+  const job_response = (await response.json()) as JobResponse
+  return job_response.job
+}
+
 export function getJobFileUrl(job_id: string, file: "component" | "log"): string {
   return `/api/job/file?job_id=${encodeURIComponent(job_id)}&file=${file}`
 }

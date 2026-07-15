@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 import type { Job, JobEvent } from "@/shared/job-types"
-import { getJob } from "./api"
+import { cancelJob, getJob } from "./api"
 
 function parseJobEvent(message: MessageEvent<string>): JobEvent | undefined {
   try {
@@ -21,6 +21,8 @@ export function useActiveJob() {
   const [job, setJob] = useState<Job>()
   const [job_id, setJobId] = useState<string | undefined>(initial_job_id ?? undefined)
   const [load_error, setLoadError] = useState<string>()
+  const [action_error, setActionError] = useState<string>()
+  const [is_cancelling, setIsCancelling] = useState(false)
 
   useEffect(() => {
     if (!job_id) return
@@ -60,6 +62,7 @@ export function useActiveJob() {
 
   const selectJob = (next_job: Job) => {
     setLoadError(undefined)
+    setActionError(undefined)
     setJob(next_job)
     setJobId(next_job.job_id)
     const request_url = new URL(window.location.href)
@@ -71,10 +74,25 @@ export function useActiveJob() {
     setJob(undefined)
     setJobId(undefined)
     setLoadError(undefined)
+    setActionError(undefined)
+    setIsCancelling(false)
     const request_url = new URL(window.location.href)
     request_url.searchParams.delete("job_id")
     window.history.replaceState({}, "", request_url)
   }
 
-  return { job, load_error, selectJob, clearJob }
+  const cancelActiveJob = async () => {
+    if (!job || job.is_complete || is_cancelling) return
+    setIsCancelling(true)
+    setActionError(undefined)
+    try {
+      setJob(await cancelJob(job.job_id))
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "The job could not be stopped.")
+    } finally {
+      setIsCancelling(false)
+    }
+  }
+
+  return { job, load_error, action_error, is_cancelling, selectJob, clearJob, cancelActiveJob }
 }

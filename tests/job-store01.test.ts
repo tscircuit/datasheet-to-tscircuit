@@ -21,3 +21,21 @@ test("JobStore streams updates and persists every log chunk", async () => {
   unsubscribe?.()
   await rm(job_dir, { recursive: true, force: true })
 })
+
+test("JobStore cancellation aborts an active job and publishes the stopping state", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-job-cancel-"))
+  const job_store = new JobStore()
+  const statuses: string[] = []
+  job_store.createJob({ job_id: "job_cancel", job_dir, file_name: "sensor.pdf" })
+  job_store.subscribe("job_cancel", (job_event) => {
+    if (job_event.event_type === "job_updated") statuses.push(job_event.job.display_status)
+  })
+
+  expect(job_store.requestCancellation("job_cancel")).toBe("requested")
+  expect(job_store.getCancellationSignal("job_cancel")?.aborted).toBe(true)
+  expect(job_store.getJob("job_cancel")?.display_status).toBe("cancelling")
+  expect(statuses).toEqual(["cancelling"])
+  expect(job_store.requestCancellation("job_cancel")).toBe("already_requested")
+
+  await rm(job_dir, { recursive: true, force: true })
+})

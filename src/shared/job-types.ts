@@ -1,6 +1,13 @@
 import type { AnyCircuitElement } from "circuit-json"
 
-export type JobDisplayStatus = "queued" | "agent_running" | "building" | "complete" | "failed"
+export type JobDisplayStatus =
+  | "queued"
+  | "agent_running"
+  | "building"
+  | "cancelling"
+  | "cancelled"
+  | "complete"
+  | "failed"
 export type JobLogStream = "system" | "stdout" | "stderr"
 
 export interface JobLog {

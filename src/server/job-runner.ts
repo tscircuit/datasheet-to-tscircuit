@@ -13,7 +13,28 @@ export interface JobRunnerContext {
 interface StreamProcessInput {
   command: string[]
   cwd: string
+  signal: AbortSignal
   on_chunk: (stream: JobLogStream, message: string) => Promise<void>
+}
+
+class JobCancelledError extends Error {
+  constructor() {
+    super("Job cancellation was requested")
+    this.name = "JobCancelledError"
+  }
+}
+
+function throwIfCancelled(signal: AbortSignal): void {
+  if (signal.aborted) throw new JobCancelledError()
+}
+
+function killProcessGroup(child_process: Bun.Subprocess, signal: NodeJS.Signals): void {
+  try {
+    if (process.platform === "win32") child_process.kill(signal)
+    else process.kill(-child_process.pid, signal)
+  } catch {
+    if (child_process.exitCode === null) child_process.kill(signal)
+  }
 }
 
 async function readProcessStream(input: {
@@ -38,23 +59,39 @@ async function readProcessStream(input: {
 }
 
 async function streamProcess(input: StreamProcessInput): Promise<number> {
+  throwIfCancelled(input.signal)
   const inherited_path = process.env.PATH ?? ""
   const command_path = input.command[0]?.includes("/")
     ? `${dirname(input.command[0])}${delimiter}${inherited_path}`
     : inherited_path
   const child_process = Bun.spawn(input.command, {
     cwd: input.cwd,
+    detached: true,
     env: { ...process.env, PATH: command_path },
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
   })
 
-  await Promise.all([
-    readProcessStream({ readable: child_process.stdout, stream: "stdout", on_chunk: input.on_chunk }),
-    readProcessStream({ readable: child_process.stderr, stream: "stderr", on_chunk: input.on_chunk }),
-  ])
-  return child_process.exited
+  let force_kill_timer: ReturnType<typeof setTimeout> | undefined
+  const stop_process = () => {
+    killProcessGroup(child_process, "SIGTERM")
+    force_kill_timer = setTimeout(() => killProcessGroup(child_process, "SIGKILL"), 2_000)
+  }
+  input.signal.addEventListener("abort", stop_process, { once: true })
+
+  try {
+    const [exit_code] = await Promise.all([
+      child_process.exited,
+      readProcessStream({ readable: child_process.stdout, stream: "stdout", on_chunk: input.on_chunk }),
+      readProcessStream({ readable: child_process.stderr, stream: "stderr", on_chunk: input.on_chunk }),
+    ])
+    throwIfCancelled(input.signal)
+    return exit_code
+  } finally {
+    input.signal.removeEventListener("abort", stop_process)
+    if (force_kill_timer) clearTimeout(force_kill_timer)
+  }
 }
 
 export function buildAgentPrompt(additional_instructions?: string): string {
@@ -100,12 +137,15 @@ export async function runJob(
 ): Promise<void> {
   const job_dir = context.job_store.getJobDir(input.job_id)
   if (!job_dir) throw new Error(`Job ${input.job_id} was not found`)
+  const cancellation_signal = context.job_store.getCancellationSignal(input.job_id)
+  if (!cancellation_signal) throw new Error(`Job ${input.job_id} has no cancellation signal`)
 
   const append = async (stream: JobLogStream, message: string): Promise<void> => {
     await context.job_store.appendLog(input.job_id, stream, message)
   }
 
   try {
+    throwIfCancelled(cancellation_signal)
     context.job_store.updateJob(input.job_id, { display_status: "agent_running" })
     await append("system", "Starting tsci agent and streaming its complete process output…\n")
 
@@ -119,9 +159,11 @@ export async function runJob(
         job_dir,
       ],
       cwd: job_dir,
+      signal: cancellation_signal,
       on_chunk: append,
     })
     if (agent_exit_code !== 0) throw new Error(`tsci-agent exited with code ${agent_exit_code}`)
+    throwIfCancelled(cancellation_signal)
 
     const component_path = join(job_dir, "index.circuit.tsx")
     const component_code = await readFile(component_path, "utf8")
@@ -129,14 +171,17 @@ export async function runJob(
       throw new Error("The agent did not create a default-exported TSX component")
     }
 
+    throwIfCancelled(cancellation_signal)
     context.job_store.updateJob(input.job_id, { display_status: "building" })
     await append("system", "\nAgent finished. Building the generated component with tsci…\n")
 
     const build_exit_code = await streamProcess({
       command: [context.tsci_bin, "build", "index.circuit.tsx", "--ignore-errors", "--ignore-warnings"],
       cwd: job_dir,
+      signal: cancellation_signal,
       on_chunk: append,
     })
+    throwIfCancelled(cancellation_signal)
 
     const circuit_json_path = await findCircuitJsonFile(join(job_dir, "dist"))
     if (!circuit_json_path) {
@@ -162,6 +207,19 @@ export async function runJob(
       circuit_json: parsed_json,
     })
   } catch (error) {
+    if (error instanceof JobCancelledError || cancellation_signal.aborted) {
+      await append("system", "\nCancellation requested. The active job process was stopped.\n").catch(
+        () => undefined,
+      )
+      context.job_store.updateJob(input.job_id, {
+        display_status: "cancelled",
+        is_complete: true,
+        has_errors: false,
+        completed_at: new Date().toISOString(),
+        error_message: undefined,
+      })
+      return
+    }
     const error_message = error instanceof Error ? error.message : String(error)
     await append("system", `\nConversion failed: ${error_message}\n`).catch(() => undefined)
     context.job_store.updateJob(input.job_id, {
