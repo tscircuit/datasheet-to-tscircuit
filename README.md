@@ -81,6 +81,10 @@ turn, tool, retry, compaction, assistant-text, and thinking events, so a separat
 After the agent exits successfully, the server runs `tsci build` and returns the
 generated `index.circuit.tsx` and Circuit JSON to the browser.
 
+The task sidebar can start and monitor multiple conversions concurrently. Each
+job has an independent process group and cancel control, so stopping one task
+does not interrupt other agents or the application container.
+
 ## Security and hosting
 
 The local Docker container is the current process and filesystem isolation

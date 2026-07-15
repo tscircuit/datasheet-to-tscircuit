@@ -1,7 +1,11 @@
-import type { ApiError, Job } from "@/shared/job-types"
+import type { ApiError, Job, JobSummary } from "@/shared/job-types"
 
 interface JobResponse {
   job: Job
+}
+
+interface JobsResponse {
+  jobs: JobSummary[]
 }
 
 async function readApiError(response: Response): Promise<string> {
@@ -38,11 +42,32 @@ export async function getJob(job_id: string): Promise<Job> {
   return job_response.job
 }
 
+export async function getJobs(): Promise<JobSummary[]> {
+  const response = await fetch("/api/jobs")
+  if (!response.ok) throw new Error(await readApiError(response))
+  const jobs_response = (await response.json()) as JobsResponse
+  return jobs_response.jobs
+}
+
 export async function cancelJob(job_id: string): Promise<Job> {
   const response = await fetch(`/api/job/cancel?job_id=${encodeURIComponent(job_id)}`, { method: "POST" })
   if (!response.ok) throw new Error(await readApiError(response))
   const job_response = (await response.json()) as JobResponse
   return job_response.job
+}
+
+export async function retryJob(job_id: string): Promise<Job> {
+  const response = await fetch(`/api/job/retry?job_id=${encodeURIComponent(job_id)}`, { method: "POST" })
+  if (!response.ok) throw new Error(await readApiError(response))
+  const job_response = (await response.json()) as JobResponse
+  return job_response.job
+}
+
+export async function deleteJob(job_id: string): Promise<void> {
+  const response = await fetch(`/api/job/delete?job_id=${encodeURIComponent(job_id)}`, {
+    method: "DELETE",
+  })
+  if (!response.ok) throw new Error(await readApiError(response))
 }
 
 export function getJobFileUrl(job_id: string, file: "component" | "log"): string {

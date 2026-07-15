@@ -31,9 +31,26 @@ export interface Job {
   circuit_json?: AnyCircuitElement[]
 }
 
+export type JobSummary = Pick<
+  Job,
+  | "job_id"
+  | "file_name"
+  | "created_at"
+  | "completed_at"
+  | "display_status"
+  | "is_complete"
+  | "has_errors"
+  | "error_message"
+>
+
 export type JobEvent =
   | { event_type: "snapshot" | "job_updated"; job: Job }
   | { event_type: "log"; log: JobLog }
+
+export type JobListEvent =
+  | { event_type: "jobs_snapshot"; jobs: JobSummary[] }
+  | { event_type: "job_updated"; job: JobSummary }
+  | { event_type: "job_deleted"; job_id: string }
 
 export interface ApiError {
   error: {
