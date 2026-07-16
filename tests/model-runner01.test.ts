@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { chmod, mkdtemp, rm } from "node:fs/promises"
+import { chmod, mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { JobStore } from "@/server/job-store"
@@ -22,6 +22,16 @@ export default function Benchmark() {
     </board>
   )
 }
+`
+
+const provisionalBenchmarkBuildSource = `#!/usr/bin/env bun
+import { mkdir } from "node:fs/promises"
+const target = Bun.argv.slice(2)[1] ?? ""
+const benchmarkId = target.split("/").at(-1)?.replace(/\\.circuit\\.tsx$/, "")
+if (!benchmarkId) process.exit(2)
+const output = process.cwd() + "/../dist/spice/benchmarks/" + benchmarkId
+await mkdir(output, { recursive: true })
+await Bun.write(output + "/circuit.json", "[]")
 `
 
 test("model prompt keeps benchmarks fixed while effort only extends iteration time", () => {
@@ -119,7 +129,7 @@ await Bun.write(dir + "/evidence/curves/transfer.csv", "x,y\\n0,0\\n1,1\\n")
 await Bun.write(dir + "/model.lib", ".subckt TOO_EARLY IN OUT\\nR1 IN OUT 1k\\n.ends TOO_EARLY\\n")
 `,
     ),
-    Bun.write(tsci_path, "#!/usr/bin/env bun\nprocess.exit(99)\n"),
+    Bun.write(tsci_path, provisionalBenchmarkBuildSource),
   ])
   await Promise.all([chmod(agent_path, 0o755), chmod(tsci_path, 0o755)])
   const job_store = new JobStore()
@@ -175,7 +185,7 @@ if (attempt === 1) {
 process.exit(8)
 `,
     ),
-    Bun.write(tsci_path, "#!/usr/bin/env bun\nprocess.exit(99)\n"),
+    Bun.write(tsci_path, provisionalBenchmarkBuildSource),
   ])
   await Promise.all([chmod(agent_path, 0o755), chmod(tsci_path, 0o755)])
   const job_store = new JobStore()
@@ -233,7 +243,7 @@ await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at
 await Bun.write(dir + "/evidence/curves/transfer.csv", "x,y\\n0,0\\n1,1\\n")
 `,
     ),
-    Bun.write(tsci_path, "#!/usr/bin/env bun\nprocess.exit(99)\n"),
+    Bun.write(tsci_path, provisionalBenchmarkBuildSource),
   ])
   await Promise.all([chmod(agent_path, 0o755), chmod(tsci_path, 0o755)])
 
@@ -316,7 +326,12 @@ console.log("champion checkpointed")
       `#!/usr/bin/env bun
 	import { appendFile, mkdir } from "node:fs/promises"
 	const jobDir = ${JSON.stringify(job_dir)}
-	const modelSource = await Bun.file(jobDir + "/spice/model.lib").text()
+		if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
+		  await mkdir(jobDir + "/dist/spice/benchmarks/transfer", { recursive: true })
+		  await Bun.write(jobDir + "/dist/spice/benchmarks/transfer/circuit.json", "[]")
+		  process.exit(0)
+		}
+		const modelSource = await Bun.file(jobDir + "/spice/model.lib").text()
 	const integrity = [
 	  { type: "source_component", source_component_id: "dut", name: "DUT" },
 	  { type: "source_port", source_port_id: "dut_in", source_component_id: "dut", name: "pin1" },
@@ -464,7 +479,12 @@ await Bun.write(dir + "/model-card.md", "# LOOP model\\n")
       `#!/usr/bin/env bun
 	import { mkdir } from "node:fs/promises"
 	const jobDir = ${JSON.stringify(job_dir)}
-	const attempt = Number(await Bun.file(jobDir + "/spice/agent-attempt.txt").text())
+		if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
+		  await mkdir(jobDir + "/dist/spice/benchmarks/transfer", { recursive: true })
+		  await Bun.write(jobDir + "/dist/spice/benchmarks/transfer/circuit.json", "[]")
+		  process.exit(0)
+		}
+		const attempt = Number(await Bun.file(jobDir + "/spice/agent-attempt.txt").text())
 	const modelSource = await Bun.file(jobDir + "/spice/model.lib").text()
 	const integrity = [
 	  { type: "source_component", source_component_id: "dut", name: "DUT" },
@@ -512,6 +532,124 @@ await mkdir(jobDir + "/dist/spice/component-with-model", { recursive: true })
   await rm(job_dir, { recursive: true, force: true })
 }, 20_000)
 
+test("structural validation defects create a new lock generation and restart refinement", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-model-lock-recovery-"))
+  const model_dir = join(job_dir, "spice")
+  const agent_path = join(job_dir, "lock-recovery-agent")
+  const tsci_path = join(job_dir, "lock-recovery-tsci")
+  await Promise.all([
+    Bun.write(join(job_dir, "datasheet.pdf"), "%PDF-1.7\nfixture"),
+    Bun.write(join(job_dir, "index.circuit.tsx"), 'export default () => <chip name="U1" />\n'),
+    Bun.write(
+      agent_path,
+      `#!/usr/bin/env bun
+import { mkdir } from "node:fs/promises"
+const args = process.argv.slice(2)
+const dir = args[args.indexOf("--dir") + 1]
+const prompt = args[args.indexOf("--prompt") + 1]
+if (prompt.includes("benchmark-only pass")) {
+  const attemptFile = dir + "/../lock-recovery-benchmark-attempt.txt"
+  const attempt = Number(await Bun.file(attemptFile).text().catch(() => "0")) + 1
+  await Bun.write(attemptFile, String(attempt))
+  await mkdir(dir + "/benchmarks", { recursive: true })
+  await mkdir(dir + "/evidence/curves", { recursive: true })
+  if (prompt.includes("structural circuit defect")) {
+    const source = await Bun.file(dir + "/benchmarks/transfer.circuit.tsx").text()
+    await Bun.write(dir + "/benchmarks/transfer.circuit.tsx", source + "\\n// Repaired harness.\\n")
+    await Bun.write(dir + "/../lock-recovery-prompt-seen.txt", "yes")
+  } else {
+    await Bun.write(dir + "/benchmarks/transfer.circuit.tsx", ${JSON.stringify(lockedBenchmarkSource)})
+    await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: "2026-07-16T00:00:00.000Z", benchmarks: [{ id: "transfer", title: "Transfer", source: { page: 3 }, critical: true, weight: 1, tolerance: 0.05, reference_file: "evidence/curves/transfer.csv", result_file: "results/champion/transfer.csv", simulation: { kind: "transient_voltage", probe_name: "VOUT_PROBE", dut_spice_node: "OUT" } }] }))
+    await Bun.write(dir + "/evidence/curves/transfer.csv", "x,y\\n0,0\\n1,1\\n")
+  }
+  process.exit(0)
+}
+const attemptFile = dir + "/../lock-recovery-refinement-attempt.txt"
+const attempt = Number(await Bun.file(attemptFile).text().catch(() => "0")) + 1
+await Bun.write(attemptFile, String(attempt))
+await mkdir(dir + "/results/champion", { recursive: true })
+await Bun.write(dir + "/model.lib", ".subckt RECOVERY IN OUT\\nR1 IN OUT 1k\\n.ends RECOVERY\\n")
+await Bun.write(dir + "/model-manifest.json", JSON.stringify({ version: 1, part_number: "RECOVERY", dialect: "portable", entry_name: "RECOVERY", model_file: "model.lib", revision: "r000" + attempt, simulator: "ngspice", generated_at: new Date().toISOString(), pins: [{ component_pin: "pin1", spice_node: "IN" }, { component_pin: "pin2", spice_node: "OUT" }] }))
+await Bun.write(dir + "/component-with-model.circuit.tsx", "export default () => <chip name=\\"DUT\\" />\\n")
+await Bun.write(dir + "/results/champion/transfer.csv", "x,y\\n0,0\\n1,1\\n")
+await Bun.write(dir + "/iteration-history.json", JSON.stringify([{ revision: "r000" + attempt, decision: "promoted" }]))
+await Bun.write(dir + "/model-card.md", "# RECOVERY model\\n")
+`,
+    ),
+    Bun.write(
+      tsci_path,
+      `#!/usr/bin/env bun
+import { mkdir } from "node:fs/promises"
+const jobDir = ${JSON.stringify(job_dir)}
+const target = Bun.argv.slice(2)[1] ?? ""
+const benchmarkOutput = jobDir + "/dist/spice/benchmarks/transfer"
+if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
+  await mkdir(benchmarkOutput, { recursive: true })
+  await Bun.write(benchmarkOutput + "/circuit.json", "[]")
+  process.exit(0)
+}
+const modelSource = await Bun.file(jobDir + "/spice/model.lib").text()
+const integrity = [
+  { type: "source_component", source_component_id: "dut", name: "DUT" },
+  { type: "source_port", source_port_id: "dut_in", source_component_id: "dut", name: "pin1" },
+  { type: "source_port", source_port_id: "dut_out", source_component_id: "dut", name: "pin2" },
+  { type: "simulation_spice_subcircuit", source_component_id: "dut", subcircuit_source: modelSource, spice_pin_to_source_port_map: { IN: "dut_in", OUT: "dut_out" } },
+  { type: "simulation_voltage_probe", name: "VOUT_PROBE", signal_input_source_port_id: "dut_out" },
+]
+if (target === "component-with-model.circuit.tsx") {
+  const output = jobDir + "/dist/spice/component-with-model"
+  await mkdir(output, { recursive: true })
+  await Bun.write(output + "/circuit.json", JSON.stringify(integrity))
+  process.exit(0)
+}
+const lock = JSON.parse(await Bun.file(jobDir + "/.model-benchmark-lock/lock.json").text())
+await mkdir(benchmarkOutput, { recursive: true })
+if (lock.generation === 1) {
+  await Bun.write(benchmarkOutput + "/circuit.json", JSON.stringify([{ type: "source_failed_to_create_component_error", message: "Locked harness is structurally invalid" }]))
+  process.exit(0)
+}
+await Bun.write(benchmarkOutput + "/circuit.json", JSON.stringify([...integrity, { type: "simulation_transient_voltage_graph", name: "VOUT_PROBE", timestamps_ms: [0, 1], voltage_levels: [0, 1] }]))
+`,
+    ),
+  ])
+  await Promise.all([chmod(agent_path, 0o755), chmod(tsci_path, 0o755)])
+
+  const job_store = new JobStore()
+  const model_run_store = new ModelRunStore()
+  job_store.createJob({ job_id: "job_lock_recovery", job_dir, file_name: "recovery.pdf" })
+  job_store.updateJob("job_lock_recovery", { display_status: "complete", is_complete: true })
+  model_run_store.createModelRun({
+    model_run_id: "model_lock_recovery",
+    job_id: "job_lock_recovery",
+    model_dir,
+    effort_multiplier: 1,
+    base_effort_ms: 20_000,
+  })
+  await Bun.write(join(model_dir, "setup-complete.json"), JSON.stringify({ version: 1 }))
+
+  await runModel(
+    { model_run_id: "model_lock_recovery" },
+    { job_store, model_run_store, agent_bin: agent_path, tsci_bin: tsci_path },
+  )
+
+  const run = model_run_store.getModelRun("model_lock_recovery")
+  const lock = JSON.parse(await Bun.file(join(job_dir, ".model-benchmark-lock", "lock.json")).text())
+  expect(run?.status).toBe("complete")
+  expect(run?.validation?.all_passed).toBe(true)
+  expect(lock.generation).toBe(2)
+  expect(await Bun.file(join(job_dir, "lock-recovery-benchmark-attempt.txt")).text()).toBe("2")
+  expect(await Bun.file(join(job_dir, "lock-recovery-refinement-attempt.txt")).text()).toBe("2")
+  expect(await Bun.file(join(job_dir, "lock-recovery-prompt-seen.txt")).text()).toBe("yes")
+  expect(
+    await Bun.file(join(job_dir, ".model-benchmark-lock", "history", "generation-0001.json")).exists(),
+  ).toBe(true)
+  expect(
+    run?.logs.some((log) => log.message.includes("restarting model refinement from a clean time boundary")),
+  ).toBe(true)
+
+  await rm(job_dir, { recursive: true, force: true })
+}, 20_000)
+
 test("extending effort keeps an active refinement pass alive past its original reserve", async () => {
   const job_dir = await mkdtemp(join(tmpdir(), "datasheet-model-live-extension-"))
   const model_dir = join(job_dir, "spice")
@@ -541,7 +679,7 @@ await Bun.write(dir + "/candidates/r0001/model.lib", ".subckt EXTENDED IN OUT\\n
 await Bun.write(dir + "/extension-finished.txt", "finished")
 `,
     ),
-    Bun.write(tsci_path, "#!/usr/bin/env bun\nprocess.exit(99)\n"),
+    Bun.write(tsci_path, provisionalBenchmarkBuildSource),
   ])
   await Promise.all([chmod(agent_path, 0o755), chmod(tsci_path, 0o755)])
 
@@ -609,7 +747,7 @@ await Bun.write(dir + "/iteration-history.json", JSON.stringify([{ revision: "r0
 await Bun.sleep(30_000)
 `,
   )
-  await Bun.write(tsci_path, "#!/usr/bin/env bun\n")
+  await Bun.write(tsci_path, provisionalBenchmarkBuildSource)
   await Promise.all([chmod(agent_path, 0o755), chmod(tsci_path, 0o755)])
 
   const job_store = new JobStore()
@@ -640,7 +778,7 @@ await Bun.sleep(30_000)
   await rm(job_dir, { recursive: true, force: true })
 }, 10_000)
 
-test("model runner builds parameter-sweep points concurrently in isolated workspaces", async () => {
+test("model runner fairly schedules every benchmark through one bounded validation pool", async () => {
   const job_dir = await mkdtemp(join(tmpdir(), "datasheet-model-sweep-runner-"))
   const model_dir = join(job_dir, "spice")
   const agent_path = join(job_dir, "sweep-agent")
@@ -672,8 +810,14 @@ await mkdir(dir + "/benchmarks", { recursive: true })
 await mkdir(dir + "/evidence/curves", { recursive: true })
 if (prompt.includes("benchmark-only pass")) {
   await Bun.write(dir + "/benchmarks/sweep.circuit.tsx", ${JSON.stringify(sweep_source)})
-  await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: new Date().toISOString(), benchmarks: [{ id: "sweep", title: "Sweep", source: { page: 2 }, critical: true, weight: 1, tolerance: 0.01, reference_file: "evidence/curves/sweep.csv", result_file: "results/champion/sweep.csv", simulation: { kind: "parameter_sweep", probe_name: "VOUT", dut_spice_node: "OUT", reducer: "last", points: [{ x: 0, props: { sweepValue: 0 } }, { x: 1, props: { sweepValue: 1 } }] } }] }))
-  await Bun.write(dir + "/evidence/curves/sweep.csv", "x,y\\n0,0\\n1,2\\n")
+  await Bun.write(dir + "/benchmarks/sweep-b.circuit.tsx", ${JSON.stringify(sweep_source)})
+  const simulation = { kind: "parameter_sweep", probe_name: "VOUT", dut_spice_node: "OUT", reducer: "last", points: [{ x: 0, props: { sweepValue: 0 } }, { x: 1, props: { sweepValue: 1 } }, { x: 2, props: { sweepValue: 2 } }] }
+  await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: new Date().toISOString(), benchmarks: [
+    { id: "sweep", title: "Sweep A", source: { page: 2 }, critical: true, weight: 1, tolerance: 0.01, reference_file: "evidence/curves/sweep.csv", result_file: "results/champion/sweep.csv", simulation },
+    { id: "sweep-b", title: "Sweep B", source: { page: 2 }, critical: true, weight: 1, tolerance: 0.01, reference_file: "evidence/curves/sweep-b.csv", result_file: "results/champion/sweep-b.csv", simulation },
+  ] }))
+  await Bun.write(dir + "/evidence/curves/sweep.csv", "x,y\\n0,0\\n1,2\\n2,4\\n")
+  await Bun.write(dir + "/evidence/curves/sweep-b.csv", "x,y\\n0,0\\n1,2\\n2,4\\n")
   process.exit(0)
 }
 await Bun.write(dir + "/model.lib", ".subckt SWEEP IN OUT\\nR1 IN OUT 1k\\n.ends SWEEP\\n")
@@ -690,6 +834,10 @@ import { appendFile, mkdir } from "node:fs/promises"
 const jobDir = ${JSON.stringify(job_dir)}
 const args = Bun.argv.slice(2)
 const target = args[1] ?? ""
+if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
+  await Bun.write(jobDir + "/unexpected-prelock-tsci.txt", target)
+  process.exit(9)
+}
 const modelSource = await Bun.file(jobDir + "/spice/model.lib").text()
 const integrity = [
   { type: "source_component", source_component_id: "dut", name: "DUT" },
@@ -703,16 +851,17 @@ if (target === "component-with-model.circuit.tsx") {
   await Bun.write(jobDir + "/dist/spice/component-with-model/circuit.json", JSON.stringify(integrity))
   process.exit(0)
 }
-const match = target.match(/\\.server-validation-builds\\/sweep\\/(point-\\d+)\\.circuit\\.tsx$/)
+const match = target.match(/\\.server-validation-builds\\/(sweep(?:-b)?)\\/(point-\\d+)\\.circuit\\.tsx$/)
 if (!match) process.exit(2)
-const runId = match[1]
+const benchmarkId = match[1]
+const runId = match[2]
 const startedAt = Date.now()
-await appendFile(jobDir + "/sweep-timing.log", runId + ",start," + startedAt + "\\n")
-await Bun.sleep(150)
-const value = runId === "point-000" ? 0 : 2
-await mkdir(jobDir + "/dist/spice/.server-validation-builds/sweep/" + runId, { recursive: true })
-await Bun.write(jobDir + "/dist/spice/.server-validation-builds/sweep/" + runId + "/circuit.json", JSON.stringify([...integrity, { type: "simulation_transient_voltage_graph", name: "VOUT", timestamps_ms: [0, 1], voltage_levels: [0, value] }]))
-await appendFile(jobDir + "/sweep-timing.log", runId + ",end," + Date.now() + "\\n")
+await appendFile(jobDir + "/sweep-timing.log", benchmarkId + "/" + runId + ",start," + startedAt + "\\n")
+await Bun.sleep(benchmarkId === "sweep" ? 80 : 220)
+const value = Number(runId.slice(-3)) * 2
+await mkdir(jobDir + "/dist/spice/.server-validation-builds/" + benchmarkId + "/" + runId, { recursive: true })
+await Bun.write(jobDir + "/dist/spice/.server-validation-builds/" + benchmarkId + "/" + runId + "/circuit.json", JSON.stringify([...integrity, { type: "simulation_transient_voltage_graph", name: "VOUT", timestamps_ms: [0, 1], voltage_levels: [0, value] }]))
+await appendFile(jobDir + "/sweep-timing.log", benchmarkId + "/" + runId + ",end," + Date.now() + "\\n")
 `,
     ),
   ])
@@ -737,16 +886,39 @@ await appendFile(jobDir + "/sweep-timing.log", runId + ",end," + Date.now() + "\
   )
 
   expect(model_run_store.getModelRun("model_sweep")?.status).toBe("complete")
-  expect(await Bun.file(join(model_dir, "results", "verified", "sweep.csv")).text()).toBe("x,y\n0,0\n1,2\n")
+  expect(await Bun.file(join(job_dir, "unexpected-prelock-tsci.txt")).exists()).toBe(false)
+  expect(await Bun.file(join(model_dir, "results", "verified", "sweep.csv")).text()).toBe(
+    "x,y\n0,0\n1,2\n2,4\n",
+  )
+  expect(await Bun.file(join(model_dir, "results", "verified", "sweep-b.csv")).text()).toBe(
+    "x,y\n0,0\n1,2\n2,4\n",
+  )
+  expect((await stat(join(model_dir, "results", "verified", "sweep.csv"))).mtimeMs).toBeLessThan(
+    (await stat(join(model_dir, "results", "verified", "sweep-b.csv"))).mtimeMs,
+  )
   const timing = (await Bun.file(join(job_dir, "sweep-timing.log")).text())
     .trim()
     .split("\n")
     .map((line) => line.split(","))
-  const starts = timing.filter((entry) => entry[1] === "start").map((entry) => Number(entry[2]))
-  const ends = timing.filter((entry) => entry[1] === "end").map((entry) => Number(entry[2]))
-  expect(starts).toHaveLength(2)
-  expect(ends).toHaveLength(2)
-  expect(Math.max(...starts)).toBeLessThan(Math.min(...ends))
+  const started = new Map(
+    timing.filter((entry) => entry[1] === "start").map((entry) => [entry[0], Number(entry[2])]),
+  )
+  const ended = new Map(
+    timing.filter((entry) => entry[1] === "end").map((entry) => [entry[0], Number(entry[2])]),
+  )
+  expect(started.size).toBe(6)
+  expect(ended.size).toBe(6)
+  const canaries = ["sweep/point-000", "sweep-b/point-000"]
+  const remaining = ["sweep/point-001", "sweep-b/point-001", "sweep/point-002", "sweep-b/point-002"]
+  expect(Math.max(...canaries.map((id) => started.get(id)!))).toBeLessThan(
+    Math.min(...canaries.map((id) => ended.get(id)!)),
+  )
+  expect(Math.min(...remaining.map((id) => started.get(id)!))).toBeGreaterThanOrEqual(
+    Math.max(...canaries.map((id) => ended.get(id)!)),
+  )
+  expect(Math.max(...remaining.map((id) => started.get(id)!))).toBeLessThan(
+    Math.min(...remaining.map((id) => ended.get(id)!)),
+  )
 
   await rm(job_dir, { recursive: true, force: true })
 }, 20_000)

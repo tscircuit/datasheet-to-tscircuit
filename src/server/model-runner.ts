@@ -8,6 +8,8 @@ import {
   createOrVerifyBenchmarkLock,
   hasBenchmarkLock,
   hasBenchmarkManifest,
+  replaceBenchmarkLockAfterCircuitRepair,
+  validateBenchmarkSuiteForLock,
   verifyBenchmarkLock,
 } from "./model-benchmark-lock"
 import { startModelProgressMonitor, type ModelProgressMonitor } from "./model-progress"
@@ -22,6 +24,7 @@ import type { ModelRunStore } from "./model-run-store"
 import { parseBenchmarkManifest, scoreModelBenchmarks } from "./model-scorer"
 import {
   clearVerifiedSimulationResults,
+  getCircuitBuildDiagnostics,
   getModelSimulationSourceSignature,
   getSimulationBuildPlan,
   getSimulationRunCount,
@@ -153,11 +156,22 @@ function summarizeProcessFailure(output: string): string | undefined {
     .map((line) => line.trim())
     .filter(Boolean)
   const diagnostic_lines = lines.filter((line) =>
-    /(?:fatal error|error:|build exiting with code|enoent|timed out)/i.test(line),
+    /(?:fatal error|error:|could not create|build completed with errors|build exiting with code|enoent|timed out)/i.test(
+      line,
+    ),
   )
   const selected = diagnostic_lines.length > 0 ? diagnostic_lines.slice(-4) : lines.slice(-8)
   const unique = selected.filter((line, index) => selected.indexOf(line) === index)
   return unique.length > 0 ? unique.join(" | ").slice(-4_000) : undefined
+}
+
+function summarizeValidationFeedback(message: string | undefined, fallback: string): string {
+  if (!message) return fallback
+  const concise = message
+    .split(/\s+Details:\s+Props:/i)[0]!
+    .replace(/\s+/g, " ")
+    .trim()
+  return concise.length > 1_200 ? `${concise.slice(0, 1_197)}…` : concise
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -323,6 +337,12 @@ async function recoverBestModelFile(model_dir: string): Promise<string | undefin
   return canonical_file
 }
 
+function markModelCardAsUnverified(model_card: string): string {
+  const notice =
+    "> **Server validation status:** This is an unverified checkpoint. It did not complete the locked independent benchmark suite.\n\n"
+  return model_card.startsWith(notice) ? model_card : `${notice}${model_card}`
+}
+
 async function publishAvailableModelCheckpoint(
   model_run_id: string,
   model_dir: string,
@@ -340,7 +360,7 @@ async function publishAvailableModelCheckpoint(
   model_run_store.updateModelRun(model_run_id, {
     model_source,
     ...(manifest ? { manifest } : {}),
-    ...(model_card ? { model_card } : {}),
+    ...(model_card ? { model_card: markModelCardAsUnverified(model_card) } : {}),
     iteration,
   })
   return true
@@ -384,6 +404,152 @@ async function clearEphemeralBenchmarkRuns(model_dir: string): Promise<void> {
       .filter((entry) => entry.isFile() && /^__run_.+\.circuit\.tsx$/i.test(entry.name))
       .map((entry) => rm(join(benchmark_dir, entry.name), { force: true })),
   )
+}
+
+async function clearRefinementArtifacts(model_dir: string): Promise<void> {
+  await clearVerifiedSimulationResults(model_dir)
+  await Promise.all([
+    ...[
+      "model.lib",
+      "model-manifest.json",
+      "component-with-model.circuit.tsx",
+      "iteration-history.json",
+      "model-card.md",
+      "validation-report.json",
+      "validation-feedback.md",
+    ].map((file) => rm(join(model_dir, file), { force: true })),
+    ...["candidates", "results/champion", ".server-validation-builds", ".agent-simulation-runs"].map(
+      (directory) => rm(join(model_dir, directory), { recursive: true, force: true }),
+    ),
+  ])
+  await mkdir(join(model_dir, "results", "champion"), { recursive: true })
+}
+
+async function validateBenchmarkSources(input: {
+  model_dir: string
+  signal: AbortSignal
+  append: (stream: JobLogStream, message: string) => Promise<void>
+}): Promise<void> {
+  const temporary_component = join(input.model_dir, "component-with-model.circuit.tsx")
+  const output_root = join(input.model_dir, ".benchmark-source-check")
+  if (await Bun.file(temporary_component).exists()) {
+    throw new Error("A model wrapper exists before provisional benchmark validation")
+  }
+  await Bun.write(
+    temporary_component,
+    'import Component from "./component.circuit"\n\nexport default Component\n',
+  )
+  try {
+    const benchmark_files = await listModelBenchFiles(input.model_dir)
+    if (input.signal.aborted) throw new Error("Provisional benchmark validation was cancelled")
+    await input.append(
+      "system",
+      `Source-checking ${benchmark_files.length} provisional benchmark circuit(s) before locking; ngspice is not run in this phase…\n`,
+    )
+    await rm(output_root, { recursive: true, force: true })
+    const result = await Bun.build({
+      entrypoints: benchmark_files.map((file) => join(input.model_dir, "benchmarks", file)),
+      outdir: output_root,
+      target: "bun",
+      format: "esm",
+      packages: "external",
+      naming: "[dir]/[name].[ext]",
+    })
+    if (!result.success) {
+      const details = result.logs
+        .map((log) => log.message)
+        .filter(Boolean)
+        .join("; ")
+      throw new Error(`Benchmark source compilation failed${details ? `: ${details}` : ""}`)
+    }
+    if (input.signal.aborted) throw new Error("Provisional benchmark validation was cancelled")
+  } finally {
+    await Promise.all([
+      rm(temporary_component, { force: true }),
+      rm(output_root, { recursive: true, force: true }),
+    ])
+  }
+}
+
+async function finalizeAndLockBenchmarks(input: {
+  model_run_id: string
+  job_dir: string
+  model_dir: string
+  signal: AbortSignal
+  context: ModelRunnerContext
+  append: (stream: JobLogStream, message: string) => Promise<void>
+  initial_feedback?: string
+  repair_lock?: BenchmarkLock
+}): Promise<{ benchmark_lock: BenchmarkLock }> {
+  const configured_attempts = Number(process.env.MODEL_BENCHMARK_FINALIZATION_ATTEMPTS ?? 4)
+  const max_attempts = Number.isInteger(configured_attempts)
+    ? Math.max(1, Math.min(8, configured_attempts))
+    : 4
+  let benchmark_validation_feedback = input.initial_feedback
+  for (let attempt = 1; attempt <= max_attempts; attempt += 1) {
+    const benchmark_exit_code = await streamModelProcess({
+      command: [
+        input.context.agent_bin,
+        "do",
+        "--prompt",
+        buildModelBenchmarkPrompt(benchmark_validation_feedback, {
+          locked_circuit_repair: Boolean(input.repair_lock),
+        }),
+        "--dir",
+        input.model_dir,
+      ],
+      cwd: input.model_dir,
+      signal: input.signal,
+      on_chunk: input.append,
+    })
+    if (benchmark_exit_code !== 0) {
+      throw new Error(`Benchmark-finalization agent exited with code ${benchmark_exit_code}`)
+    }
+    const forbidden_artifacts = await findPrematureRefinementArtifacts(input.model_dir)
+    if (forbidden_artifacts.length > 0) {
+      throw new Error(
+        `Benchmark finalization created forbidden model artifacts before the suite was locked: ${forbidden_artifacts.join(", ")}`,
+      )
+    }
+
+    let rejection: string | undefined
+    if (!(await hasBenchmarkManifest(input.model_dir))) {
+      rejection = "The benchmark-finalization agent did not create benchmarks.json"
+    } else {
+      try {
+        await validateBenchmarkSuiteForLock(input.model_dir)
+        await validateBenchmarkSources({
+          model_dir: input.model_dir,
+          signal: input.signal,
+          append: input.append,
+        })
+        const benchmark_lock = input.repair_lock
+          ? await replaceBenchmarkLockAfterCircuitRepair(input.model_dir, input.repair_lock)
+          : await createOrVerifyBenchmarkLock(input.model_dir)
+        return { benchmark_lock }
+      } catch (error) {
+        rejection = error instanceof Error ? error.message : String(error)
+      }
+    }
+    if (!rejection) rejection = "The benchmark suite did not pass server validation"
+    if (attempt >= max_attempts) {
+      throw new Error(
+        `Benchmark finalization still failed server validation after ${attempt} attempts: ${rejection}`,
+      )
+    }
+    benchmark_validation_feedback = rejection.slice(0, 8_000)
+    await input.append(
+      "system",
+      `The server rejected benchmark-finalization attempt ${attempt}: ${rejection}\nReturning the exact validation error to the benchmark agent for correction; model refinement remains untimed and has not started.\n`,
+    )
+    updateServerProgress(
+      input.model_run_id,
+      input.context.model_run_store,
+      "locking_benchmarks",
+      `Correcting benchmark suite after server validation attempt ${attempt}`,
+    )
+  }
+  throw new Error("The benchmark suite could not be locked")
 }
 
 function waitForComponent(
@@ -545,107 +711,248 @@ function toImportPath(from_directory: string, target_file: string): string {
   return path.startsWith(".") ? path : `./${path}`
 }
 
-async function runParameterSweepBuilds(input: {
+type SimulationFailureKind = "benchmark_structure" | "simulation" | "process"
+
+interface ValidationBuildRun {
+  point_index: number
+  run_id: string
+  x?: number
+  wrapper_path: string
+  generated_path: string
+  saved_path: string
+}
+
+interface ValidationBuildResult {
+  exit_code: number
+  path?: string
+  x?: number
+  error_message?: string
+  failure_kind?: SimulationFailureKind
+}
+
+interface BenchmarkValidationState {
   benchmark_id: string
   benchmark_file: string
-  build_plan: Awaited<ReturnType<typeof getSimulationBuildPlan>>
+  source_signature: string
+  runs: ValidationBuildRun[]
+  results: Array<ValidationBuildResult | undefined>
+  building_verification: SimulationBenchmarkVerification
+  verification?: SimulationBenchmarkVerification
+  failure_kind?: SimulationFailureKind
+  finalizing: boolean
+}
+
+function getValidationConcurrency(): number {
+  const concurrency_value = Number(process.env.MODEL_VALIDATION_CONCURRENCY ?? 4)
+  return Number.isInteger(concurrency_value) ? Math.max(1, Math.min(8, concurrency_value)) : 4
+}
+
+async function prepareBenchmarkValidation(input: {
+  benchmark_id: string
+  benchmark_file: string
+  source_signature: string
   job_dir: string
   model_dir: string
-  signal: AbortSignal
-  tsci_bin: string
-  append: (stream: JobLogStream, message: string) => Promise<void>
-}): Promise<{
-  exit_code: number
-  point_paths: Array<{ path: string; x: number }>
-  error_message?: string
-}> {
+}): Promise<BenchmarkValidationState> {
+  const build_plan = await getSimulationBuildPlan(input.model_dir, input.benchmark_id)
   const build_root = join(input.model_dir, ".server-validation-builds", input.benchmark_id)
   await rm(build_root, { recursive: true, force: true })
   await mkdir(build_root, { recursive: true })
   const benchmark_source = join(input.model_dir, "benchmarks", input.benchmark_file)
-  const runs = await Promise.all(
-    input.build_plan.map(async (point, point_index) => {
-      if (point.x === undefined || !point.props) throw new Error("parameter sweep build plan is invalid")
-      const point_x = point.x
+  const runs: ValidationBuildRun[] = await Promise.all(
+    build_plan.map(async (point, point_index) => {
+      if (build_plan.length === 1 && !point.props) {
+        return {
+          point_index,
+          run_id: point.run_id,
+          ...(point.x === undefined ? {} : { x: point.x }),
+          wrapper_path: benchmark_source,
+          generated_path: join(
+            input.job_dir,
+            "dist",
+            "spice",
+            "benchmarks",
+            input.benchmark_id,
+            "circuit.json",
+          ),
+          saved_path: join(
+            input.model_dir,
+            "validation-artifacts",
+            input.benchmark_id,
+            "runs",
+            point.run_id,
+            "circuit.json",
+          ),
+        }
+      }
       const wrapper_path = join(build_root, `${point.run_id}.circuit.tsx`)
+      const props = point.props ? ` {...${JSON.stringify(point.props)}}` : ""
       await Bun.write(
         wrapper_path,
-        `import Benchmark from ${JSON.stringify(toImportPath(dirname(wrapper_path), benchmark_source))}\n\nexport default function ServerValidationPoint() {\n  return <Benchmark {...${JSON.stringify(point.props)}} />\n}\n`,
+        `import Benchmark from ${JSON.stringify(toImportPath(dirname(wrapper_path), benchmark_source))}\n\nexport default function ServerValidationPoint() {\n  return <Benchmark${props} />\n}\n`,
       )
-      return { point, point_x, point_index, wrapper_path }
+      return {
+        point_index,
+        run_id: point.run_id,
+        ...(point.x === undefined ? {} : { x: point.x }),
+        wrapper_path,
+        generated_path: join(
+          input.job_dir,
+          "dist",
+          "spice",
+          ".server-validation-builds",
+          input.benchmark_id,
+          point.run_id,
+          "circuit.json",
+        ),
+        saved_path: join(
+          input.model_dir,
+          "validation-artifacts",
+          input.benchmark_id,
+          "runs",
+          point.run_id,
+          "circuit.json",
+        ),
+      }
     }),
   )
-  const results: Array<{ exit_code: number; path?: string; x: number; error_message?: string } | undefined> =
-    Array(runs.length)
-  let next_index = 0
-  const concurrency_value = Number(process.env.MODEL_VALIDATION_CONCURRENCY ?? 4)
-  const concurrency = Number.isInteger(concurrency_value) ? Math.max(1, Math.min(8, concurrency_value)) : 4
-  const worker = async () => {
-    while (!input.signal.aborted) {
-      const run_index = next_index
-      next_index += 1
-      const run = runs[run_index]
-      if (!run) return
-      await input.append(
-        "system",
-        `Building locked benchmark ${input.benchmark_file} (${run.point_index + 1}/${runs.length}) at x=${run.point.x}…\n`,
-      )
-      const source_relative = relative(input.model_dir, run.wrapper_path)
-      let process_output = ""
-      const exit_code = await streamModelProcess({
-        command: [input.tsci_bin, "build", source_relative, "--ignore-warnings"],
-        cwd: input.model_dir,
-        signal: input.signal,
-        on_chunk: async (stream, message) => {
-          process_output = captureProcessOutput(process_output, message)
-          await input.append(stream, message)
-        },
-      })
-      const generated_path = join(
-        input.job_dir,
-        "dist",
-        "spice",
-        ".server-validation-builds",
-        input.benchmark_id,
-        run.point.run_id,
-        "circuit.json",
-      )
-      if (exit_code !== 0) {
-        results[run_index] = {
-          exit_code,
-          x: run.point_x,
-          error_message: summarizeProcessFailure(process_output),
-        }
-        continue
-      }
-      const saved_path = join(
-        input.model_dir,
-        "validation-artifacts",
-        input.benchmark_id,
-        "runs",
-        run.point.run_id,
-        "circuit.json",
-      )
-      await mkdir(dirname(saved_path), { recursive: true })
-      await Bun.write(saved_path, await readFile(generated_path))
-      results[run_index] = { exit_code, path: saved_path, x: run.point_x }
+  return {
+    benchmark_id: input.benchmark_id,
+    benchmark_file: input.benchmark_file,
+    source_signature: input.source_signature,
+    runs,
+    results: Array(runs.length),
+    building_verification: {
+      benchmark_id: input.benchmark_id,
+      passed: false,
+      status: "building",
+      generated_at: new Date().toISOString(),
+      source_signature: input.source_signature,
+    },
+    finalizing: false,
+  }
+}
+
+async function executeValidationBuild(input: {
+  state: BenchmarkValidationState
+  run: ValidationBuildRun
+  model_dir: string
+  signal: AbortSignal
+  tsci_bin: string
+  append: (stream: JobLogStream, message: string) => Promise<void>
+}): Promise<ValidationBuildResult> {
+  const { state, run } = input
+  if (input.signal.aborted) {
+    return { exit_code: 143, x: run.x, error_message: "Validation was cancelled", failure_kind: "process" }
+  }
+  const point_label = run.x === undefined ? "" : ` at x=${run.x}`
+  await input.append(
+    "system",
+    `Building locked benchmark ${state.benchmark_file} (${run.point_index + 1}/${state.runs.length})${point_label}…\n`,
+  )
+  await rm(dirname(run.generated_path), { recursive: true, force: true })
+  const source_relative = relative(input.model_dir, run.wrapper_path)
+  let process_output = ""
+  let exit_code: number
+  try {
+    exit_code = await streamModelProcess({
+      command: [
+        input.tsci_bin,
+        "build",
+        source_relative,
+        "--ignore-warnings",
+        "--disable-pcb",
+        "--routing-disabled",
+        "--disable-parts-engine",
+      ],
+      cwd: input.model_dir,
+      signal: input.signal,
+      on_chunk: async (stream, message) => {
+        process_output = captureProcessOutput(process_output, message)
+        await input.append(stream, message)
+      },
+    })
+  } catch (error) {
+    return {
+      exit_code: 1,
+      x: run.x,
+      error_message: error instanceof Error ? error.message : String(error),
+      failure_kind: "process",
     }
   }
-  await Promise.all(Array.from({ length: Math.min(concurrency, runs.length) }, () => worker()))
-  const completed = results.filter(
-    (result): result is { exit_code: number; path?: string; x: number; error_message?: string } =>
-      result !== undefined,
-  )
-  const failed = completed.find((result) => result.exit_code !== 0)
-  return {
-    exit_code: failed?.exit_code ?? (input.signal.aborted ? 143 : 0),
-    point_paths: completed.flatMap((result) =>
-      result.exit_code === 0 && result.path ? [{ path: result.path, x: result.x }] : [],
-    ),
-    error_message: failed?.error_message
-      ? `Sweep point x=${failed.x} failed: ${failed.error_message}`
-      : undefined,
+  if (exit_code !== 0) {
+    return {
+      exit_code,
+      x: run.x,
+      error_message: summarizeProcessFailure(process_output),
+      failure_kind: "process",
+    }
   }
+  try {
+    const circuit_text = await readFile(run.generated_path, "utf8")
+    await mkdir(dirname(run.saved_path), { recursive: true })
+    await Bun.write(run.saved_path, circuit_text)
+    const diagnostics = getCircuitBuildDiagnostics(JSON.parse(circuit_text) as unknown)
+    if (diagnostics.source_errors.length > 0) {
+      return {
+        exit_code: 1,
+        path: run.saved_path,
+        x: run.x,
+        error_message: diagnostics.source_errors.join("; "),
+        failure_kind: "benchmark_structure",
+      }
+    }
+    if (diagnostics.simulation_errors.length > 0) {
+      return {
+        exit_code: 1,
+        path: run.saved_path,
+        x: run.x,
+        error_message: diagnostics.simulation_errors.join("; "),
+        failure_kind: "simulation",
+      }
+    }
+    return { exit_code: 0, path: run.saved_path, x: run.x }
+  } catch (error) {
+    return {
+      exit_code: 1,
+      x: run.x,
+      error_message: error instanceof Error ? error.message : String(error),
+      failure_kind: "process",
+    }
+  }
+}
+
+async function runValidationTaskPool<T>(input: {
+  tasks: T[]
+  concurrency: number
+  signal: AbortSignal
+  run: (task: T) => Promise<void>
+}): Promise<void> {
+  let next_index = 0
+  const worker = async () => {
+    while (!input.signal.aborted) {
+      const task_index = next_index
+      next_index += 1
+      const task = input.tasks[task_index]
+      if (!task) return
+      await input.run(task)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(input.concurrency, input.tasks.length) }, () => worker()))
+}
+
+function getRoundRobinRemainingRuns(
+  states: BenchmarkValidationState[],
+): Array<{ state: BenchmarkValidationState; run: ValidationBuildRun }> {
+  const tasks: Array<{ state: BenchmarkValidationState; run: ValidationBuildRun }> = []
+  const maximum_runs = Math.max(0, ...states.map((state) => state.runs.length))
+  for (let point_index = 1; point_index < maximum_runs; point_index += 1) {
+    for (const state of states) {
+      const run = state.runs[point_index]
+      if (run && !state.verification) tasks.push({ state, run })
+    }
+  }
+  return tasks
 }
 
 async function validateChampion(
@@ -664,6 +971,7 @@ async function validateChampion(
   model_card: string
   iteration: number
   integration_error?: string
+  benchmark_contract_error?: string
   simulation_verifications: SimulationBenchmarkVerification[]
 }> {
   const [model_source, manifest_value, model_card, iteration] = await Promise.all([
@@ -684,7 +992,15 @@ async function validateChampion(
   }
   const integration_errors: string[] = []
   const build_exit_code = await streamModelProcess({
-    command: [context.tsci_bin, "build", "component-with-model.circuit.tsx", "--ignore-warnings"],
+    command: [
+      context.tsci_bin,
+      "build",
+      "component-with-model.circuit.tsx",
+      "--ignore-warnings",
+      "--disable-pcb",
+      "--routing-disabled",
+      "--disable-parts-engine",
+    ],
     cwd: input.model_dir,
     signal: input.signal,
     on_chunk: append,
@@ -695,96 +1011,153 @@ async function validateChampion(
     const integrated_circuit: unknown = JSON.parse(
       await readFile(join(input.job_dir, "dist", "spice", "component-with-model", "circuit.json"), "utf8"),
     )
-    assertIntegratedCircuitUsesCanonicalModel(integrated_circuit, model_source)
-    await append("system", "Built the server-generated canonical model wrapper.\n")
+    const diagnostics = getCircuitBuildDiagnostics(integrated_circuit)
+    const integration_build_errors = [...diagnostics.source_errors, ...diagnostics.simulation_errors]
+    if (integration_build_errors.length > 0) {
+      integration_errors.push(
+        `The tscircuit model integration build produced semantic errors: ${integration_build_errors.join("; ")}`,
+      )
+    } else {
+      assertIntegratedCircuitUsesCanonicalModel(integrated_circuit, model_source)
+      await append("system", "Built the server-generated canonical model wrapper.\n")
+    }
   }
 
   const benchmark_files = await listModelBenchFiles(input.model_dir)
   if (benchmark_files.length === 0) throw new Error("No tscircuit benchmark circuits were created")
-  const simulation_verifications: SimulationBenchmarkVerification[] = []
-  for (const benchmark_file of benchmark_files) {
-    const benchmark_id = benchmark_file.replace(/\.circuit\.tsx$/i, "")
-    if (input.signal.aborted) {
-      integration_errors.push("The independent benchmark re-run reached its validation time limit")
-      break
-    }
-    const source_signature = await getModelSimulationSourceSignature(input.model_dir, benchmark_id)
-    await writeSimulationValidationReport(input.model_dir, [
-      ...simulation_verifications,
-      {
-        benchmark_id,
-        passed: false,
-        status: "building",
-        generated_at: new Date().toISOString(),
-        source_signature,
-      },
-    ])
-    const build_plan = await getSimulationBuildPlan(input.model_dir, benchmark_id)
-    let point_paths: Array<{ path: string; x: number }> = []
-    let simulation_exit_code = 0
-    let simulation_build_error: string | undefined
-    if (build_plan.length > 1) {
-      const sweep_result = await runParameterSweepBuilds({
+  const states = await Promise.all(
+    benchmark_files.map(async (benchmark_file) => {
+      const benchmark_id = benchmark_file.replace(/\.circuit\.tsx$/i, "")
+      return prepareBenchmarkValidation({
         benchmark_id,
         benchmark_file,
-        build_plan,
+        source_signature: await getModelSimulationSourceSignature(input.model_dir, benchmark_id),
         job_dir: input.job_dir,
         model_dir: input.model_dir,
-        signal: input.signal,
-        tsci_bin: context.tsci_bin,
-        append,
       })
-      simulation_exit_code = sweep_result.exit_code
-      point_paths = sweep_result.point_paths
-      simulation_build_error = sweep_result.error_message
-    } else {
-      await append("system", `Building and running locked benchmark ${benchmark_file}…\n`)
-      await rm(join(input.job_dir, "dist", "spice", "benchmarks", benchmark_id), {
-        recursive: true,
-        force: true,
-      })
-      const command = [context.tsci_bin, "build", join("benchmarks", benchmark_file), "--ignore-warnings"]
-      let process_output = ""
-      simulation_exit_code = await streamModelProcess({
-        command,
-        cwd: input.model_dir,
-        signal: input.signal,
-        on_chunk: async (stream, message) => {
-          process_output = captureProcessOutput(process_output, message)
-          await append(stream, message)
-        },
-      })
-      simulation_build_error = summarizeProcessFailure(process_output)
+    }),
+  )
+  await writeSimulationValidationReport(
+    input.model_dir,
+    states.map((state) => state.building_verification),
+  )
+
+  let report_write = Promise.resolve()
+  const publishReport = (): Promise<void> => {
+    report_write = report_write.then(() =>
+      writeSimulationValidationReport(
+        input.model_dir,
+        states.map((state) => state.verification ?? state.building_verification),
+      ),
+    )
+    return report_write
+  }
+  const failState = async (
+    state: BenchmarkValidationState,
+    run: ValidationBuildRun,
+    result: ValidationBuildResult,
+  ): Promise<void> => {
+    if (state.verification) return
+    state.failure_kind = result.failure_kind ?? "process"
+    const point_label = run.x === undefined ? "" : ` at x=${run.x}`
+    const error_message = `${state.benchmark_file} build${point_label} exited with code ${result.exit_code}${
+      result.error_message ? `: ${result.error_message}` : ""
+    }`
+    state.verification = {
+      benchmark_id: state.benchmark_id,
+      passed: false,
+      status: "failed",
+      generated_at: new Date().toISOString(),
+      source_signature: state.source_signature,
+      error_message,
     }
-    if (simulation_exit_code !== 0) {
-      const error_message = `${benchmark_file} build exited with code ${simulation_exit_code}${
-        simulation_build_error ? `: ${simulation_build_error}` : ""
-      }`
-      integration_errors.push(error_message)
-      simulation_verifications.push({
-        benchmark_id,
-        passed: false,
-        status: "failed",
-        generated_at: new Date().toISOString(),
-        source_signature,
-        error_message,
-      })
-      await writeSimulationValidationReport(input.model_dir, simulation_verifications)
-      continue
+    await publishReport()
+  }
+  const finalizeState = async (state: BenchmarkValidationState): Promise<void> => {
+    if (
+      state.verification ||
+      state.finalizing ||
+      state.results.filter((result) => Boolean(result?.path)).length !== state.runs.length
+    ) {
+      return
     }
-    const verification = await verifySimulationBenchmark({
+    state.finalizing = true
+    state.verification = await verifySimulationBenchmark({
       model_dir: input.model_dir,
-      benchmark_id,
-      source_signature,
-      circuit_json_paths: point_paths.length ? point_paths : undefined,
+      benchmark_id: state.benchmark_id,
+      source_signature: state.source_signature,
+      circuit_json_paths: state.results.map((result) => ({
+        path: result!.path!,
+        ...(result!.x === undefined ? {} : { x: result!.x }),
+      })),
     })
-    simulation_verifications.push(verification)
-    await writeSimulationValidationReport(input.model_dir, simulation_verifications)
-    if (!verification.passed) {
-      integration_errors.push(`${benchmark_file}: ${verification.error_message}`)
+    await publishReport()
+  }
+  const runTask = async (task: {
+    state: BenchmarkValidationState
+    run: ValidationBuildRun
+  }): Promise<void> => {
+    if (task.state.verification || input.signal.aborted) return
+    const result = await executeValidationBuild({
+      state: task.state,
+      run: task.run,
+      model_dir: input.model_dir,
+      signal: input.signal,
+      tsci_bin: context.tsci_bin,
+      append,
+    })
+    task.state.results[task.run.point_index] = result
+    if (result.exit_code !== 0 || !result.path) {
+      await failState(task.state, task.run, result)
+      return
+    }
+    await finalizeState(task.state)
+  }
+
+  const concurrency = getValidationConcurrency()
+  await append(
+    "system",
+    `Starting fair global validation scheduling with up to ${concurrency} concurrent build(s); one preview run per benchmark is prioritized first.\n`,
+  )
+  await runValidationTaskPool({
+    tasks: states.flatMap((state) => (state.runs[0] ? [{ state, run: state.runs[0] }] : [])),
+    concurrency,
+    signal: input.signal,
+    run: runTask,
+  })
+  await runValidationTaskPool({
+    tasks: getRoundRobinRemainingRuns(states),
+    concurrency,
+    signal: input.signal,
+    run: runTask,
+  })
+  await Promise.all(states.map(finalizeState))
+
+  if (input.signal.aborted) {
+    integration_errors.push("The independent benchmark re-run reached its validation time limit")
+  }
+  for (const state of states) {
+    if (!state.verification && !input.signal.aborted) {
+      await failState(state, state.runs[0]!, {
+        exit_code: 1,
+        error_message: "Validation did not produce every required simulator output",
+        failure_kind: "process",
+      })
     }
   }
-  await writeSimulationValidationReport(input.model_dir, simulation_verifications)
+  await report_write
+  const simulation_verifications = states.flatMap((state) => (state.verification ? [state.verification] : []))
+  for (const state of states) {
+    if (state.verification && !state.verification.passed) {
+      integration_errors.push(`${state.benchmark_file}: ${state.verification.error_message}`)
+    }
+  }
+  const structural_failure = states.find(
+    (state) => state.failure_kind === "benchmark_structure" && state.verification,
+  )
+  const benchmark_contract_error = structural_failure
+    ? `${structural_failure.benchmark_file}: ${structural_failure.verification!.error_message ?? "benchmark source contract failed"}`
+    : undefined
   await verifyBenchmarkLock(input.model_dir, input.benchmark_lock)
   return {
     manifest,
@@ -792,6 +1165,7 @@ async function validateChampion(
     model_card,
     iteration,
     integration_error: integration_errors.length > 0 ? integration_errors.join("; ") : undefined,
+    benchmark_contract_error,
     simulation_verifications,
   }
 }
@@ -810,7 +1184,7 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
 
   let budget_exhausted = false
   let stale_timeout = false
-  const process_controller = new AbortController()
+  let process_controller = new AbortController()
   const cancel_process = () => process_controller.abort()
   if (cancellation_signal.aborted) {
     markModelRunCancelled(input.model_run_id, context.model_run_store)
@@ -925,78 +1299,25 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
         "system",
         "Starting the untimed benchmark-finalization pass. Model refinement has not started.\n",
       )
-      const configured_attempts = Number(process.env.MODEL_BENCHMARK_FINALIZATION_ATTEMPTS ?? 4)
-      const max_attempts = Number.isInteger(configured_attempts)
-        ? Math.max(1, Math.min(8, configured_attempts))
-        : 4
-      let benchmark_validation_feedback: string | undefined
-      for (let attempt = 1; attempt <= max_attempts; attempt += 1) {
-        const benchmark_exit_code = await streamModelProcess({
-          command: [
-            context.agent_bin,
-            "do",
-            "--prompt",
-            buildModelBenchmarkPrompt(benchmark_validation_feedback),
-            "--dir",
-            model_dir,
-          ],
-          cwd: model_dir,
-          signal: process_controller.signal,
-          on_chunk: append,
-        })
-        if (cancellation_signal.aborted) {
-          await append("system", "\nBenchmark finalization was stopped. Draft evidence was preserved.\n")
-          markModelRunCancelled(input.model_run_id, context.model_run_store)
-          return
-        }
-        if (benchmark_exit_code !== 0) {
-          throw new Error(`Benchmark-finalization agent exited with code ${benchmark_exit_code}`)
-        }
-        const finalized_premature_artifacts = await findPrematureRefinementArtifacts(model_dir)
-        if (finalized_premature_artifacts.length > 0) {
-          throw new Error(
-            `Benchmark finalization created forbidden model artifacts before the suite was locked: ${finalized_premature_artifacts.join(", ")}`,
-          )
-        }
-
-        let rejection: string | undefined
-        if (!(await hasBenchmarkManifest(model_dir))) {
-          rejection = "The benchmark-finalization agent did not create benchmarks.json"
-        } else {
-          try {
-            benchmark_lock = await createOrVerifyBenchmarkLock(model_dir)
-          } catch (error) {
-            rejection = error instanceof Error ? error.message : String(error)
-          }
-        }
-        if (benchmark_lock) {
-          context.model_run_store.rememberBenchmarkLock(input.model_run_id, benchmark_lock)
-          break
-        }
-        if (!rejection) rejection = "The benchmark suite did not pass server validation"
-        if (attempt >= max_attempts) {
-          throw new Error(
-            `Benchmark finalization still failed server validation after ${attempt} attempts: ${rejection}`,
-          )
-        }
-        benchmark_validation_feedback = rejection.slice(0, 8_000)
-        await append(
-          "system",
-          `The server rejected benchmark-finalization attempt ${attempt}: ${rejection}\nReturning the exact validation error to the benchmark agent for correction; model refinement remains untimed and has not started.\n`,
-        )
-        updateServerProgress(
-          input.model_run_id,
-          context.model_run_store,
-          "locking_benchmarks",
-          `Correcting benchmark suite after server validation attempt ${attempt}`,
-        )
-      }
-      if (!benchmark_lock) throw new Error("The benchmark suite could not be locked")
+      const finalized = await finalizeAndLockBenchmarks({
+        model_run_id: input.model_run_id,
+        job_dir,
+        model_dir,
+        signal: process_controller.signal,
+        context,
+        append,
+      })
+      benchmark_lock = finalized.benchmark_lock
+      context.model_run_store.rememberBenchmarkLock(input.model_run_id, benchmark_lock)
     } else {
       await clearEphemeralBenchmarkRuns(model_dir)
       benchmark_lock = await verifyBenchmarkLock(model_dir, benchmark_lock)
       context.model_run_store.rememberBenchmarkLock(input.model_run_id, benchmark_lock)
     }
+    const locked_simulation_run_count = await getSimulationRunCount(model_dir).catch(() => 0)
+    context.model_run_store.setValidationProfile(input.model_run_id, {
+      simulation_run_count: locked_simulation_run_count,
+    })
     await append("system", "The server locked the benchmark manifest, evidence, and test benches.\n")
 
     context.model_run_store.startSegment(input.model_run_id)
@@ -1017,14 +1338,17 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
     let final_validation: Awaited<ReturnType<typeof scoreModelBenchmarks>> | undefined
     let final_error_message: string | undefined
     let agent_attempt = 0
+    let benchmark_recovery_count = 0
 
-    budget_monitor = setInterval(() => {
-      const remaining_time_ms = context.model_run_store.getRemainingTimeMs(input.model_run_id)
-      if (remaining_time_ms !== undefined && remaining_time_ms <= 0) {
-        budget_exhausted = true
-        process_controller.abort()
-      }
-    }, 500)
+    const startBudgetMonitor = () =>
+      setInterval(() => {
+        const remaining_time_ms = context.model_run_store.getRemainingTimeMs(input.model_run_id)
+        if (remaining_time_ms !== undefined && remaining_time_ms <= 0) {
+          budget_exhausted = true
+          process_controller.abort()
+        }
+      }, 500)
+    budget_monitor = startBudgetMonitor()
 
     while (true) {
       agent_attempt += 1
@@ -1170,20 +1494,22 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
           context,
         )
         await verifyBenchmarkLock(model_dir, benchmark_lock)
-        if (
-          final_champion.simulation_verifications.every((verification) => verification.passed) &&
-          !(await hasCompleteVerifiedSimulationReport(model_dir))
-        ) {
-          throw new Error("The server-verified simulation artifacts changed before scoring")
+        if (final_champion.benchmark_contract_error) {
+          final_error_message = final_champion.benchmark_contract_error
+        } else if (!(await hasCompleteVerifiedSimulationReport(model_dir))) {
+          final_validation = undefined
+          final_error_message =
+            "Scoring was deferred because independent simulation validation is incomplete."
+        } else {
+          final_validation = await scoreModelBenchmarks(model_dir, {
+            results_directory_override: getVerifiedResultsDirectory(model_dir),
+          })
+          await Bun.write(
+            join(model_dir, "validation-report.json"),
+            `${JSON.stringify(final_validation, null, 2)}\n`,
+          )
+          await artifact_monitor.sync()
         }
-        final_validation = await scoreModelBenchmarks(model_dir, {
-          results_directory_override: getVerifiedResultsDirectory(model_dir),
-        })
-        await Bun.write(
-          join(model_dir, "validation-report.json"),
-          `${JSON.stringify(final_validation, null, 2)}\n`,
-        )
-        await artifact_monitor.sync()
       } catch (error) {
         final_error_message = error instanceof Error ? error.message : String(error)
         if (error instanceof ModelProcessStaleError) stale_timeout = true
@@ -1197,12 +1523,80 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
         return
       }
 
+      if (final_champion?.benchmark_contract_error) {
+        const configured_recoveries = Number(process.env.MODEL_BENCHMARK_RECOVERY_ATTEMPTS ?? 2)
+        const maximum_recoveries = Number.isInteger(configured_recoveries)
+          ? Math.max(0, Math.min(4, configured_recoveries))
+          : 2
+        if (benchmark_recovery_count >= maximum_recoveries) {
+          final_error_message = `Benchmark circuit recovery limit reached: ${final_champion.benchmark_contract_error}`
+          break
+        }
+        benchmark_recovery_count += 1
+        context.model_run_store.pauseSegment(input.model_run_id)
+        if (budget_monitor) clearInterval(budget_monitor)
+        budget_monitor = undefined
+        budget_exhausted = false
+        process_controller = new AbortController()
+        await append(
+          "system",
+          `Independent validation found a structural defect in the locked benchmark circuit. Pausing and discarding model refinement, then returning only the circuit harness for controlled repair (lock generation ${benchmark_lock.generation + 1}).\n`,
+        )
+        updateServerProgress(
+          input.model_run_id,
+          context.model_run_store,
+          "locking_benchmarks",
+          `Repairing a structural benchmark defect in lock generation ${benchmark_lock.generation}`,
+        )
+        await clearRefinementArtifacts(model_dir)
+        const repaired = await finalizeAndLockBenchmarks({
+          model_run_id: input.model_run_id,
+          job_dir,
+          model_dir,
+          signal: process_controller.signal,
+          context,
+          append,
+          initial_feedback: final_champion.benchmark_contract_error,
+          repair_lock: benchmark_lock,
+        })
+        benchmark_lock = repaired.benchmark_lock
+        context.model_run_store.rememberBenchmarkLock(input.model_run_id, benchmark_lock)
+        const repaired_run_count = await getSimulationRunCount(model_dir)
+        context.model_run_store.setValidationProfile(input.model_run_id, {
+          simulation_run_count: repaired_run_count,
+        })
+        context.model_run_store.restartSegment(input.model_run_id)
+        budget_monitor = startBudgetMonitor()
+        final_champion = undefined
+        final_validation = undefined
+        final_error_message = undefined
+        agent_attempt = 0
+        await append(
+          "system",
+          `Committed benchmark lock generation ${benchmark_lock.generation}; restarting model refinement from a clean time boundary.\n`,
+        )
+        continue
+      }
+
       const validation_complete = final_validation?.all_passed === true && !final_champion?.integration_error
       if (validation_complete) break
 
       const simulation_failures =
         final_champion?.simulation_verifications.filter((verification) => !verification.passed) ?? []
       const score_failures = final_validation?.benchmarks.filter((benchmark) => !benchmark.passed) ?? []
+      const scoring_status = final_validation
+        ? score_failures.length > 0
+          ? score_failures
+              .map(
+                (failure) =>
+                  `- ${failure.benchmark_id}: ${summarizeValidationFeedback(
+                    failure.error_message,
+                    `NRMSE ${failure.normalized_rmse}`,
+                  )}`,
+              )
+              .join("\n")
+          : "- None"
+        : "- Not scored because independent simulation validation is incomplete."
       final_error_message =
         final_champion?.integration_error ??
         final_error_message ??
@@ -1214,20 +1608,14 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
             ? simulation_failures
                 .map(
                   (failure) =>
-                    `- ${failure.benchmark_id}: ${failure.error_message ?? "simulation verification failed"}`,
+                    `- ${failure.benchmark_id}: ${summarizeValidationFeedback(
+                      failure.error_message,
+                      "simulation verification failed",
+                    )}`,
                 )
                 .join("\n")
             : "- None"
-        }\n\n## Scoring failures\n\n${
-          score_failures.length > 0
-            ? score_failures
-                .map(
-                  (failure) =>
-                    `- ${failure.benchmark_id}: ${failure.error_message ?? `NRMSE ${failure.normalized_rmse}`}`,
-                )
-                .join("\n")
-            : "- None"
-        }\n`,
+        }\n\n## Scoring failures\n\n${scoring_status}\n`,
       )
       await append(
         "system",
@@ -1309,7 +1697,7 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
               iteration: final_champion.iteration,
               model_source: final_champion.model_source,
               manifest: final_champion.manifest,
-              model_card: final_champion.model_card,
+              model_card: markModelCardAsUnverified(final_champion.model_card),
             }
           : {}),
         ...(final_validation ? { validation: final_validation } : {}),
@@ -1359,7 +1747,5 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
 
 export async function listModelBenchFiles(model_dir: string): Promise<string[]> {
   const manifest_value: unknown = JSON.parse(await readFile(join(model_dir, "benchmarks.json"), "utf8"))
-  return parseBenchmarkManifest(manifest_value)
-    .benchmarks.map((benchmark) => `${benchmark.id}.circuit.tsx`)
-    .sort()
+  return parseBenchmarkManifest(manifest_value).benchmarks.map((benchmark) => `${benchmark.id}.circuit.tsx`)
 }

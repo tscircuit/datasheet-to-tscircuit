@@ -21,6 +21,8 @@ type ModelRunSubscriber = (event: ModelRunEvent) => void
 interface ModelRunRecord extends ModelRun {
   model_dir: string
   benchmark_lock?: BenchmarkLock
+  validation_run_count: number
+  validation_canary_ms?: number
   cancellation_controller: AbortController
   subscriber_set: Set<ModelRunSubscriber>
 }
@@ -80,10 +82,23 @@ function computeElapsedTime(record: ModelRunRecord, now = Date.now()): number {
   return record.elapsed_time_ms + Math.max(0, now - segment_start)
 }
 
-function computeValidationReserve(record: ModelRunRecord, simulation_run_count = 0): number {
+function computeValidationReserve(
+  record: ModelRunRecord,
+  simulation_run_count = record.validation_run_count,
+  observed_canary_ms = record.validation_canary_ms,
+): number {
   const base_reserve = Math.max(250, record.base_effort_ms * 0.25)
+  const concurrency_value = Number(process.env.MODEL_VALIDATION_CONCURRENCY ?? 4)
+  const concurrency = Number.isInteger(concurrency_value) ? Math.max(1, Math.min(8, concurrency_value)) : 4
+  const configured_batch_ms = Number(process.env.MODEL_VALIDATION_BATCH_ESTIMATE_MS ?? 20_000)
+  const minimum_batch_ms = Number.isFinite(configured_batch_ms)
+    ? Math.max(1_000, configured_batch_ms)
+    : 20_000
+  const measured_batch_ms =
+    observed_canary_ms && Number.isFinite(observed_canary_ms) ? Math.ceil(observed_canary_ms * 1.5) : 0
+  const batch_ms = Math.max(minimum_batch_ms, measured_batch_ms)
   const estimated_suite_ms =
-    simulation_run_count > 0 ? 15_000 + Math.ceil(simulation_run_count / 4) * 2_000 : 0
+    simulation_run_count > 0 ? 60_000 + Math.ceil(simulation_run_count / concurrency) * batch_ms : 0
   return Math.round(Math.min(record.allocated_time_ms * 0.8, Math.max(base_reserve, estimated_suite_ms)))
 }
 
@@ -141,6 +156,7 @@ export class ModelRunStore {
       logs: [],
       progress_history: [],
       preview_options: [],
+      validation_run_count: 0,
       cancellation_controller: new AbortController(),
       subscriber_set: new Set(),
     }
@@ -179,6 +195,7 @@ export class ModelRunStore {
       logs: input.logs,
       progress_history: input.model_run.progress_history ?? [],
       preview_options: input.model_run.preview_options ?? [],
+      validation_run_count: 0,
       cancellation_controller: new AbortController(),
       subscriber_set: new Set(),
     }
@@ -228,12 +245,46 @@ export class ModelRunStore {
 
   getFinalizationReserveMs(model_run_id: string, simulation_run_count = 0): number | undefined {
     const record = this.run_map.get(model_run_id)
-    return record ? computeValidationReserve(record, simulation_run_count) : undefined
+    return record
+      ? computeValidationReserve(record, simulation_run_count || record.validation_run_count)
+      : undefined
+  }
+
+  setValidationProfile(
+    model_run_id: string,
+    profile: { simulation_run_count: number; canary_duration_ms?: number },
+  ): ModelRun {
+    const record = this.requireRecord(model_run_id)
+    record.validation_run_count = Math.max(0, Math.floor(profile.simulation_run_count))
+    record.validation_canary_ms = profile.canary_duration_ms
+    this.touchAndPublish(record)
+    return getPublicModelRun(record)
   }
 
   startSegment(model_run_id: string): ModelRun {
     const record = this.requireRecord(model_run_id)
     if (record.segment_started_at) return getPublicModelRun(record)
+    record.segment_started_at = new Date().toISOString()
+    record.completed_at = undefined
+    record.status = "running"
+    record.is_complete = false
+    record.has_errors = false
+    record.error_message = undefined
+    this.touchAndPublish(record)
+    return getPublicModelRun(record)
+  }
+
+  pauseSegment(model_run_id: string): ModelRun {
+    const record = this.requireRecord(model_run_id)
+    if (record.segment_started_at) record.elapsed_time_ms = computeElapsedTime(record)
+    record.segment_started_at = undefined
+    this.touchAndPublish(record)
+    return getPublicModelRun(record)
+  }
+
+  restartSegment(model_run_id: string): ModelRun {
+    const record = this.requireRecord(model_run_id)
+    record.elapsed_time_ms = 0
     record.segment_started_at = new Date().toISOString()
     record.completed_at = undefined
     record.status = "running"

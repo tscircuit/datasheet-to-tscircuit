@@ -200,6 +200,7 @@ async function readWorkspaceCircuitJson(input: {
     await Promise.all([
       listFiles(join(dist_root, ".agent-simulation-runs", input.benchmark_id), "circuit.json"),
       listFiles(join(dist_root, ".server-validation-builds", input.benchmark_id), "circuit.json"),
+      listFiles(join(input.model_dir, "validation-artifacts", input.benchmark_id, "runs"), "circuit.json"),
     ])
   ).flat()
   const candidates = [canonical_file, ...isolated_files]

@@ -36,6 +36,11 @@ interface SimulationGraph {
   voltage_levels: number[]
 }
 
+export interface CircuitBuildDiagnostics {
+  source_errors: string[]
+  simulation_errors: string[]
+}
+
 export interface SimulationBenchmarkVerification {
   benchmark_id: string
   passed: boolean
@@ -227,18 +232,30 @@ export async function validateSimulationDefinitions(
   await Promise.all(benchmark_ids.map((benchmark_id) => readSimulationDefinition(model_dir, benchmark_id)))
 }
 
+function normalizeCircuitErrorMessage(element: Record<string, unknown>): string {
+  const raw = typeof element.message === "string" ? element.message : String(element.type)
+  return raw.split(/\s+Details:\s+Props:/i)[0]!.trim()
+}
+
+export function getCircuitBuildDiagnostics(value: unknown): CircuitBuildDiagnostics {
+  if (!isCircuitJson(value)) throw new Error("simulation did not produce Circuit JSON")
+  const source_errors = new Set<string>()
+  const simulation_errors = new Set<string>()
+  for (const element of value) {
+    if (!isRecord(element) || typeof element.type !== "string" || !element.type.endsWith("_error")) continue
+    const message = normalizeCircuitErrorMessage(element)
+    if (element.type.startsWith("source_")) source_errors.add(message)
+    if (element.type.startsWith("simulation_")) simulation_errors.add(message)
+  }
+  return { source_errors: [...source_errors], simulation_errors: [...simulation_errors] }
+}
+
 function parseSimulationOutput(value: unknown): { graphs: SimulationGraph[]; errors: string[] } {
   if (!isCircuitJson(value)) throw new Error("simulation did not produce Circuit JSON")
-  const errors: string[] = []
+  const diagnostics = getCircuitBuildDiagnostics(value)
   const graphs: SimulationGraph[] = []
   for (const element of value) {
     if (!isRecord(element) || typeof element.type !== "string") continue
-    const blocks_simulation = element.type.startsWith("simulation_") || element.type.startsWith("source_")
-    if (blocks_simulation && element.type.endsWith("_error")) {
-      errors.push(
-        "message" in element && typeof element.message === "string" ? element.message : element.type,
-      )
-    }
     if (element.type !== "simulation_transient_voltage_graph") continue
     if (
       typeof element.name !== "string" ||
@@ -261,7 +278,7 @@ function parseSimulationOutput(value: unknown): { graphs: SimulationGraph[]; err
       voltage_levels: element.voltage_levels as number[],
     })
   }
-  return { graphs, errors }
+  return { graphs, errors: [...diagnostics.source_errors, ...diagnostics.simulation_errors] }
 }
 
 function normalizeModelSource(source: string): string {
@@ -640,7 +657,7 @@ export async function verifySimulationBenchmark(input: {
   model_dir: string
   benchmark_id: string
   source_signature?: string
-  circuit_json_paths?: Array<{ path: string; x: number }>
+  circuit_json_paths?: Array<{ path: string; x?: number }>
 }): Promise<SimulationBenchmarkVerification> {
   const generated_at = new Date().toISOString()
   let artifact: Partial<SimulationBenchmarkVerification> = {}
@@ -694,7 +711,7 @@ export async function verifySimulationBenchmark(input: {
     }
 
     const parsed = circuit_jsons.map((json) => parseSimulationOutput(json))
-    const errors = parsed.flatMap(({ errors }) => errors)
+    const errors = [...new Set(parsed.flatMap(({ errors }) => errors))]
     if (errors.length > 0) throw new Error(errors.join("; "))
     assertNoSyntheticBenchmarkChannel(model_source)
     for (const circuit of circuit_jsons) {

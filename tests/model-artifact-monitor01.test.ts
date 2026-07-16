@@ -232,6 +232,31 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
     ),
   ).toBe(true)
 
+  const durable_output = join(
+    model_dir,
+    "validation-artifacts",
+    "output",
+    "runs",
+    "point-000",
+    "circuit.json",
+  )
+  await rm(isolated_output, { force: true })
+  await mkdir(join(durable_output, ".."), { recursive: true })
+  await Bun.write(
+    durable_output,
+    JSON.stringify(verifiedCircuit(modelSourceOne, "RESULT", "output-durable-run", [1, 2])),
+  )
+  const selected_durable_preview = await loadModelSelectedPreview({
+    model_dir,
+    benchmark_id: "output",
+  })
+  expect(selected_durable_preview?.circuit_preview?.snapshot_origin).toBe("workspace")
+  expect(
+    selected_durable_preview?.circuit_preview?.circuit_json?.some(
+      (element) => (element as { source_component_id?: string }).source_component_id === "output-durable-run",
+    ),
+  ).toBe(true)
+
   await Bun.write(join(model_dir, "model.lib"), modelSourceTwo)
   await monitor.sync()
   expect(store.getModelRun("model_1")?.circuit_preview?.is_stale).toBe(true)

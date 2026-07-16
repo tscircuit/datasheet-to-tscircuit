@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
+  getCircuitBuildDiagnostics,
   getVerifiedSimulationArtifact,
   getVerifiedResultFile,
   hasCompleteVerifiedSimulationReport,
@@ -27,6 +28,24 @@ function verifiedCircuit(probe_name: string, extra: Array<Record<string, unknown
     ...extra,
   ]
 }
+
+test("circuit diagnostics treat semantic source errors as failures even when a build exits zero", () => {
+  const diagnostics = getCircuitBuildDiagnostics([
+    {
+      type: "source_failed_to_create_component_error",
+      message:
+        'Invalid props for analogsimulation "SIM": simulationType Details: Props: { "simulationType": "transient" }',
+    },
+    {
+      type: "source_failed_to_create_component_error",
+      message:
+        'Invalid props for analogsimulation "SIM": simulationType Details: Props: { "simulationType": "transient" }',
+    },
+  ])
+
+  expect(diagnostics.source_errors).toEqual(['Invalid props for analogsimulation "SIM": simulationType'])
+  expect(diagnostics.simulation_errors).toEqual([])
+})
 
 test("simulation verification rejects solver errors and hashes extracted simulator curves", async () => {
   const job_dir = await mkdtemp(join(tmpdir(), "datasheet-model-simulation-validation-"))

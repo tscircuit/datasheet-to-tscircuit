@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { mkdir, readFile, readdir, rename } from "node:fs/promises"
+import { mkdir, readFile, readdir, rename, rm } from "node:fs/promises"
 import { dirname, isAbsolute, join, resolve, sep } from "node:path"
 import ts from "typescript"
 import { parseBenchmarkManifest, validateBenchmarkReferenceFiles } from "./model-scorer"
@@ -12,6 +12,7 @@ interface LockedFile {
 
 export interface BenchmarkLock {
   version: 1
+  generation: number
   locked_at: string
   benchmark_ids: string[]
   files: LockedFile[]
@@ -281,6 +282,38 @@ function findVoltageProbe(
   return result
 }
 
+function assertAnalogSimulationProps(source_file: ts.SourceFile, benchmark_id: string): void {
+  let count = 0
+  const visit = (node: ts.Node): void => {
+    if (
+      (ts.isJsxSelfClosingElement(node) || ts.isJsxOpeningElement(node)) &&
+      node.tagName.getText() === "analogsimulation"
+    ) {
+      count += 1
+      const attribute = node.attributes.properties.find(
+        (property): property is ts.JsxAttribute =>
+          ts.isJsxAttribute(property) && property.name.getText() === "simulationType",
+      )
+      if (attribute) {
+        const value =
+          attribute.initializer && ts.isStringLiteral(attribute.initializer)
+            ? attribute.initializer.text.trim()
+            : undefined
+        if (value !== "spice_transient_analysis") {
+          throw new Error(
+            `Benchmark ${benchmark_id} analogsimulation simulationType must be omitted or exactly "spice_transient_analysis"`,
+          )
+        }
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(source_file)
+  if (count !== 1) {
+    throw new Error(`Benchmark ${benchmark_id} must define exactly one analogsimulation`)
+  }
+}
+
 function assertBenchmarkSourceContract(source: string, benchmark: BenchmarkRecord): void {
   const source_file = parseBenchmarkSource(source, benchmark.id)
   if (
@@ -306,6 +339,7 @@ function assertBenchmarkSourceContract(source: string, benchmark: BenchmarkRecor
   if (!/<analogsimulation\b[^>]*\bspiceEngine=["']ngspice["']/.test(source)) {
     throw new Error(`Benchmark ${benchmark.id} must run an ngspice analogsimulation`)
   }
+  assertAnalogSimulationProps(source_file, benchmark.id)
   const probe_name = isRecord(benchmark.simulation) ? benchmark.simulation.probe_name : undefined
   if (typeof probe_name === "string") {
     const probe = findVoltageProbe(source_file, probe_name)
@@ -387,7 +421,28 @@ function parseLock(value: unknown): BenchmarkLock {
   ) {
     throw new Error("The server-owned benchmark lock is invalid")
   }
-  return value as unknown as BenchmarkLock
+  const generation = "generation" in value ? value.generation : 1
+  if (typeof generation !== "number" || !Number.isInteger(generation) || generation < 1) {
+    throw new Error("The server-owned benchmark lock has an invalid generation")
+  }
+  return { ...(value as Omit<BenchmarkLock, "generation">), generation }
+}
+
+async function writeLockSnapshots(
+  model_dir: string,
+  files: Array<LockedFile & { text: string }>,
+  generation: number,
+): Promise<void> {
+  const lock_root = getLockRoot(model_dir)
+  const generation_root = join(lock_root, "snapshots", `generation-${String(generation).padStart(4, "0")}`)
+  const current_root = join(lock_root, "snapshot")
+  await rm(current_root, { recursive: true, force: true })
+  await Promise.all(
+    files.flatMap(({ file, text }) => [
+      writeTextAtomically(join(generation_root, file), text),
+      writeTextAtomically(join(current_root, file), text),
+    ]),
+  )
 }
 
 export async function hasBenchmarkManifest(model_dir: string): Promise<boolean> {
@@ -396,6 +451,10 @@ export async function hasBenchmarkManifest(model_dir: string): Promise<boolean> 
 
 export async function hasBenchmarkLock(model_dir: string): Promise<boolean> {
   return Bun.file(getLockFile(model_dir)).exists()
+}
+
+export async function validateBenchmarkSuiteForLock(model_dir: string): Promise<void> {
+  await readCurrentLock(model_dir)
 }
 
 export async function createOrVerifyBenchmarkLock(model_dir: string): Promise<BenchmarkLock> {
@@ -422,16 +481,72 @@ export async function createOrVerifyBenchmarkLock(model_dir: string): Promise<Be
   const locked_at = new Date().toISOString()
   const lock: BenchmarkLock = {
     version: 1,
+    generation: 1,
     locked_at,
     benchmark_ids: current.benchmark_ids,
     files: current.files.map(({ file, sha256 }) => ({ file, sha256 })),
   }
-  const snapshot_root = join(getLockRoot(model_dir), "snapshot")
-  await Promise.all(
-    current.files.map(({ file, text }) => writeTextAtomically(join(snapshot_root, file), text)),
-  )
+  await writeLockSnapshots(model_dir, current.files, lock.generation)
   await writeTextAtomically(lock_path, `${JSON.stringify(lock, null, 2)}\n`)
   return lock
+}
+
+export async function replaceBenchmarkLockAfterCircuitRepair(
+  model_dir: string,
+  expected_lock: BenchmarkLock,
+): Promise<BenchmarkLock> {
+  const lock_path = getLockFile(model_dir)
+  const persisted = parseLock(JSON.parse(await readFile(lock_path, "utf8")) as unknown)
+  if (
+    persisted.locked_at !== expected_lock.locked_at ||
+    persisted.generation !== expected_lock.generation ||
+    JSON.stringify(persisted.benchmark_ids) !== JSON.stringify(expected_lock.benchmark_ids) ||
+    JSON.stringify(persisted.files) !== JSON.stringify(expected_lock.files)
+  ) {
+    throw new Error("The server-owned benchmark lock changed before circuit repair could be committed")
+  }
+
+  const current = await readCurrentLock(model_dir)
+  const repairable = (file: string) => file.startsWith("benchmarks/") && file.endsWith(".circuit.tsx")
+  const preserved = expected_lock.files.filter(({ file }) => !repairable(file))
+  const current_preserved = current.files
+    .filter(({ file }) => !repairable(file))
+    .map(({ file, sha256 }) => ({ file, sha256 }))
+  if (JSON.stringify(preserved) !== JSON.stringify(current_preserved)) {
+    throw new Error(
+      "Benchmark circuit recovery may change only benchmarks/*.circuit.tsx; the manifest, evidence, tolerances, and sweep points must remain locked",
+    )
+  }
+  if (JSON.stringify(current.benchmark_ids) !== JSON.stringify(expected_lock.benchmark_ids)) {
+    throw new Error("Benchmark circuit recovery may not add, remove, or rename benchmarks")
+  }
+  const previous_circuits = expected_lock.files.filter(({ file }) => repairable(file))
+  const current_circuits = current.files
+    .filter(({ file }) => repairable(file))
+    .map(({ file, sha256 }) => ({ file, sha256 }))
+  if (JSON.stringify(previous_circuits) === JSON.stringify(current_circuits)) {
+    throw new Error("Benchmark circuit recovery must repair at least one benchmarks/*.circuit.tsx file")
+  }
+
+  const generation = expected_lock.generation + 1
+  const replacement: BenchmarkLock = {
+    version: 1,
+    generation,
+    locked_at: new Date().toISOString(),
+    benchmark_ids: current.benchmark_ids,
+    files: current.files.map(({ file, sha256 }) => ({ file, sha256 })),
+  }
+  await writeTextAtomically(
+    join(
+      getLockRoot(model_dir),
+      "history",
+      `generation-${String(expected_lock.generation).padStart(4, "0")}.json`,
+    ),
+    `${JSON.stringify(expected_lock, null, 2)}\n`,
+  )
+  await writeLockSnapshots(model_dir, current.files, generation)
+  await writeTextAtomically(lock_path, `${JSON.stringify(replacement, null, 2)}\n`)
+  return replacement
 }
 
 export async function verifyBenchmarkLock(
@@ -443,6 +558,7 @@ export async function verifyBenchmarkLock(
   if (
     expected_lock &&
     (expected_lock.locked_at !== lock.locked_at ||
+      expected_lock.generation !== lock.generation ||
       JSON.stringify(expected_lock.benchmark_ids) !== JSON.stringify(lock.benchmark_ids) ||
       JSON.stringify(expected_lock.files) !== JSON.stringify(lock.files))
   ) {

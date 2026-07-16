@@ -2,7 +2,11 @@ import { expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { createOrVerifyBenchmarkLock, verifyBenchmarkLock } from "@/server/model-benchmark-lock"
+import {
+  createOrVerifyBenchmarkLock,
+  replaceBenchmarkLockAfterCircuitRepair,
+  verifyBenchmarkLock,
+} from "@/server/model-benchmark-lock"
 
 const benchmarkSource = `import Component from "../component-with-model.circuit"
 
@@ -132,6 +136,72 @@ test("benchmark locks accept direct DUT selectors containing a greater-than sepa
   await expect(createOrVerifyBenchmarkLock(model_dir)).resolves.toMatchObject({
     benchmark_ids: ["transfer"],
   })
+
+  await rm(job_dir, { recursive: true, force: true })
+})
+
+test("benchmark locks reject invalid analogsimulation props before refinement", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-benchmark-simulation-props-"))
+  const model_dir = join(job_dir, "spice")
+  await createLockedFixture(model_dir)
+  const invalid_source = benchmarkSource.replace(
+    '<analogsimulation duration="1ms"',
+    '<analogsimulation simulationType="transient" duration="1ms"',
+  )
+  await Bun.write(join(model_dir, "benchmarks", "transfer.circuit.tsx"), invalid_source)
+
+  await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow(
+    'simulationType must be omitted or exactly "spice_transient_analysis"',
+  )
+
+  await Bun.write(
+    join(model_dir, "benchmarks", "transfer.circuit.tsx"),
+    invalid_source.replace('simulationType="transient"', 'simulationType="spice_transient_analysis"'),
+  )
+  await expect(createOrVerifyBenchmarkLock(model_dir)).resolves.toMatchObject({ generation: 1 })
+
+  await rm(job_dir, { recursive: true, force: true })
+})
+
+test("controlled circuit repair creates a new immutable lock generation", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-benchmark-lock-generation-"))
+  const model_dir = join(job_dir, "spice")
+  await createLockedFixture(model_dir)
+  const first = await createOrVerifyBenchmarkLock(model_dir)
+  expect(first.generation).toBe(1)
+  await expect(replaceBenchmarkLockAfterCircuitRepair(model_dir, first)).rejects.toThrow(
+    "must repair at least one",
+  )
+
+  await Bun.write(
+    join(model_dir, "benchmarks", "transfer.circuit.tsx"),
+    `${benchmarkSource}\n// Structural harness repair.\n`,
+  )
+  const second = await replaceBenchmarkLockAfterCircuitRepair(model_dir, first)
+  expect(second.generation).toBe(2)
+  await expect(verifyBenchmarkLock(model_dir, second)).resolves.toMatchObject({ generation: 2 })
+  expect(
+    await Bun.file(join(job_dir, ".model-benchmark-lock", "history", "generation-0001.json")).exists(),
+  ).toBe(true)
+  expect(
+    await Bun.file(
+      join(
+        job_dir,
+        ".model-benchmark-lock",
+        "snapshots",
+        "generation-0002",
+        "benchmarks",
+        "transfer.circuit.tsx",
+      ),
+    ).text(),
+  ).toContain("Structural harness repair")
+
+  const manifest = JSON.parse(await Bun.file(join(model_dir, "benchmarks.json")).text())
+  manifest.benchmarks[0].tolerance = 0.5
+  await Bun.write(join(model_dir, "benchmarks.json"), JSON.stringify(manifest))
+  await expect(replaceBenchmarkLockAfterCircuitRepair(model_dir, second)).rejects.toThrow(
+    "may change only benchmarks/*.circuit.tsx",
+  )
 
   await rm(job_dir, { recursive: true, force: true })
 })
