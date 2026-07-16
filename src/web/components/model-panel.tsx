@@ -12,10 +12,11 @@ import {
   Square,
   Terminal,
 } from "lucide-react"
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
 import type { Job, ModelProgressPhase, ModelRun, ModelRunStatus } from "@/shared/job-types"
 import { getModelRunFileUrl } from "../api"
 import { useModelRun } from "../use-model-run"
+import { AgentLogViewer } from "./agent-log-viewer"
 import { ModelLivePreview } from "./model-live-preview"
 
 const STATUS_COPY: Record<ModelRunStatus, string> = {
@@ -84,12 +85,6 @@ function getElapsedTime(model_run: ModelRun, now: number): number {
 }
 
 function ModelRunLogs({ model_run }: { model_run: ModelRun }) {
-  const terminal_ref = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    const terminal = terminal_ref.current
-    if (terminal) terminal.scrollTop = terminal.scrollHeight
-  }, [model_run.logs])
-
   return (
     <section className="model-subcard model-log-card" aria-label="SPICE model agent logs">
       <header>
@@ -100,15 +95,12 @@ function ModelRunLogs({ model_run }: { model_run: ModelRun }) {
           <Download size={14} /> Log
         </a>
       </header>
-      <div className="model-terminal" ref={terminal_ref} aria-live="polite">
-        {model_run.logs.length === 0 && <span className="terminal-muted">Waiting for the model agent…</span>}
-        {model_run.logs.map((log) => (
-          <span className={`terminal-chunk terminal-${log.stream}`} key={log.log_id}>
-            {log.message}
-          </span>
-        ))}
-        {!model_run.is_complete && <span className="terminal-cursor" />}
-      </div>
+      <AgentLogViewer
+        className="model-terminal"
+        empty_message="Waiting for the model agent…"
+        is_running={!model_run.is_complete}
+        logs={model_run.logs}
+      />
     </section>
   )
 }
