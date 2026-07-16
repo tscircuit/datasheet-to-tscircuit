@@ -180,6 +180,25 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
   expect(selected_verified_preview?.circuit_preview?.snapshot_origin).toBe("server_validation")
   expect(selected_verified_preview?.reference_preview?.result_points?.[1]).toEqual({ x: 1, y: 2.1 })
 
+  await Bun.write(
+    join(benchmark_dir, "transfer.circuit.tsx"),
+    'export default () => <board><resistor name="R1" resistance="2k" /></board>\n',
+  )
+  const stale_transfer_preview = await loadModelSelectedPreview({
+    model_dir,
+    benchmark_id: "transfer",
+  })
+  const unchanged_output_preview = await loadModelSelectedPreview({
+    model_dir,
+    benchmark_id: "output",
+  })
+  expect(stale_transfer_preview?.circuit_preview?.is_stale).toBe(true)
+  expect(stale_transfer_preview?.reference_preview?.is_stale).toBe(true)
+  expect(stale_transfer_preview?.reference_preview?.result_status).toBe("deprecated")
+  expect(unchanged_output_preview?.reference_preview?.is_stale).toBe(false)
+  expect(unchanged_output_preview?.reference_preview?.result_status).toBe("verified")
+  await Bun.write(join(benchmark_dir, "transfer.circuit.tsx"), "export default () => <board />\n")
+
   await writeSimulationValidationReport(model_dir, [
     transfer_verification,
     {

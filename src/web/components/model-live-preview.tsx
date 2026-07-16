@@ -1,4 +1,4 @@
-import { Activity, Check, Clipboard, Code2, FlaskConical, LoaderCircle } from "lucide-react"
+import { Activity, AlertTriangle, Check, Clipboard, Code2, FlaskConical, LoaderCircle } from "lucide-react"
 import { lazy, Suspense, useEffect, useMemo, useState } from "react"
 import type {
   ModelCircuitPreview as ModelCircuitPreviewData,
@@ -89,7 +89,6 @@ function ModelCircuitPreview({ preview }: { preview?: ModelCircuitPreviewData })
             {preview.build_status.replace("_", " ")}
             {preview.snapshot_origin === "server_validation" ? " · verified snapshot" : ""}
             {preview.snapshot_origin === "workspace" ? " · saved workspace run" : ""}
-            {preview.is_stale ? " · older than source" : ""}
           </small>
         )}
       </header>
@@ -215,6 +214,7 @@ function ReferenceGraph({ preview }: { preview?: ModelReferencePreview }) {
   const displayed_x_max = preview.x_scale === "log" ? 10 ** x_max : x_max
   const displayed_y_min = preview.y_scale === "log" ? 10 ** y_min : y_min
   const displayed_y_max = preview.y_scale === "log" ? 10 ** y_max : y_max
+  const comparison_is_deprecated = preview.result_status === "deprecated" || preview.is_stale
 
   return (
     <section className="workspace-card model-reference-card" aria-label="Datasheet reference graph">
@@ -226,6 +226,15 @@ function ReferenceGraph({ preview }: { preview?: ModelReferencePreview }) {
         <small>{preview.source_file}</small>
       </header>
       <div className="model-reference-plot">
+        {comparison_is_deprecated && preview.result_points && (
+          <div className="model-comparison-warning" role="status">
+            <AlertTriangle size={13} />
+            <span>
+              <strong>Deprecated comparison</strong>
+              This curve was built from an earlier source; the automatic run will replace it.
+            </span>
+          </div>
+        )}
         <svg viewBox="0 0 650 340" role="img" aria-label={`${preview.title} reference curve`}>
           <g className="reference-grid">
             {[0, 1, 2, 3, 4].map((tick) => (
@@ -238,7 +247,7 @@ function ReferenceGraph({ preview }: { preview?: ModelReferencePreview }) {
           <polyline className="reference-line" points={reference_path} />
           {result_path && (
             <polyline
-              className={`result-line${preview.result_status === "partial" ? " result-line-partial" : ""}`}
+              className={`result-line${preview.result_status === "partial" ? " result-line-partial" : ""}${comparison_is_deprecated ? " result-line-deprecated" : ""}`}
               points={result_path}
             />
           )}
@@ -262,9 +271,13 @@ function ReferenceGraph({ preview }: { preview?: ModelReferencePreview }) {
             <i /> Datasheet reference
           </span>
           {preview.result_points && (
-            <span className="result-series">
-              <i /> {preview.result_status === "partial" ? "Validated waveform" : "Server-verified model"}
-              {preview.is_stale ? " (older source)" : ""}
+            <span className={`result-series${comparison_is_deprecated ? " deprecated" : ""}`}>
+              <i />
+              {comparison_is_deprecated
+                ? "Previous model result · deprecated"
+                : preview.result_status === "partial"
+                  ? "Validated waveform"
+                  : "Server-verified model"}
             </span>
           )}
           {!preview.result_points && (

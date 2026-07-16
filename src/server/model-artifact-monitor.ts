@@ -130,6 +130,11 @@ async function readReferencePreview(input: {
   const result_points = verified_artifact?.result_text
     ? parseCurveCsv(verified_artifact.result_text)
     : undefined
+  const is_stale = Boolean(
+    verified_artifact?.source_signature &&
+      current_signature &&
+      verified_artifact.source_signature !== current_signature,
+  )
   return {
     benchmark_id: selected?.id,
     title: selected?.title ?? selected?.id ?? basename(reference_file, ".csv"),
@@ -139,16 +144,15 @@ async function readReferencePreview(input: {
     y_scale: selected?.y_scale === "log" ? "log" : "linear",
     reference_points,
     result_points: result_points && result_points.length > 0 ? result_points : undefined,
-    result_status: verified_artifact?.passed
-      ? "verified"
-      : verified_artifact?.status === "building" && result_points?.length
-        ? "partial"
-        : undefined,
-    is_stale: Boolean(
-      verified_artifact?.source_signature &&
-        current_signature &&
-        verified_artifact.source_signature !== current_signature,
-    ),
+    result_status:
+      is_stale && result_points?.length
+        ? "deprecated"
+        : verified_artifact?.passed
+          ? "verified"
+          : verified_artifact?.status === "building" && result_points?.length
+            ? "partial"
+            : undefined,
+    is_stale,
     updated_at: verified_artifact?.generated_at ?? new Date().toISOString(),
   }
 }
