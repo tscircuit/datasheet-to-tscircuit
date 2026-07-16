@@ -2,7 +2,11 @@ import { expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { scoreModelBenchmarks } from "@/server/model-scorer"
+import {
+  parseBenchmarkManifest,
+  scoreModelBenchmarks,
+  validateBenchmarkSweepSelfRepresentation,
+} from "@/server/model-scorer"
 
 test("model scorer evaluates every locked benchmark from numeric CSV data", async () => {
   const model_dir = await mkdtemp(join(tmpdir(), "datasheet-model-scorer-"))
@@ -55,5 +59,46 @@ test("model scorer evaluates every locked benchmark from numeric CSV data", asyn
   expect(report.benchmarks[0]?.normalized_rmse).toBe(0)
   expect(report.benchmarks[1]?.passed).toBe(false)
 
+  await rm(model_dir, { recursive: true, force: true })
+})
+
+test("benchmark lock rejects a sweep grid whose interpolation cannot represent its reference", async () => {
+  const model_dir = await mkdtemp(join(tmpdir(), "datasheet-model-sparse-grid-"))
+  await mkdir(join(model_dir, "evidence"), { recursive: true })
+  await Bun.write(join(model_dir, "evidence", "bend.csv"), "x,y\n0,0\n0.5,1\n1,0\n")
+  const base = {
+    version: 1 as const,
+    locked_at: new Date().toISOString(),
+    benchmarks: [
+      {
+        id: "bend",
+        title: "Sharp bend",
+        source: { page: 2 },
+        critical: true,
+        weight: 1,
+        tolerance: 0.01,
+        max_error_tolerance: 0.02,
+        reference_file: "evidence/bend.csv",
+        result_file: "results/champion/bend.csv",
+        simulation: {
+          kind: "parameter_sweep",
+          probe_name: "RESULT",
+          dut_spice_node: "OUT",
+          reducer: "last",
+          points: [
+            { x: 0, props: { input: 0 } },
+            { x: 1, props: { input: 1 } },
+          ],
+        },
+      },
+    ],
+  }
+  await expect(
+    validateBenchmarkSweepSelfRepresentation(model_dir, parseBenchmarkManifest(base)),
+  ).rejects.toThrow("sweep grid is too sparse")
+  base.benchmarks[0]!.simulation.points.splice(1, 0, { x: 0.5, props: { input: 0.5 } })
+  await expect(
+    validateBenchmarkSweepSelfRepresentation(model_dir, parseBenchmarkManifest(base)),
+  ).resolves.toBeUndefined()
   await rm(model_dir, { recursive: true, force: true })
 })

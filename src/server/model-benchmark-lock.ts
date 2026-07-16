@@ -2,7 +2,11 @@ import { createHash } from "node:crypto"
 import { mkdir, readFile, readdir, rename, rm } from "node:fs/promises"
 import { dirname, isAbsolute, join, resolve, sep } from "node:path"
 import ts from "typescript"
-import { parseBenchmarkManifest, validateBenchmarkReferenceFiles } from "./model-scorer"
+import {
+  parseBenchmarkManifest,
+  validateBenchmarkReferenceFiles,
+  validateBenchmarkSweepSelfRepresentation,
+} from "./model-scorer"
 import { validateSimulationDefinitions } from "./model-simulation-validator"
 
 interface LockedFile {
@@ -369,6 +373,7 @@ async function readCurrentLock(model_dir: string): Promise<{
   const records = parseBenchmarkRecords(manifest_value)
   for (const record of records) assertEvidenceFile(model_dir, record.reference_file)
   await validateBenchmarkReferenceFiles(model_dir, manifest)
+  await validateBenchmarkSweepSelfRepresentation(model_dir, manifest)
   await validateSimulationDefinitions(
     model_dir,
     records.map((record) => record.id),

@@ -120,7 +120,7 @@ test("ModelRunStore preserves persisted active-segment effort across a restart",
   await rm(model_dir, { recursive: true, force: true })
 })
 
-test("ModelRunStore reserves a measured validation window and can restart a clean segment", async () => {
+test("ModelRunStore keeps validation untimed and can restart a clean segment", async () => {
   const model_dir = await mkdtemp(join(tmpdir(), "datasheet-model-validation-profile-"))
   const store = new ModelRunStore()
   store.createModelRun({
@@ -131,14 +131,14 @@ test("ModelRunStore reserves a measured validation window and can restart a clea
     base_effort_ms: 300_000,
   })
 
-  expect(store.getFinalizationReserveMs("model_validation_profile")).toBe(75_000)
+  expect(store.getFinalizationReserveMs("model_validation_profile")).toBe(0)
   store.setValidationProfile("model_validation_profile", {
     simulation_run_count: 10_000,
     canary_duration_ms: 20_000,
   })
-  expect(store.getFinalizationReserveMs("model_validation_profile")).toBe(240_000)
+  expect(store.getFinalizationReserveMs("model_validation_profile")).toBe(0)
   const control = JSON.parse(await Bun.file(join(model_dir, "run-control.json")).text())
-  expect(control.finalization_reserve_ms).toBe(240_000)
+  expect(control.finalization_reserve_ms).toBe(0)
 
   store.startSegment("model_validation_profile")
   await Bun.sleep(5)

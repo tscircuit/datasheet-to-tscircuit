@@ -132,6 +132,7 @@ function LiveProgress({ model_run }: { model_run: ModelRun }) {
       evidence?.graphs_digitized !== undefined ||
       evidence?.benchmark_drafts !== undefined ||
       benchmark?.completed !== undefined ||
+      benchmark?.locked_total !== undefined ||
       champion?.passing !== undefined,
   )
 
@@ -200,6 +201,21 @@ function LiveProgress({ model_run }: { model_run: ModelRun }) {
                     {benchmark.completed}
                     {benchmark.total !== undefined ? `/${benchmark.total}` : ""}
                   </strong>
+                </div>
+              )}
+              {benchmark?.locked_total !== undefined && (
+                <div>
+                  <span>Executable benchmarks</span>
+                  <strong>
+                    {benchmark.locked_total}
+                    {benchmark.draft_total !== undefined ? `/${benchmark.draft_total} drafts` : ""}
+                  </strong>
+                </div>
+              )}
+              {benchmark?.omitted !== undefined && benchmark.omitted > 0 && (
+                <div>
+                  <span>Evidence-only drafts</span>
+                  <strong>{benchmark.omitted}</strong>
                 </div>
               )}
               {champion?.passing !== undefined && (

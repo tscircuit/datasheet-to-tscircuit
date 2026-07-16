@@ -61,12 +61,15 @@ extra effort only permits more refinement iterations.
    starting the full simulation suite. Keep trial revisions under
    \`candidates/<revision>/model.lib\`. When you want to run or refresh a viewer,
    use \`tsci build benchmarks/<benchmark-id>.circuit.tsx --ignore-warnings
-   --disable-pcb --routing-disabled --disable-parts-engine\`.
-   Immediately after the first usable baseline exists, prioritize one saved build
-   for every benchmark before launching exhaustive parameter sweeps, so every UI
-   viewer becomes available early. Use a bounded pool of at most four concurrent
-   builds and dispatch remaining sweep points round-robin across benchmarks; do
-   not launch an unbounded per-benchmark shell fan-out.
+   --disable-pcb --routing-disabled --disable-parts-engine\`. The project runtime
+   config preserves the ngspice engine while these flags skip unrelated PCB,
+   routing, and parts-engine work.
+   Do not duplicate the server's exhaustive suite. After the first usable baseline
+   is checkpointed, run only the smallest local smoke or targeted diagnostic needed
+   to catch syntax/convergence mistakes, then exit promptly. The server immediately
+   runs one saved point from every benchmark in a bounded fair pool, publishes each
+   partial reference overlay, finishes the full suite, and returns exact failures
+   for the next correction pass.
    For injected parameter-sweep points, create wrapper TSX only under
    \`.agent-simulation-runs/<benchmark-id>/\`; never create \`__run_*\` files or any
    other temporary circuit under \`benchmarks/\`. The server and UI treat
@@ -78,17 +81,19 @@ extra effort only permits more refinement iterations.
 5. Candidate CSVs are diagnostic only: never copy, resample, or fit reference
    points directly into a result CSV. The server deletes \`results/verified\`,
    reruns every tscircuit simulation, extracts simulator graphs itself, and scores
-   only that server-owned data. Run \`bun score-benchmarks.ts\` after every candidate.
+   only that server-owned data. Use server validation artifacts as the authoritative
+   score; locally rerun only affected benchmarks before checkpointing a correction.
    Promote a candidate only
    when it improves, in order: syntax/pin validity, critical tests passing,
    convergence failures, worst error, weighted score, and model simplicity.
 6. Only after the benchmark lock exists, the server starts the refinement timer.
-   Re-read \`run-control.json\`. While enough time remains for a full iteration and
-   finalization, diagnose the largest residual, refine, simulate the entire locked
-   suite, score, and checkpoint the champion. Prefer bounded numeric parameter
+   Re-read \`run-control.json\`. While refinement time remains, diagnose the largest
+   residual, refine the affected behavior, run a bounded diagnostic, and checkpoint
+   the champion for the next untimed server validation pass. Prefer bounded numeric parameter
    tuning before changing topology.
-7. Reserve the stated finalization time. Finish by running the entire suite for the
-   champion, running the scorer, and writing all required deliverables. Do not exit
+7. Independent server validation and scoring pause the refinement timer; do not
+   reserve effort for them. Finish by checkpointing the champion and all required
+   deliverables. Do not exit
    while a known simulation or score is failing; the server will return validation
    feedback and continue the agent until everything passes or effort expires. Never wait
    until the deadline to save the current champion. \`model.lib\` must always be
@@ -337,6 +342,11 @@ benchmark. Every benchmark must declare its server-verifiable simulation mapping
 including probe_name and dut_spice_node, and must cite immutable evidence under
 evidence/. Update model-progress.json while working.
 
+For every parameter sweep, choose enough x points that linearly interpolating the
+published reference values sampled on that grid satisfies both the benchmark RMSE
+and maximum-error tolerances. The server checks this before locking and will return
+an overly sparse grid for correction; do not leave the model an impossible score.
+
 Omit the analogsimulation \`simulationType\` prop or set it exactly to
 \`"spice_transient_analysis"\`. Before committing the lock, the server performs
 static contract validation and source compilation without running ngspice. The
@@ -365,7 +375,9 @@ Re-read run-control.json before every refinement iteration because the user may
 extend the time budget while you work. Use the available time to improve the
 same locked benchmark suite; do not reduce tests or loosen tolerances.
 Run or refresh saved viewer output with
-\`tsci build benchmarks/<benchmark-id>.circuit.tsx --ignore-warnings\`. The UI only reads
+\`tsci build benchmarks/<benchmark-id>.circuit.tsx --ignore-warnings
+--disable-pcb --routing-disabled --disable-parts-engine\`. The project runtime
+config preserves ngspice while skipping unrelated PCB work. The UI only reads
 persisted Circuit JSON and will not execute the TSX for you.
 For parameter-sweep diagnostics, put injected wrapper circuits under
 \`.agent-simulation-runs/<benchmark-id>/\`, import the locked benchmark from there,
@@ -379,7 +391,8 @@ benchmarks.json, benchmark TSX, or evidence CSVs; correction passes may change
 only model artifacts and documentation. Keep a usable champion checkpoint at all times. Finish with every
 required artifact and a freshly generated validation-report.json. If
 validation-feedback.md exists, inspect it together with simulation-validation.json
-and validation-artifacts, fix every item, and rerun the locked suite.
+and validation-artifacts, fix every item, run only the affected local diagnostics,
+and return the checkpoint to the server without repeating its exhaustive suite.
 Describe model-card.md regions as intended or agent-tested, not server-validated;
 the server owns the final validation claim.
 Do not stop at a prose report and do not exit knowingly below 100% validation.`

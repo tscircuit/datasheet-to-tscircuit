@@ -54,6 +54,10 @@ export interface SimulationBenchmarkVerification {
   error_message?: string
   verified_result_file?: string
   sha256?: string
+  partial_result_file?: string
+  partial_sha256?: string
+  completed_points?: number
+  total_points?: number
 }
 
 interface SimulationValidationReport {
@@ -73,6 +77,9 @@ export interface VerifiedSimulationArtifact {
   result_file?: string
   result_text?: string
   error_message?: string
+  status: "building" | "passed" | "failed"
+  completed_points?: number
+  total_points?: number
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -653,6 +660,100 @@ export async function clearVerifiedSimulationResults(model_dir: string): Promise
   ])
 }
 
+export async function verifyPartialSimulationBenchmark(input: {
+  model_dir: string
+  benchmark_id: string
+  source_signature?: string
+  circuit_json_paths: Array<{ path: string; x?: number }>
+}): Promise<SimulationBenchmarkVerification> {
+  const generated_at = new Date().toISOString()
+  assertSafeBenchmarkId(input.benchmark_id)
+  const definition = await readSimulationDefinition(input.model_dir, input.benchmark_id)
+  const source_path = join(input.model_dir, "benchmarks", `${input.benchmark_id}.circuit.tsx`)
+  const supplied_paths = [...input.circuit_json_paths]
+  if (supplied_paths.length === 0) throw new Error("partial validation has no simulator output")
+
+  const paths =
+    definition.kind === "parameter_sweep"
+      ? definition.points.flatMap((point) => {
+          const matches = supplied_paths.filter((candidate) => Object.is(candidate.x, point.x))
+          if (matches.length > 1) {
+            throw new Error(`parameter sweep provided duplicate simulator outputs for x=${point.x}`)
+          }
+          return matches
+        })
+      : supplied_paths.slice(0, 1)
+  const [source_text, model_source, ...circuit_texts] = await Promise.all([
+    readFile(source_path, "utf8"),
+    readFile(join(input.model_dir, "model.lib"), "utf8"),
+    ...paths.map(({ path }) => readFile(path, "utf8")),
+  ])
+  const circuit_jsons = circuit_texts.map((text) => JSON.parse(text) as unknown)
+  if (circuit_jsons.some((json) => !isCircuitJson(json))) {
+    throw new Error("partial simulation did not produce valid Circuit JSON")
+  }
+  const parsed = circuit_jsons.map((json) => parseSimulationOutput(json))
+  const errors = [...new Set(parsed.flatMap(({ errors }) => errors))]
+  if (errors.length > 0) throw new Error(errors.join("; "))
+  assertNoSyntheticBenchmarkChannel(model_source)
+  for (const circuit of circuit_jsons) {
+    assertCanonicalDutSimulation(
+      circuit as AnyCircuitElement[],
+      model_source,
+      definition.probe_name,
+      definition.dut_spice_node,
+    )
+  }
+
+  const points =
+    definition.kind === "transient_voltage"
+      ? (() => {
+          const graph = requireGraph(parsed[0]!.graphs, definition.probe_name)
+          return graph.timestamps_ms.map((x, index) => ({
+            x,
+            y: graph.voltage_levels[index]! * definition.scale + definition.offset,
+          }))
+        })()
+      : paths.map((path, index) => ({
+          x: path.x!,
+          y:
+            reduceGraph(requireGraph(parsed[index]!.graphs, definition.probe_name), definition.reducer) *
+              definition.scale +
+            definition.offset,
+        }))
+  const text = toCsv(points)
+  const trusted_result_file = join(
+    getValidationRoot(input.model_dir),
+    "partial-results",
+    `${input.benchmark_id}.csv`,
+  )
+  const diagnostic_result_file = join(input.model_dir, "results", "partial", `${input.benchmark_id}.csv`)
+  await Promise.all([
+    writeTextAtomically(trusted_result_file, text),
+    writeTextAtomically(diagnostic_result_file, text),
+  ])
+  const artifact = await writeArtifactCopies({
+    model_dir: input.model_dir,
+    benchmark_id: input.benchmark_id,
+    circuit_text: circuit_texts[0]!,
+    source_text,
+  })
+  return {
+    benchmark_id: input.benchmark_id,
+    passed: false,
+    status: "building",
+    generated_at,
+    ...artifact,
+    source_signature:
+      input.source_signature ??
+      (await getModelSimulationSourceSignature(input.model_dir, input.benchmark_id)),
+    partial_result_file: relative(getValidationRoot(input.model_dir), trusted_result_file),
+    partial_sha256: hashText(text),
+    completed_points: paths.length,
+    total_points: definition.kind === "parameter_sweep" ? definition.points.length : 1,
+  }
+}
+
 export async function verifySimulationBenchmark(input: {
   model_dir: string
   benchmark_id: string
@@ -830,6 +931,7 @@ export async function getVerifiedSimulationArtifact(
   if (!isCircuitJson(circuit_json)) return undefined
 
   let result_text: string | undefined
+  let result_file: string | undefined
   if (result.passed) {
     if (typeof result.verified_result_file !== "string" || typeof result.sha256 !== "string") {
       return undefined
@@ -838,6 +940,17 @@ export async function getVerifiedSimulationArtifact(
     if (!result_path) return undefined
     result_text = await readFile(result_path, "utf8")
     if (hashText(result_text) !== result.sha256) return undefined
+    result_file = `results/verified/${benchmark_id}.csv`
+  } else if (
+    result.status === "building" &&
+    typeof result.partial_result_file === "string" &&
+    typeof result.partial_sha256 === "string"
+  ) {
+    const result_path = resolveInside(trusted_root, result.partial_result_file)
+    if (!result_path) return undefined
+    result_text = await readFile(result_path, "utf8")
+    if (hashText(result_text) !== result.partial_sha256) return undefined
+    result_file = `results/partial/${benchmark_id}.csv`
   }
   return {
     benchmark_id,
@@ -847,9 +960,12 @@ export async function getVerifiedSimulationArtifact(
     source_signature: result.source_signature,
     code,
     circuit_json,
-    result_file: result.passed ? `results/verified/${benchmark_id}.csv` : undefined,
+    result_file,
     result_text,
     error_message: result.error_message,
+    status: result.status ?? (result.passed ? "passed" : "failed"),
+    completed_points: result.completed_points,
+    total_points: result.total_points,
   }
 }
 

@@ -266,6 +266,83 @@ export async function validateBenchmarkReferenceFiles(
   )
 }
 
+function interpolateReference(points: Point[], x: number, x_scale: "linear" | "log"): number {
+  const transformed_x = transform(x, x_scale, "sweep x")
+  const first_x = transform(points[0]!.x, x_scale, "reference x")
+  const last_x = transform(points.at(-1)!.x, x_scale, "reference x")
+  if (transformed_x <= first_x) return points[0]!.y
+  if (transformed_x >= last_x) return points.at(-1)!.y
+  for (let index = 1; index < points.length; index += 1) {
+    const right = points[index]!
+    const right_x = transform(right.x, x_scale, "reference x")
+    if (right_x < transformed_x) continue
+    const left = points[index - 1]!
+    const left_x = transform(left.x, x_scale, "reference x")
+    const ratio = (transformed_x - left_x) / (right_x - left_x)
+    return left.y + ratio * (right.y - left.y)
+  }
+  return points.at(-1)!.y
+}
+
+/**
+ * Reject a parameter-sweep grid that cannot faithfully re-render its own
+ * reference data when the published curve is sampled at the declared sweep
+ * coordinates. This prevents an immutable benchmark whose interpolation error
+ * alone is larger than its tolerance before any DUT model is involved.
+ */
+export async function validateBenchmarkSweepSelfRepresentation(
+  model_dir: string,
+  manifest: BenchmarkManifest,
+): Promise<void> {
+  for (const benchmark of manifest.benchmarks) {
+    if (!isRecord(benchmark.simulation) || benchmark.simulation.kind !== "parameter_sweep") continue
+    if (!Array.isArray(benchmark.simulation.points)) continue
+    const sweep_x = benchmark.simulation.points.flatMap((point) =>
+      isRecord(point) && typeof point.x === "number" && Number.isFinite(point.x) ? [point.x] : [],
+    )
+    if (sweep_x.length < 2) continue
+    sweep_x.sort((first, second) => first - second)
+    const reference_points = await readCsvPoints(resolveWorkspaceFile(model_dir, benchmark.reference_file))
+    const x_scale = benchmark.x_scale ?? "linear"
+    const y_scale = benchmark.y_scale ?? "linear"
+    const first_reference_x = transform(reference_points[0]!.x, x_scale, "reference x")
+    const last_reference_x = transform(reference_points.at(-1)!.x, x_scale, "reference x")
+    if (
+      transform(sweep_x[0]!, x_scale, "sweep x") > first_reference_x ||
+      transform(sweep_x.at(-1)!, x_scale, "sweep x") < last_reference_x
+    ) {
+      throw new Error(`Benchmark ${benchmark.id} sweep range does not cover every reference x value`)
+    }
+    const ideal_points = sweep_x.map((x) => ({
+      x,
+      y: interpolateReference(reference_points, x, x_scale),
+    }))
+    const targets = reference_points.map((point) => transform(point.y, y_scale, "reference y"))
+    const target_min = Math.min(...targets)
+    const target_max = Math.max(...targets)
+    const target_abs_max = Math.max(...targets.map(Math.abs))
+    const normalization_span = Math.max(target_max - target_min, target_abs_max * 0.05, 1e-12)
+    const errors = reference_points.map((point) => {
+      const result_y = interpolate(ideal_points, point.x, x_scale)
+      return (
+        Math.abs(
+          transform(result_y, y_scale, "sampled reference y") - transform(point.y, y_scale, "reference y"),
+        ) / normalization_span
+      )
+    })
+    const normalized_rmse = Math.sqrt(
+      errors.reduce((total, error) => total + error * error, 0) / errors.length,
+    )
+    const normalized_max_error = Math.max(...errors)
+    const max_error_tolerance = benchmark.max_error_tolerance ?? benchmark.tolerance * 2
+    if (normalized_rmse > benchmark.tolerance + 1e-12 || normalized_max_error > max_error_tolerance + 1e-12) {
+      throw new Error(
+        `Benchmark ${benchmark.id} sweep grid is too sparse for its locked tolerance: reference self-representation has normalized RMSE ${normalized_rmse.toFixed(6)} (limit ${benchmark.tolerance}) and max error ${normalized_max_error.toFixed(6)} (limit ${max_error_tolerance}). Add sweep points at the missing curve bends before locking.`,
+      )
+    }
+  }
+}
+
 export async function scoreModelBenchmarks(
   model_dir: string,
   options: { results_directory_override?: string } = {},

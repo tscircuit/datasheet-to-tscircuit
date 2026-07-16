@@ -7,6 +7,7 @@ import {
   getVerifiedSimulationArtifact,
   getVerifiedResultFile,
   hasCompleteVerifiedSimulationReport,
+  verifyPartialSimulationBenchmark,
   verifySimulationBenchmark,
   writeSimulationValidationReport,
 } from "@/server/model-simulation-validator"
@@ -233,6 +234,19 @@ test("parameter sweeps reuse one circuit and combine separately persisted runs",
   const second = join(output_dir, "point-001.json")
   await Bun.write(first, make(2))
   await Bun.write(second, make(4))
+  const partial = await verifyPartialSimulationBenchmark({
+    model_dir,
+    benchmark_id: "sweep",
+    circuit_json_paths: [{ path: first, x: 0 }],
+  })
+  await writeSimulationValidationReport(model_dir, [partial])
+  const partial_artifact = await getVerifiedSimulationArtifact(model_dir, "sweep")
+  expect(partial.status).toBe("building")
+  expect(partial.completed_points).toBe(1)
+  expect(partial.total_points).toBe(2)
+  expect(partial_artifact?.status).toBe("building")
+  expect(partial_artifact?.result_file).toBe("results/partial/sweep.csv")
+  expect(partial_artifact?.result_text).toBe("x,y\n0,2\n")
   const result = await verifySimulationBenchmark({
     model_dir,
     benchmark_id: "sweep",

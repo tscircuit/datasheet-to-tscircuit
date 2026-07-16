@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { chmod, mkdtemp, rm, stat } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { JobStore } from "@/server/job-store"
@@ -8,7 +8,13 @@ import {
   buildModelBenchmarkPrompt,
   buildModelSetupPrompt,
 } from "@/server/model-scaffold"
-import { parseModelManifest, runModel, validateManifestAgainstModel } from "@/server/model-runner"
+import {
+  parseModelManifest,
+  preflightNgspice,
+  runModel,
+  stripAnalogSimulationForStructuralCheck,
+  validateManifestAgainstModel,
+} from "@/server/model-runner"
 import { ModelRunStore } from "@/server/model-run-store"
 
 const lockedBenchmarkSource = `import Component from "../component-with-model.circuit"
@@ -27,6 +33,12 @@ export default function Benchmark() {
 const provisionalBenchmarkBuildSource = `#!/usr/bin/env bun
 import { mkdir } from "node:fs/promises"
 const target = Bun.argv.slice(2)[1] ?? ""
+if (target === "server-ngspice-preflight.circuit.tsx") {
+  const output = process.cwd() + "/../dist/spice/server-ngspice-preflight"
+  await mkdir(output, { recursive: true })
+  await Bun.write(output + "/circuit.json", JSON.stringify([{ type: "simulation_transient_voltage_graph", name: "RESULT", timestamps_ms: [0, 0.01], voltage_levels: [1, 1] }]))
+  process.exit(0)
+}
 const benchmarkId = target.split("/").at(-1)?.replace(/\\.circuit\\.tsx$/, "")
 if (!benchmarkId) process.exit(2)
 const output = process.cwd() + "/../dist/spice/benchmarks/" + benchmarkId
@@ -79,6 +91,109 @@ test("model manifests cannot claim an unexecuted simulator", () => {
     }),
   ).toThrow('simulator must be "ngspice"')
 })
+
+test("benchmark prelock rejects invalid analogsimulation props before stripping simulation", () => {
+  expect(() =>
+    stripAnalogSimulationForStructuralCheck(
+      '<board><analogsimulation simulationType="transient" spiceEngine="ngspice" /></board>',
+      "invalid.circuit.tsx",
+    ),
+  ).toThrow('simulationType must be "spice_transient_analysis" or omitted')
+  expect(() =>
+    stripAnalogSimulationForStructuralCheck(
+      '<board><analogsimulation simulationType="spice_transient_analysis" spiceEngine="ngspice" /></board>',
+      "valid.circuit.tsx",
+    ),
+  ).not.toThrow()
+})
+
+test("ngspice preflight fails on an empty engine map and passes after the engine is available", async () => {
+  const tmp_root = join(process.cwd(), "tmp")
+  await mkdir(tmp_root, { recursive: true })
+  const job_dir = await mkdtemp(join(tmp_root, "ngspice-preflight-"))
+  const model_dir = join(job_dir, "spice")
+  const tsci_path = join(job_dir, "fake-tsci")
+  await mkdir(model_dir, { recursive: true })
+  await Bun.write(
+    tsci_path,
+    `#!/usr/bin/env bun
+console.error('SPICE engine "ngspice" not found in platform config. Available engines: []')
+process.exit(1)
+`,
+  )
+  await chmod(tsci_path, 0o755)
+  const controller = new AbortController()
+  await expect(
+    preflightNgspice({
+      job_dir,
+      model_dir,
+      signal: controller.signal,
+      tsci_bin: tsci_path,
+      append: async () => undefined,
+    }),
+  ).rejects.toThrow('SPICE engine "ngspice" not found')
+
+  await Bun.write(
+    tsci_path,
+    `#!/usr/bin/env bun
+import { mkdir } from "node:fs/promises"
+const output = ${JSON.stringify(job_dir)} + "/dist/spice/server-ngspice-preflight"
+await mkdir(output, { recursive: true })
+await Bun.write(output + "/circuit.json", JSON.stringify([{ type: "simulation_transient_voltage_graph", name: "RESULT", timestamps_ms: [0, 0.01], voltage_levels: [1, 1] }]))
+`,
+  )
+  expect(
+    await preflightNgspice({
+      job_dir,
+      model_dir,
+      signal: controller.signal,
+      tsci_bin: tsci_path,
+      append: async () => undefined,
+    }),
+  ).toBeGreaterThanOrEqual(0)
+  await rm(job_dir, { recursive: true, force: true })
+})
+
+test("ngspice preflight uses a real component port that the tscircuit probe renderer can resolve", async () => {
+  const tmp_root = join(process.cwd(), "tmp")
+  await mkdir(tmp_root, { recursive: true })
+  const job_dir = await mkdtemp(join(tmp_root, "ngspice-real-preflight-"))
+  const model_dir = join(job_dir, "spice")
+  await Promise.all([
+    mkdir(model_dir, { recursive: true }),
+    Bun.write(
+      join(job_dir, "package.json"),
+      '{"name":"ngspice-real-preflight","private":true,"type":"module"}\n',
+    ),
+    Bun.write(
+      join(job_dir, "tscircuit.config.ts"),
+      `import { createNgspiceSpiceEngine } from "@tscircuit/ngspice-spice-engine"
+
+const ngspiceSpiceEngine = await createNgspiceSpiceEngine()
+
+export default { platformConfig: { spiceEngineMap: { ngspice: ngspiceSpiceEngine } } }
+`,
+    ),
+  ])
+  const messages: string[] = []
+  try {
+    expect(
+      await preflightNgspice({
+        job_dir,
+        model_dir,
+        signal: new AbortController().signal,
+        tsci_bin: join(process.cwd(), "node_modules", ".bin", "tsci"),
+        append: async (_stream, message) => {
+          messages.push(message)
+        },
+      }),
+    ).toBeGreaterThanOrEqual(0)
+    expect(messages.join("\n")).toContain("ngspice preflight passed")
+    expect(messages.join("\n")).not.toContain("Could not identify connected source for VoltageProbe")
+  } finally {
+    await rm(job_dir, { recursive: true, force: true })
+  }
+}, 30_000)
 
 test("model manifests must select the first SUBCKT with exact pin names", () => {
   const manifest = parseModelManifest({
@@ -326,6 +441,13 @@ console.log("champion checkpointed")
       `#!/usr/bin/env bun
 	import { appendFile, mkdir } from "node:fs/promises"
 	const jobDir = ${JSON.stringify(job_dir)}
+	const target = Bun.argv.slice(2)[1] ?? ""
+	if (target === "server-ngspice-preflight.circuit.tsx") {
+	  const output = jobDir + "/dist/spice/server-ngspice-preflight"
+	  await mkdir(output, { recursive: true })
+	  await Bun.write(output + "/circuit.json", JSON.stringify([{ type: "simulation_transient_voltage_graph", name: "RESULT", timestamps_ms: [0, 0.01], voltage_levels: [1, 1] }]))
+	  process.exit(0)
+	}
 		if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
 		  await mkdir(jobDir + "/dist/spice/benchmarks/transfer", { recursive: true })
 		  await Bun.write(jobDir + "/dist/spice/benchmarks/transfer/circuit.json", "[]")
@@ -403,6 +525,9 @@ console.log("simulation ok")
   expect(model_run?.progress_history.some((event) => event.phase === "scoring")).toBe(true)
   const tsci_calls = await Bun.file(join(job_dir, "tsci-calls.log")).text()
   expect(tsci_calls).toContain("build benchmarks/transfer.circuit.tsx --ignore-warnings")
+  expect(tsci_calls).toContain("--disable-pcb")
+  expect(tsci_calls).toContain("--routing-disabled")
+  expect(tsci_calls).toContain("--disable-parts-engine")
   expect(tsci_calls).not.toContain("simulate analog")
   expect(
     await Bun.file(join(job_dir, ".model-validation", "benchmarks", "transfer", "circuit.json")).exists(),
@@ -479,6 +604,13 @@ await Bun.write(dir + "/model-card.md", "# LOOP model\\n")
       `#!/usr/bin/env bun
 	import { mkdir } from "node:fs/promises"
 	const jobDir = ${JSON.stringify(job_dir)}
+	const target = Bun.argv.slice(2)[1] ?? ""
+	if (target === "server-ngspice-preflight.circuit.tsx") {
+	  const output = jobDir + "/dist/spice/server-ngspice-preflight"
+	  await mkdir(output, { recursive: true })
+	  await Bun.write(output + "/circuit.json", JSON.stringify([{ type: "simulation_transient_voltage_graph", name: "RESULT", timestamps_ms: [0, 0.01], voltage_levels: [1, 1] }]))
+	  process.exit(0)
+	}
 		if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
 		  await mkdir(jobDir + "/dist/spice/benchmarks/transfer", { recursive: true })
 		  await Bun.write(jobDir + "/dist/spice/benchmarks/transfer/circuit.json", "[]")
@@ -582,6 +714,12 @@ await Bun.write(dir + "/model-card.md", "# RECOVERY model\\n")
 import { mkdir } from "node:fs/promises"
 const jobDir = ${JSON.stringify(job_dir)}
 const target = Bun.argv.slice(2)[1] ?? ""
+if (target === "server-ngspice-preflight.circuit.tsx") {
+  const output = jobDir + "/dist/spice/server-ngspice-preflight"
+  await mkdir(output, { recursive: true })
+  await Bun.write(output + "/circuit.json", JSON.stringify([{ type: "simulation_transient_voltage_graph", name: "RESULT", timestamps_ms: [0, 0.01], voltage_levels: [1, 1] }]))
+  process.exit(0)
+}
 const benchmarkOutput = jobDir + "/dist/spice/benchmarks/transfer"
 if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
   await mkdir(benchmarkOutput, { recursive: true })
@@ -772,8 +910,9 @@ await Bun.sleep(30_000)
   expect(recovered_run?.status).toBe("timed_out")
   expect(recovered_run?.model_source).toContain(".subckt RECOVERED")
   expect(await Bun.file(join(model_dir, "model.lib")).text()).toContain(".subckt RECOVERED")
-  expect(recovered_run?.elapsed_time_ms).toBeLessThan(1_000)
-  expect(recovered_run?.error_message).toContain("independent-validation window")
+  expect(recovered_run?.elapsed_time_ms).toBeGreaterThanOrEqual(900)
+  expect(recovered_run?.elapsed_time_ms).toBeLessThan(1_250)
+  expect(recovered_run?.error_message).toContain("every benchmark could be verified")
 
   await rm(job_dir, { recursive: true, force: true })
 }, 10_000)
@@ -834,9 +973,18 @@ import { appendFile, mkdir } from "node:fs/promises"
 const jobDir = ${JSON.stringify(job_dir)}
 const args = Bun.argv.slice(2)
 const target = args[1] ?? ""
+if (target === "server-ngspice-preflight.circuit.tsx") {
+  const output = jobDir + "/dist/spice/server-ngspice-preflight"
+  await mkdir(output, { recursive: true })
+  await Bun.write(output + "/circuit.json", JSON.stringify([{ type: "simulation_transient_voltage_graph", name: "RESULT", timestamps_ms: [0, 0.01], voltage_levels: [1, 1] }]))
+  process.exit(0)
+}
 if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
-  await Bun.write(jobDir + "/unexpected-prelock-tsci.txt", target)
-  process.exit(9)
+  const match = target.match(/^benchmarks\\/(sweep(?:-b)?)\\.circuit\\.tsx$/)
+  if (!match) process.exit(9)
+  await mkdir(jobDir + "/dist/spice/benchmarks/" + match[1], { recursive: true })
+  await Bun.write(jobDir + "/dist/spice/benchmarks/" + match[1] + "/circuit.json", "[]")
+  process.exit(0)
 }
 const modelSource = await Bun.file(jobDir + "/spice/model.lib").text()
 const integrity = [

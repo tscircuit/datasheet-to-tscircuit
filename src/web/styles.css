@@ -2083,6 +2083,11 @@ a {
   stroke-dashoffset: 10;
 }
 
+.result-line-partial {
+  opacity: 0.72;
+  stroke-dasharray: 4 8;
+}
+
 .reference-axis-labels {
   fill: #7d858f;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;

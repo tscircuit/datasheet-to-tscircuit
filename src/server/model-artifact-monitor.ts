@@ -139,6 +139,13 @@ async function readReferencePreview(input: {
     y_scale: selected?.y_scale === "log" ? "log" : "linear",
     reference_points,
     result_points: result_points && result_points.length > 0 ? result_points : undefined,
+    result_status: verified_artifact?.passed
+      ? "verified"
+      : verified_artifact?.status === "building" && result_points?.length
+        ? "partial"
+        : undefined,
+    result_completed_points: verified_artifact?.completed_points,
+    result_total_points: verified_artifact?.total_points,
     is_stale: Boolean(
       verified_artifact?.source_signature &&
         current_signature &&

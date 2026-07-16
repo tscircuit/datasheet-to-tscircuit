@@ -83,23 +83,13 @@ function computeElapsedTime(record: ModelRunRecord, now = Date.now()): number {
 }
 
 function computeValidationReserve(
-  record: ModelRunRecord,
-  simulation_run_count = record.validation_run_count,
-  observed_canary_ms = record.validation_canary_ms,
+  _record: ModelRunRecord,
+  _simulation_run_count = _record.validation_run_count,
+  _observed_canary_ms = _record.validation_canary_ms,
 ): number {
-  const base_reserve = Math.max(250, record.base_effort_ms * 0.25)
-  const concurrency_value = Number(process.env.MODEL_VALIDATION_CONCURRENCY ?? 4)
-  const concurrency = Number.isInteger(concurrency_value) ? Math.max(1, Math.min(8, concurrency_value)) : 4
-  const configured_batch_ms = Number(process.env.MODEL_VALIDATION_BATCH_ESTIMATE_MS ?? 20_000)
-  const minimum_batch_ms = Number.isFinite(configured_batch_ms)
-    ? Math.max(1_000, configured_batch_ms)
-    : 20_000
-  const measured_batch_ms =
-    observed_canary_ms && Number.isFinite(observed_canary_ms) ? Math.ceil(observed_canary_ms * 1.5) : 0
-  const batch_ms = Math.max(minimum_batch_ms, measured_batch_ms)
-  const estimated_suite_ms =
-    simulation_run_count > 0 ? 60_000 + Math.ceil(simulation_run_count / concurrency) * batch_ms : 0
-  return Math.round(Math.min(record.allocated_time_ms * 0.8, Math.max(base_reserve, estimated_suite_ms)))
+  // Evidence setup, benchmark repair, and independent validation are server-owned
+  // work. They pause the refinement segment instead of consuming user effort.
+  return 0
 }
 
 function getPublicModelRun(record: ModelRunRecord): ModelRun {
@@ -474,7 +464,7 @@ export class ModelRunStore {
           deadline_at,
           finalization_reserve_ms: computeValidationReserve(record),
           instruction:
-            "Re-read this file before every refinement iteration; effort may be extended while running.",
+            "Re-read this file before every refinement iteration; only agent refinement consumes effort, while server validation is untimed.",
         },
         null,
         2,
