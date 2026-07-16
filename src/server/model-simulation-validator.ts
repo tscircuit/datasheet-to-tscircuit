@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, rm } from "node:fs/promises"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import type { AnyCircuitElement } from "circuit-json"
 
-type SimulationExtractionDefinition = {
+export type SimulationExtractionDefinition = {
   kind: "transient_voltage"
   x_axis: "time_ms"
   probe_name: string
@@ -407,6 +407,17 @@ function requireGraph(graphs: SimulationGraph[], probe_name: string): Simulation
   return matches[0]!
 }
 
+export function extractSimulationResultPoints(
+  circuit_json: unknown,
+  definition: SimulationExtractionDefinition,
+): Array<{ x: number; y: number }> {
+  const graph = requireGraph(parseSimulationOutput(circuit_json).graphs, definition.probe_name)
+  return graph.timestamps_ms.map((x, index) => ({
+    x,
+    y: graph.voltage_levels[index]! * definition.scale + definition.offset,
+  }))
+}
+
 function toCsv(points: Array<{ x: number; y: number }>): string {
   return `x,y\n${points.map((point) => `${point.x},${point.y}`).join("\n")}\n`
 }
@@ -578,11 +589,7 @@ export async function verifyPartialSimulationBenchmark(input: {
     )
   }
 
-  const graph = requireGraph(parsed[0]!.graphs, definition.probe_name)
-  const points = graph.timestamps_ms.map((x, index) => ({
-    x,
-    y: graph.voltage_levels[index]! * definition.scale + definition.offset,
-  }))
+  const points = extractSimulationResultPoints(circuit_jsons[0], definition)
   const text = toCsv(points)
   const trusted_result_file = join(
     getValidationRoot(input.model_dir),
@@ -670,11 +677,7 @@ export async function verifySimulationBenchmark(input: {
       )
     }
 
-    const graph = requireGraph(parsed[0]!.graphs, definition.probe_name)
-    const points = graph.timestamps_ms.map((x, index) => ({
-      x,
-      y: graph.voltage_levels[index]! * definition.scale + definition.offset,
-    }))
+    const points = extractSimulationResultPoints(circuit_json, definition)
     const text = toCsv(points)
     const trusted_result_file = join(
       getVerifiedResultsDirectory(input.model_dir),

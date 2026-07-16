@@ -75,8 +75,11 @@ extra effort only permits more refinement iterations.
    for the next correction pass.
    The embedded \`<analogsimulation>\` runs ngspice and saves Circuit JSON under
    \`../dist/spice/benchmarks/<benchmark-id>/circuit.json\`. The UI only reads
-   saved output and never executes TSX. \`tsci simulate analog\` may be useful for
-   terminal diagnostics, but it does not persist the Circuit JSON used by the UI.
+   saved output and never executes TSX. A saved targeted build appears immediately
+   in both the analog-simulation tab and the reference overlay as an unverified
+   agent result; independent validation later replaces both views with the same
+   server-verified artifact. \`tsci simulate analog\` may be useful for terminal
+   diagnostics, but it does not persist the Circuit JSON used by the UI.
 5. Candidate CSVs are diagnostic only: never copy, resample, or fit reference
    points directly into a result CSV. The server deletes \`results/verified\`,
    reruns every tscircuit simulation, extracts simulator graphs itself, and scores

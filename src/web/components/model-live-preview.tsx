@@ -215,6 +215,16 @@ function ReferenceGraph({ preview }: { preview?: ModelReferencePreview }) {
   const displayed_y_min = preview.y_scale === "log" ? 10 ** y_min : y_min
   const displayed_y_max = preview.y_scale === "log" ? 10 ** y_max : y_max
   const comparison_is_deprecated = preview.result_status === "deprecated" || preview.is_stale
+  const comparison_is_unverified = preview.result_status === "unverified"
+  const result_label = comparison_is_deprecated
+    ? "Previous model result · deprecated"
+    : comparison_is_unverified
+      ? preview.result_origin === "workspace"
+        ? "Agent run · unverified"
+        : "Simulation run · unverified"
+      : preview.result_status === "partial"
+        ? "Server validation · in progress"
+        : "Server-verified model"
 
   return (
     <section className="workspace-card model-reference-card" aria-label="Datasheet reference graph">
@@ -247,7 +257,7 @@ function ReferenceGraph({ preview }: { preview?: ModelReferencePreview }) {
           <polyline className="reference-line" points={reference_path} />
           {result_path && (
             <polyline
-              className={`result-line${preview.result_status === "partial" ? " result-line-partial" : ""}${comparison_is_deprecated ? " result-line-deprecated" : ""}`}
+              className={`result-line${comparison_is_unverified ? " result-line-unverified" : ""}${preview.result_status === "partial" ? " result-line-partial" : ""}${comparison_is_deprecated ? " result-line-deprecated" : ""}`}
               points={result_path}
             />
           )}
@@ -271,13 +281,11 @@ function ReferenceGraph({ preview }: { preview?: ModelReferencePreview }) {
             <i /> Datasheet reference
           </span>
           {preview.result_points && (
-            <span className={`result-series${comparison_is_deprecated ? " deprecated" : ""}`}>
+            <span
+              className={`result-series${comparison_is_unverified ? " unverified" : ""}${comparison_is_deprecated ? " deprecated" : ""}`}
+            >
               <i />
-              {comparison_is_deprecated
-                ? "Previous model result · deprecated"
-                : preview.result_status === "partial"
-                  ? "Validated waveform"
-                  : "Server-verified model"}
+              {result_label}
             </span>
           )}
           {!preview.result_points && (

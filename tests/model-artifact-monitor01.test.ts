@@ -169,7 +169,12 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
   })
   expect(selected_workspace_preview?.circuit_preview?.snapshot_origin).toBe("workspace")
   expect((await stat(output_output)).mtimeMs).toBe(output_mtime_before)
-  expect(selected_workspace_preview?.reference_preview?.result_points).toBeUndefined()
+  expect(selected_workspace_preview?.reference_preview?.result_points?.[1]).toEqual({ x: 1, y: 2.1 })
+  expect(selected_workspace_preview?.reference_preview?.result_status).toBe("unverified")
+  expect(selected_workspace_preview?.reference_preview?.result_origin).toBe("workspace")
+  expect(selected_workspace_preview?.reference_preview?.updated_at).toBe(
+    selected_workspace_preview?.circuit_preview?.updated_at,
+  )
 
   const output_verification = await verifySimulationBenchmark({ model_dir, benchmark_id: "output" })
   await writeSimulationValidationReport(model_dir, [transfer_verification, output_verification])
@@ -179,6 +184,11 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
   })
   expect(selected_verified_preview?.circuit_preview?.snapshot_origin).toBe("server_validation")
   expect(selected_verified_preview?.reference_preview?.result_points?.[1]).toEqual({ x: 1, y: 2.1 })
+  expect(selected_verified_preview?.reference_preview?.result_status).toBe("verified")
+  expect(selected_verified_preview?.reference_preview?.result_origin).toBe("server_validation")
+  expect(selected_verified_preview?.reference_preview?.updated_at).toBe(
+    selected_verified_preview?.circuit_preview?.updated_at,
+  )
 
   await Bun.write(
     join(benchmark_dir, "transfer.circuit.tsx"),
@@ -270,6 +280,11 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
         (element as { source_component_id?: string }).source_component_id === "transfer-revision-two",
     ),
   ).toBe(true)
+  const refreshed_reference = store.getModelRun("model_1")?.reference_preview
+  expect(refreshed_reference?.result_points?.[1]).toEqual({ x: 1, y: 1 })
+  expect(refreshed_reference?.result_status).toBe("unverified")
+  expect(refreshed_reference?.result_origin).toBe("workspace")
+  expect(refreshed_reference?.updated_at).toBe(refreshed?.updated_at)
 
   monitor.stop()
   await rm(job_dir, { recursive: true, force: true })

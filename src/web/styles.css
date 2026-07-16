@@ -2400,6 +2400,11 @@ a {
   stroke-dasharray: 4 8;
 }
 
+.result-line-unverified {
+  opacity: 0.82;
+  stroke-dasharray: 5 7;
+}
+
 .result-line-deprecated {
   opacity: 0.72;
   stroke-dasharray: 3 8;
@@ -2438,6 +2443,14 @@ a {
 
 .result-series i {
   border-top: 3px dotted #d97706;
+}
+
+.result-series.unverified {
+  color: #9a5b0b;
+}
+
+.result-series.unverified i {
+  border-top-style: dashed;
 }
 
 .result-series.deprecated {

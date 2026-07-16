@@ -4,11 +4,9 @@ import { join } from "node:path"
 import type {
   JobLog,
   JobLogStream,
-  ModelCircuitPreview,
   ModelManifest,
   ModelProgress,
   ModelPreviewOption,
-  ModelReferencePreview,
   ModelRun,
   ModelRunEvent,
   ModelRunStatus,
@@ -328,16 +326,13 @@ export class ModelRunStore {
     return getPublicModelRun(record)
   }
 
-  updateCircuitPreview(model_run_id: string, preview: ModelCircuitPreview): ModelRun {
+  updatePreviews(
+    model_run_id: string,
+    previews: Pick<ModelRun, "circuit_preview" | "reference_preview">,
+  ): ModelRun {
     const record = this.requireRecord(model_run_id)
-    record.circuit_preview = preview
-    this.touchAndPublish(record)
-    return getPublicModelRun(record)
-  }
-
-  updateReferencePreview(model_run_id: string, preview: ModelReferencePreview): ModelRun {
-    const record = this.requireRecord(model_run_id)
-    record.reference_preview = preview
+    record.circuit_preview = previews.circuit_preview
+    record.reference_preview = previews.reference_preview
     this.touchAndPublish(record)
     return getPublicModelRun(record)
   }
