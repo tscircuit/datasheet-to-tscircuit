@@ -28,7 +28,6 @@ import {
   clearVerifiedSimulationResults,
   getCircuitBuildDiagnostics,
   getModelSimulationSourceSignature,
-  getSimulationBuildPlan,
   getSimulationRunCount,
   getVerifiedResultsDirectory,
   hasCompleteVerifiedSimulationReport,
@@ -406,16 +405,6 @@ async function clearIncompleteBenchmarkFinalization(model_dir: string): Promise<
   await mkdir(join(model_dir, "benchmarks"), { recursive: true })
 }
 
-async function clearEphemeralBenchmarkRuns(model_dir: string): Promise<void> {
-  const benchmark_dir = join(model_dir, "benchmarks")
-  const entries = await readdir(benchmark_dir, { withFileTypes: true }).catch(() => [])
-  await Promise.all(
-    entries
-      .filter((entry) => entry.isFile() && /^__run_.+\.circuit\.tsx$/i.test(entry.name))
-      .map((entry) => rm(join(benchmark_dir, entry.name), { force: true })),
-  )
-}
-
 async function clearRefinementArtifacts(model_dir: string): Promise<void> {
   await clearVerifiedSimulationResults(model_dir)
   await Promise.all([
@@ -428,8 +417,8 @@ async function clearRefinementArtifacts(model_dir: string): Promise<void> {
       "validation-report.json",
       "validation-feedback.md",
     ].map((file) => rm(join(model_dir, file), { force: true })),
-    ...["candidates", "results/champion", ".server-validation-builds", ".agent-simulation-runs"].map(
-      (directory) => rm(join(model_dir, directory), { recursive: true, force: true }),
+    ...["candidates", "results/champion"].map((directory) =>
+      rm(join(model_dir, directory), { recursive: true, force: true }),
     ),
   ])
   await mkdir(join(model_dir, "results", "champion"), { recursive: true })
@@ -973,20 +962,11 @@ function assertIntegratedCircuitUsesCanonicalModel(value: unknown, model_source:
   }
 }
 
-function toImportPath(from_directory: string, target_file: string): string {
-  const path = relative(from_directory, target_file)
-    .replaceAll("\\", "/")
-    .replace(/\.tsx$/i, "")
-  return path.startsWith(".") ? path : `./${path}`
-}
-
 type SimulationFailureKind = "benchmark_structure" | "simulation" | "infrastructure" | "process"
 
 interface ValidationBuildRun {
-  point_index: number
   run_id: string
-  x?: number
-  wrapper_path: string
+  source_path: string
   generated_path: string
   saved_path: string
 }
@@ -994,7 +974,6 @@ interface ValidationBuildRun {
 interface ValidationBuildResult {
   exit_code: number
   path?: string
-  x?: number
   error_message?: string
   failure_kind?: SimulationFailureKind
 }
@@ -1024,68 +1003,22 @@ async function prepareBenchmarkValidation(input: {
   job_dir: string
   model_dir: string
 }): Promise<BenchmarkValidationState> {
-  const build_plan = await getSimulationBuildPlan(input.model_dir, input.benchmark_id)
-  const build_root = join(input.model_dir, ".server-validation-builds", input.benchmark_id)
-  await rm(build_root, { recursive: true, force: true })
-  await mkdir(build_root, { recursive: true })
   const benchmark_source = join(input.model_dir, "benchmarks", input.benchmark_file)
-  const runs: ValidationBuildRun[] = await Promise.all(
-    build_plan.map(async (point, point_index) => {
-      if (build_plan.length === 1 && !point.props) {
-        return {
-          point_index,
-          run_id: point.run_id,
-          ...(point.x === undefined ? {} : { x: point.x }),
-          wrapper_path: benchmark_source,
-          generated_path: join(
-            input.job_dir,
-            "dist",
-            "spice",
-            "benchmarks",
-            input.benchmark_id,
-            "circuit.json",
-          ),
-          saved_path: join(
-            input.model_dir,
-            "validation-artifacts",
-            input.benchmark_id,
-            "runs",
-            point.run_id,
-            "circuit.json",
-          ),
-        }
-      }
-      const wrapper_path = join(build_root, `${point.run_id}.circuit.tsx`)
-      const props = point.props ? ` {...${JSON.stringify(point.props)}}` : ""
-      await Bun.write(
-        wrapper_path,
-        `import Benchmark from ${JSON.stringify(toImportPath(dirname(wrapper_path), benchmark_source))}\n\nexport default function ServerValidationPoint() {\n  return <Benchmark${props} />\n}\n`,
-      )
-      return {
-        point_index,
-        run_id: point.run_id,
-        ...(point.x === undefined ? {} : { x: point.x }),
-        wrapper_path,
-        generated_path: join(
-          input.job_dir,
-          "dist",
-          "spice",
-          ".server-validation-builds",
-          input.benchmark_id,
-          point.run_id,
-          "circuit.json",
-        ),
-        saved_path: join(
-          input.model_dir,
-          "validation-artifacts",
-          input.benchmark_id,
-          "runs",
-          point.run_id,
-          "circuit.json",
-        ),
-      }
-    }),
-  )
+  const runs: ValidationBuildRun[] = [
+    {
+      run_id: "default",
+      source_path: benchmark_source,
+      generated_path: join(input.job_dir, "dist", "spice", "benchmarks", input.benchmark_id, "circuit.json"),
+      saved_path: join(
+        input.model_dir,
+        "validation-artifacts",
+        input.benchmark_id,
+        "runs",
+        "default",
+        "circuit.json",
+      ),
+    },
+  ]
   return {
     benchmark_id: input.benchmark_id,
     benchmark_file: input.benchmark_file,
@@ -1120,15 +1053,14 @@ async function executeValidationBuild(input: {
 }): Promise<ValidationBuildResult> {
   const { state, run } = input
   if (input.signal.aborted) {
-    return { exit_code: 143, x: run.x, error_message: "Validation was cancelled", failure_kind: "process" }
+    return { exit_code: 143, error_message: "Validation was cancelled", failure_kind: "process" }
   }
-  const point_label = run.x === undefined ? "" : ` at x=${run.x}`
   await input.append(
     "system",
-    `Building locked benchmark ${state.benchmark_file} (${run.point_index + 1}/${state.runs.length})${point_label}…\n`,
+    `Building complete transient waveform for locked benchmark ${state.benchmark_file}…\n`,
   )
   await rm(dirname(run.generated_path), { recursive: true, force: true })
-  const source_relative = relative(input.model_dir, run.wrapper_path)
+  const source_relative = relative(input.model_dir, run.source_path)
   let process_output = ""
   let exit_code: number
   try {
@@ -1153,7 +1085,6 @@ async function executeValidationBuild(input: {
     const error_message = error instanceof Error ? error.message : String(error)
     return {
       exit_code: 1,
-      x: run.x,
       error_message,
       failure_kind: isInfrastructureFailure(error_message) ? "infrastructure" : "process",
     }
@@ -1162,7 +1093,6 @@ async function executeValidationBuild(input: {
     const error_message = summarizeProcessFailure(process_output)
     return {
       exit_code,
-      x: run.x,
       error_message,
       failure_kind: isInfrastructureFailure(process_output) ? "infrastructure" : "process",
     }
@@ -1176,7 +1106,6 @@ async function executeValidationBuild(input: {
       return {
         exit_code: 1,
         path: run.saved_path,
-        x: run.x,
         error_message: diagnostics.source_errors.join("; "),
         failure_kind: "benchmark_structure",
       }
@@ -1186,16 +1115,14 @@ async function executeValidationBuild(input: {
       return {
         exit_code: 1,
         path: run.saved_path,
-        x: run.x,
         error_message,
         failure_kind: isInfrastructureFailure(error_message) ? "infrastructure" : "simulation",
       }
     }
-    return { exit_code: 0, path: run.saved_path, x: run.x }
+    return { exit_code: 0, path: run.saved_path }
   } catch (error) {
     return {
       exit_code: 1,
-      x: run.x,
       error_message: error instanceof Error ? error.message : String(error),
       failure_kind: "process",
     }
@@ -1219,20 +1146,6 @@ async function runValidationTaskPool<T>(input: {
     }
   }
   await Promise.all(Array.from({ length: Math.min(input.concurrency, input.tasks.length) }, () => worker()))
-}
-
-function getRoundRobinRemainingRuns(
-  states: BenchmarkValidationState[],
-): Array<{ state: BenchmarkValidationState; run: ValidationBuildRun }> {
-  const tasks: Array<{ state: BenchmarkValidationState; run: ValidationBuildRun }> = []
-  const maximum_runs = Math.max(0, ...states.map((state) => state.runs.length))
-  for (let point_index = 1; point_index < maximum_runs; point_index += 1) {
-    for (const state of states) {
-      const run = state.runs[point_index]
-      if (run && !state.verification) tasks.push({ state, run })
-    }
-  }
-  return tasks
 }
 
 async function validateChampion(
@@ -1340,8 +1253,7 @@ async function validateChampion(
   ): Promise<void> => {
     if (state.verification) return
     state.failure_kind = result.failure_kind ?? "process"
-    const point_label = run.x === undefined ? "" : ` at x=${run.x}`
-    const error_message = `${state.benchmark_file} build${point_label} exited with code ${result.exit_code}${
+    const error_message = `${state.benchmark_file} build exited with code ${result.exit_code}${
       result.error_message ? `: ${result.error_message}` : ""
     }`
     state.verification = {
@@ -1369,7 +1281,6 @@ async function validateChampion(
       source_signature: state.source_signature,
       circuit_json_paths: state.results.map((result) => ({
         path: result!.path!,
-        ...(result!.x === undefined ? {} : { x: result!.x }),
       })),
     })
     await publishReport()
@@ -1388,7 +1299,7 @@ async function validateChampion(
       tsci_bin: context.tsci_bin,
       append,
     })
-    task.state.results[task.run.point_index] = result
+    task.state.results[0] = result
     if (result.exit_code !== 0 || !result.path) {
       await failState(task.state, task.run, result)
       if (result.failure_kind === "infrastructure") {
@@ -1398,9 +1309,7 @@ async function validateChampion(
     }
     task.state.partial_write = task.state.partial_write.then(async () => {
       const successful_paths = task.state.results.flatMap((candidate) =>
-        candidate?.path
-          ? [{ path: candidate.path, ...(candidate.x === undefined ? {} : { x: candidate.x }) }]
-          : [],
+        candidate?.path ? [{ path: candidate.path }] : [],
       )
       task.state.building_verification = await verifyPartialSimulationBenchmark({
         model_dir: input.model_dir,
@@ -1417,16 +1326,10 @@ async function validateChampion(
   const concurrency = getValidationConcurrency()
   await append(
     "system",
-    `Starting fair global validation scheduling with up to ${concurrency} concurrent build(s); one preview run per benchmark is prioritized first.\n`,
+    `Starting transient waveform validation with up to ${concurrency} concurrent build(s); each benchmark runs exactly once and publishes its complete time trace as soon as it finishes.\n`,
   )
   await runValidationTaskPool({
     tasks: states.flatMap((state) => (state.runs[0] ? [{ state, run: state.runs[0] }] : [])),
-    concurrency,
-    signal: input.signal,
-    run: runTask,
-  })
-  await runValidationTaskPool({
-    tasks: getRoundRobinRemainingRuns(states),
     concurrency,
     signal: input.signal,
     run: runTask,
@@ -1623,7 +1526,6 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
       benchmark_lock = finalized.benchmark_lock
       context.model_run_store.rememberBenchmarkLock(input.model_run_id, benchmark_lock)
     } else {
-      await clearEphemeralBenchmarkRuns(model_dir)
       benchmark_lock = await verifyBenchmarkLock(model_dir, benchmark_lock)
       context.model_run_store.rememberBenchmarkLock(input.model_run_id, benchmark_lock)
     }
@@ -1718,7 +1620,6 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
         )
       }
 
-      await clearEphemeralBenchmarkRuns(model_dir)
       await verifyBenchmarkLock(model_dir, benchmark_lock)
       const agent_controller = new AbortController()
       let refinement_effort_exhausted = false
@@ -1768,7 +1669,6 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
         }
         throw new Error("The agent did not create benchmarks.json")
       }
-      await clearEphemeralBenchmarkRuns(model_dir)
       await verifyBenchmarkLock(model_dir, benchmark_lock)
       if (refinement_effort_exhausted) {
         await append(
@@ -1932,7 +1832,7 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
         `${score_failures.length} of ${final_validation?.benchmark_count ?? 0} benchmarks failed scoring.`
       await Bun.write(
         join(model_dir, "validation-feedback.md"),
-        `# Server validation feedback\n\nValidation is not complete. Fix the model without changing the server-locked benchmark manifest, circuits, evidence, tolerances, or sweep points.\n\nThe exact server-run outputs are saved in \`simulation-validation.json\` and \`validation-artifacts/<benchmark-id>/\`. Inspect those Circuit JSON files and extracted curves before changing the model.\n\n## Simulation failures\n\n${
+        `# Server validation feedback\n\nValidation is not complete. Fix the model without changing the server-locked benchmark manifest, circuits, evidence, tolerances, or transient waveform definitions.\n\nThe exact server-run outputs are saved in \`simulation-validation.json\` and \`validation-artifacts/<benchmark-id>/\`. Inspect those Circuit JSON files and extracted curves before changing the model.\n\n## Simulation failures\n\n${
           simulation_failures.length > 0
             ? simulation_failures
                 .map(

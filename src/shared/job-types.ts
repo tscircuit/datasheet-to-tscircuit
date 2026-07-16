@@ -187,8 +187,6 @@ export interface ModelReferencePreview {
   reference_points: ModelCurvePoint[]
   result_points?: ModelCurvePoint[]
   result_status?: "partial" | "verified"
-  result_completed_points?: number
-  result_total_points?: number
   is_stale?: boolean
   updated_at: string
 }

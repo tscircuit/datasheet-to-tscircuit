@@ -2,11 +2,7 @@ import { createHash } from "node:crypto"
 import { mkdir, readFile, readdir, rename, rm } from "node:fs/promises"
 import { dirname, isAbsolute, join, resolve, sep } from "node:path"
 import ts from "typescript"
-import {
-  parseBenchmarkManifest,
-  validateBenchmarkReferenceFiles,
-  validateBenchmarkSweepSelfRepresentation,
-} from "./model-scorer"
+import { parseBenchmarkManifest, validateBenchmarkReferenceFiles } from "./model-scorer"
 import { validateSimulationDefinitions } from "./model-simulation-validator"
 
 interface LockedFile {
@@ -68,171 +64,6 @@ function parseBenchmarkRecords(value: unknown): BenchmarkRecord[] {
     reference_file: entry.reference_file,
     simulation: entry.simulation,
   }))
-}
-
-function assertSourceUsesSweepProps(source: string, benchmark: BenchmarkRecord): void {
-  if (!isRecord(benchmark.simulation) || benchmark.simulation.kind !== "parameter_sweep") return
-  if (!Array.isArray(benchmark.simulation.points) || benchmark.simulation.points.length < 2) return
-  const prop_keys = new Set<string>()
-  const point_x_values = new Set<number>()
-  let expected_prop_signature: string | undefined
-  for (const [index, point] of benchmark.simulation.points.entries()) {
-    if (
-      !isRecord(point) ||
-      typeof point.x !== "number" ||
-      !Number.isFinite(point.x) ||
-      !isRecord(point.props) ||
-      Object.keys(point.props).length === 0
-    ) {
-      throw new Error(`Benchmark ${benchmark.id} sweep point ${index + 1} has no injected props`)
-    }
-    if (point_x_values.has(point.x)) {
-      throw new Error(`Benchmark ${benchmark.id} has duplicate sweep x=${point.x}`)
-    }
-    point_x_values.add(point.x)
-    const point_prop_keys = Object.keys(point.props).sort()
-    const prop_signature = JSON.stringify(point_prop_keys)
-    if (expected_prop_signature !== undefined && prop_signature !== expected_prop_signature) {
-      throw new Error(`Benchmark ${benchmark.id} sweep points must inject the same prop keys`)
-    }
-    expected_prop_signature = prop_signature
-    for (const key of point_prop_keys) prop_keys.add(key)
-  }
-  for (const key of prop_keys) {
-    if (!sourceConsumesInjectedProp(source, key)) {
-      throw new Error(
-        `Benchmark ${benchmark.id} does not use injected prop ${key} in a runtime expression; every sweep prop must affect the DUT harness`,
-      )
-    }
-  }
-}
-
-function isRuntimeIdentifierRead(node: ts.Identifier): boolean {
-  const parent = node.parent
-  if (
-    ((ts.isBindingElement(parent) ||
-      ts.isParameter(parent) ||
-      ts.isVariableDeclaration(parent) ||
-      ts.isFunctionDeclaration(parent) ||
-      ts.isFunctionExpression(parent) ||
-      ts.isClassDeclaration(parent) ||
-      ts.isClassExpression(parent)) &&
-      parent.name === node) ||
-    ((ts.isPropertyAssignment(parent) ||
-      ts.isPropertyDeclaration(parent) ||
-      ts.isPropertySignature(parent) ||
-      ts.isMethodDeclaration(parent) ||
-      ts.isMethodSignature(parent) ||
-      ts.isGetAccessorDeclaration(parent) ||
-      ts.isSetAccessorDeclaration(parent)) &&
-      parent.name === node) ||
-    (ts.isJsxAttribute(parent) && parent.name === node) ||
-    ts.isImportSpecifier(parent) ||
-    ts.isExportSpecifier(parent) ||
-    ts.isImportClause(parent) ||
-    ts.isNamespaceImport(parent) ||
-    ts.isInterfaceDeclaration(parent) ||
-    ts.isTypeAliasDeclaration(parent) ||
-    ts.isTypeParameterDeclaration(parent)
-  ) {
-    return false
-  }
-  for (let current: ts.Node | undefined = parent; current; current = current.parent) {
-    if (ts.isTypeNode(current)) return false
-    if (
-      ts.isExpression(current) ||
-      ts.isStatement(current) ||
-      ts.isSourceFile(current) ||
-      ts.isJsxExpression(current)
-    ) {
-      break
-    }
-  }
-  return true
-}
-
-function functionConsumesInjectedProp(node: ts.FunctionLikeDeclaration, prop_name: string): boolean {
-  const parameter = node.parameters[0]
-  if (!parameter || !node.body) return false
-  if (ts.isObjectBindingPattern(parameter.name)) {
-    const binding = parameter.name.elements.find((element) => {
-      const external_name = element.propertyName?.getText() ?? element.name.getText()
-      return external_name === prop_name
-    })
-    if (!binding || !ts.isIdentifier(binding.name)) return false
-    const local_name = binding.name.text
-    let found = false
-    const visit = (candidate: ts.Node) => {
-      if (found) return
-      if (
-        candidate !== binding.name &&
-        ts.isIdentifier(candidate) &&
-        candidate.text === local_name &&
-        isRuntimeIdentifierRead(candidate)
-      ) {
-        found = true
-        return
-      }
-      ts.forEachChild(candidate, visit)
-    }
-    visit(node.body)
-    return found
-  }
-  if (!ts.isIdentifier(parameter.name)) return false
-  const parameter_name = parameter.name.text
-  let found = false
-  const visit = (candidate: ts.Node) => {
-    if (found) return
-    if (
-      ts.isPropertyAccessExpression(candidate) &&
-      ts.isIdentifier(candidate.expression) &&
-      candidate.expression.text === parameter_name &&
-      candidate.name.text === prop_name
-    ) {
-      found = true
-      return
-    }
-    if (
-      ts.isElementAccessExpression(candidate) &&
-      ts.isIdentifier(candidate.expression) &&
-      candidate.expression.text === parameter_name &&
-      ts.isStringLiteral(candidate.argumentExpression) &&
-      candidate.argumentExpression.text === prop_name
-    ) {
-      found = true
-      return
-    }
-    ts.forEachChild(candidate, visit)
-  }
-  visit(node.body)
-  return found
-}
-
-function sourceConsumesInjectedProp(source: string, identifier: string): boolean {
-  const source_file = ts.createSourceFile(
-    "benchmark.circuit.tsx",
-    source,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TSX,
-  )
-  let found = false
-  const visit = (node: ts.Node) => {
-    if (found) return
-    if (
-      (ts.isFunctionDeclaration(node) ||
-        ts.isFunctionExpression(node) ||
-        ts.isArrowFunction(node) ||
-        ts.isMethodDeclaration(node)) &&
-      functionConsumesInjectedProp(node, identifier)
-    ) {
-      found = true
-      return
-    }
-    ts.forEachChild(node, visit)
-  }
-  visit(source_file)
-  return found
 }
 
 function parseBenchmarkSource(source: string, benchmark_id: string): ts.SourceFile {
@@ -360,7 +191,6 @@ function assertBenchmarkSourceContract(source: string, benchmark: BenchmarkRecor
   if (/\b(selector|telemetry|benchmark[_ -]?code|metric[_ -]?channel)\b/i.test(source)) {
     throw new Error(`Benchmark ${benchmark.id} contains a synthetic benchmark backchannel`)
   }
-  assertSourceUsesSweepProps(source, benchmark)
 }
 
 async function readCurrentLock(model_dir: string): Promise<{
@@ -373,7 +203,6 @@ async function readCurrentLock(model_dir: string): Promise<{
   const records = parseBenchmarkRecords(manifest_value)
   for (const record of records) assertEvidenceFile(model_dir, record.reference_file)
   await validateBenchmarkReferenceFiles(model_dir, manifest)
-  await validateBenchmarkSweepSelfRepresentation(model_dir, manifest)
   await validateSimulationDefinitions(
     model_dir,
     records.map((record) => record.id),
@@ -519,7 +348,7 @@ export async function replaceBenchmarkLockAfterCircuitRepair(
     .map(({ file, sha256 }) => ({ file, sha256 }))
   if (JSON.stringify(preserved) !== JSON.stringify(current_preserved)) {
     throw new Error(
-      "Benchmark circuit recovery may change only benchmarks/*.circuit.tsx; the manifest, evidence, tolerances, and sweep points must remain locked",
+      "Benchmark circuit recovery may change only benchmarks/*.circuit.tsx; the manifest, evidence, tolerances, and transient waveform definitions must remain locked",
     )
   }
   if (JSON.stringify(current.benchmark_ids) !== JSON.stringify(expected_lock.benchmark_ids)) {

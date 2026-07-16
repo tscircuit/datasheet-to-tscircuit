@@ -144,8 +144,6 @@ async function readReferencePreview(input: {
       : verified_artifact?.status === "building" && result_points?.length
         ? "partial"
         : undefined,
-    result_completed_points: verified_artifact?.completed_points,
-    result_total_points: verified_artifact?.total_points,
     is_stale: Boolean(
       verified_artifact?.source_signature &&
         current_signature &&
@@ -205,8 +203,6 @@ async function readWorkspaceCircuitJson(input: {
   const canonical_file = join(dist_root, "benchmarks", input.benchmark_id, "circuit.json")
   const isolated_files = (
     await Promise.all([
-      listFiles(join(dist_root, ".agent-simulation-runs", input.benchmark_id), "circuit.json"),
-      listFiles(join(dist_root, ".server-validation-builds", input.benchmark_id), "circuit.json"),
       listFiles(join(input.model_dir, "validation-artifacts", input.benchmark_id, "runs"), "circuit.json"),
     ])
   ).flat()

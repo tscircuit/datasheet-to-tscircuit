@@ -2,11 +2,7 @@ import { expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import {
-  parseBenchmarkManifest,
-  scoreModelBenchmarks,
-  validateBenchmarkSweepSelfRepresentation,
-} from "@/server/model-scorer"
+import { parseBenchmarkManifest, scoreModelBenchmarks } from "@/server/model-scorer"
 
 test("model scorer evaluates every locked benchmark from numeric CSV data", async () => {
   const model_dir = await mkdtemp(join(tmpdir(), "datasheet-model-scorer-"))
@@ -29,6 +25,12 @@ test("model scorer evaluates every locked benchmark from numeric CSV data", asyn
           tolerance: 0.05,
           reference_file: "evidence/transfer.csv",
           result_file: "results/champion/transfer.csv",
+          simulation: {
+            kind: "transient_voltage",
+            x_axis: "time_ms",
+            probe_name: "RESULT",
+            dut_spice_node: "OUT",
+          },
         },
         {
           id: "dropout",
@@ -39,6 +41,12 @@ test("model scorer evaluates every locked benchmark from numeric CSV data", asyn
           tolerance: 0.05,
           reference_file: "evidence/dropout.csv",
           result_file: "results/champion/dropout.csv",
+          simulation: {
+            kind: "transient_voltage",
+            x_axis: "time_ms",
+            probe_name: "RESULT",
+            dut_spice_node: "OUT",
+          },
         },
       ],
     }),
@@ -62,43 +70,37 @@ test("model scorer evaluates every locked benchmark from numeric CSV data", asyn
   await rm(model_dir, { recursive: true, force: true })
 })
 
-test("benchmark lock rejects a sweep grid whose interpolation cannot represent its reference", async () => {
-  const model_dir = await mkdtemp(join(tmpdir(), "datasheet-model-sparse-grid-"))
-  await mkdir(join(model_dir, "evidence"), { recursive: true })
-  await Bun.write(join(model_dir, "evidence", "bend.csv"), "x,y\n0,0\n0.5,1\n1,0\n")
+test("benchmark manifests accept only complete time-domain waveform definitions", async () => {
   const base = {
     version: 1 as const,
     locked_at: new Date().toISOString(),
     benchmarks: [
       {
         id: "bend",
-        title: "Sharp bend",
+        title: "Transient waveform",
         source: { page: 2 },
         critical: true,
         weight: 1,
         tolerance: 0.01,
         max_error_tolerance: 0.02,
-        reference_file: "evidence/bend.csv",
+        reference_file: "evidence/waveform.csv",
         result_file: "results/champion/bend.csv",
         simulation: {
-          kind: "parameter_sweep",
+          kind: "transient_voltage",
+          x_axis: "time_ms",
           probe_name: "RESULT",
           dut_spice_node: "OUT",
-          reducer: "last",
-          points: [
-            { x: 0, props: { input: 0 } },
-            { x: 1, props: { input: 1 } },
-          ],
         },
       },
     ],
   }
-  await expect(
-    validateBenchmarkSweepSelfRepresentation(model_dir, parseBenchmarkManifest(base)),
-  ).rejects.toThrow("sweep grid is too sparse")
-  base.benchmarks[0]!.simulation.points.splice(1, 0, { x: 0.5, props: { input: 0.5 } })
-  await expect(
-    validateBenchmarkSweepSelfRepresentation(model_dir, parseBenchmarkManifest(base)),
-  ).resolves.toBeUndefined()
-  await rm(model_dir, { recursive: true, force: true })
+  expect(parseBenchmarkManifest(base).benchmarks[0]?.simulation.x_axis).toBe("time_ms")
+  const invalid = structuredClone(base)
+  invalid.benchmarks[0]!.simulation = {
+    kind: "static_curve",
+    x_axis: "input_voltage",
+    probe_name: "RESULT",
+    dut_spice_node: "OUT",
+  } as (typeof invalid.benchmarks)[0]["simulation"]
+  expect(() => parseBenchmarkManifest(invalid)).toThrow('transient_voltage simulation with x_axis "time_ms"')
 })

@@ -263,10 +263,7 @@ function ReferenceGraph({ preview }: { preview?: ModelReferencePreview }) {
           </span>
           {preview.result_points && (
             <span className="result-series">
-              <i /> {preview.result_status === "partial" ? "Validated points" : "Server-verified model"}
-              {preview.result_status === "partial" && preview.result_total_points
-                ? ` (${preview.result_completed_points ?? preview.result_points.length}/${preview.result_total_points})`
-                : ""}
+              <i /> {preview.result_status === "partial" ? "Validated waveform" : "Server-verified model"}
               {preview.is_stale ? " (older source)" : ""}
             </span>
           )}

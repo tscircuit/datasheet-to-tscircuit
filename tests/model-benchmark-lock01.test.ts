@@ -44,7 +44,12 @@ async function createLockedFixture(model_dir: string): Promise<void> {
             tolerance: 0.05,
             reference_file: "evidence/curves/transfer.csv",
             result_file: "results/champion/transfer.csv",
-            simulation: { kind: "transient_voltage", probe_name: "VOUT", dut_spice_node: "OUT" },
+            simulation: {
+              kind: "transient_voltage",
+              x_axis: "time_ms",
+              probe_name: "VOUT",
+              dut_spice_node: "OUT",
+            },
           },
         ],
       }),
@@ -68,7 +73,7 @@ test("server-owned benchmark locks reject tolerance and evidence tampering", asy
   await rm(job_dir, { recursive: true, force: true })
 })
 
-test("benchmark locks reject synthetic channels and unconsumed sweep props", async () => {
+test("benchmark locks reject synthetic channels and non-transient definitions", async () => {
   const job_dir = await mkdtemp(join(tmpdir(), "datasheet-benchmark-contract-"))
   const model_dir = join(job_dir, "spice")
   await createLockedFixture(model_dir)
@@ -81,26 +86,18 @@ test("benchmark locks reject synthetic channels and unconsumed sweep props", asy
   await Bun.write(join(model_dir, "benchmarks", "transfer.circuit.tsx"), benchmarkSource)
   const manifest = JSON.parse(await Bun.file(join(model_dir, "benchmarks.json")).text())
   manifest.benchmarks[0].simulation = {
-    kind: "parameter_sweep",
+    kind: "static_curve",
+    x_axis: "input_voltage",
     probe_name: "VOUT",
     dut_spice_node: "OUT",
-    points: [
-      { x: 0, props: { sweepValue: 0 } },
-      { x: 1, props: { sweepValue: 1 } },
-    ],
   }
   await Bun.write(join(model_dir, "benchmarks.json"), JSON.stringify(manifest))
-  await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("does not use injected prop")
-
-  await Bun.write(
-    join(model_dir, "benchmarks", "transfer.circuit.tsx"),
-    `${benchmarkSource}\n// sweepValue is intentionally mentioned only in a comment\n`,
-  )
-  await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("does not use injected prop")
+  await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("transient_voltage")
 
   manifest.benchmarks[0].reference_file = "evidence/../benchmarks/transfer.circuit.tsx"
   manifest.benchmarks[0].simulation = {
     kind: "transient_voltage",
+    x_axis: "time_ms",
     probe_name: "VOUT",
     dut_spice_node: "OUT",
   }

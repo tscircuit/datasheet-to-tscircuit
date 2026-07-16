@@ -68,6 +68,7 @@ test("simulation verification rejects solver errors and hashes extracted simulat
           id: "transient",
           simulation: {
             kind: "transient_voltage",
+            x_axis: "time_ms",
             probe_name: "VOUT",
             dut_spice_node: "OUT",
             scale: 2,
@@ -188,15 +189,15 @@ test("simulation verification rejects solver errors and hashes extracted simulat
   await rm(job_dir, { recursive: true, force: true })
 })
 
-test("parameter sweeps reuse one circuit and combine separately persisted runs", async () => {
-  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-parameter-sweep-"))
+test("a transient simulation publishes its complete waveform immediately", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-transient-waveform-"))
   const model_dir = join(job_dir, "spice")
   const output_dir = join(job_dir, "outputs")
   await Promise.all([
     mkdir(join(model_dir, "benchmarks"), { recursive: true }),
     mkdir(output_dir, { recursive: true }),
   ])
-  await Bun.write(join(model_dir, "benchmarks", "sweep.circuit.tsx"), "export default () => <board />\n")
+  await Bun.write(join(model_dir, "benchmarks", "waveform.circuit.tsx"), "export default () => <board />\n")
   await Bun.write(join(model_dir, "model.lib"), modelSource)
   await Bun.write(
     join(model_dir, "benchmarks.json"),
@@ -204,64 +205,56 @@ test("parameter sweeps reuse one circuit and combine separately persisted runs",
       version: 1,
       benchmarks: [
         {
-          id: "sweep",
+          id: "waveform",
           simulation: {
-            kind: "parameter_sweep",
+            kind: "transient_voltage",
+            x_axis: "time_ms",
             probe_name: "RESULT",
             dut_spice_node: "OUT",
-            reducer: "last",
-            points: [
-              { x: 0, props: { sweepValue: 0 } },
-              { x: 1, props: { sweepValue: 1 } },
-            ],
           },
         },
       ],
     }),
   )
-  const make = (value: number) =>
+  const output = join(output_dir, "waveform.json")
+  await Bun.write(
+    output,
     JSON.stringify(
       verifiedCircuit("RESULT", [
         {
           type: "simulation_transient_voltage_graph",
           name: "RESULT",
-          timestamps_ms: [0, 1],
-          voltage_levels: [0, value],
+          timestamps_ms: [0, 0.5, 1],
+          voltage_levels: [0, 2, 4],
         },
       ]),
-    )
-  const first = join(output_dir, "point-000.json")
-  const second = join(output_dir, "point-001.json")
-  await Bun.write(first, make(2))
-  await Bun.write(second, make(4))
+    ),
+  )
   const partial = await verifyPartialSimulationBenchmark({
     model_dir,
-    benchmark_id: "sweep",
-    circuit_json_paths: [{ path: first, x: 0 }],
+    benchmark_id: "waveform",
+    circuit_json_paths: [{ path: output }],
   })
   await writeSimulationValidationReport(model_dir, [partial])
-  const partial_artifact = await getVerifiedSimulationArtifact(model_dir, "sweep")
+  const partial_artifact = await getVerifiedSimulationArtifact(model_dir, "waveform")
   expect(partial.status).toBe("building")
-  expect(partial.completed_points).toBe(1)
-  expect(partial.total_points).toBe(2)
   expect(partial_artifact?.status).toBe("building")
-  expect(partial_artifact?.result_file).toBe("results/partial/sweep.csv")
-  expect(partial_artifact?.result_text).toBe("x,y\n0,2\n")
+  expect(partial_artifact?.result_file).toBe("results/partial/waveform.csv")
+  expect(partial_artifact?.result_text).toBe("x,y\n0,0\n0.5,2\n1,4\n")
   const result = await verifySimulationBenchmark({
     model_dir,
-    benchmark_id: "sweep",
-    circuit_json_paths: [
-      { path: second, x: 1 },
-      { path: first, x: 0 },
-    ],
+    benchmark_id: "waveform",
+    circuit_json_paths: [{ path: output }],
   })
   expect(result.passed).toBe(true)
-  expect(await Bun.file(join(model_dir, "results", "verified", "sweep.csv")).text()).toBe("x,y\n0,2\n1,4\n")
+  expect(await Bun.file(join(model_dir, "results", "verified", "waveform.csv")).text()).toBe(
+    "x,y\n0,0\n0.5,2\n1,4\n",
+  )
   await rm(job_dir, { recursive: true, force: true })
 })
 
-test("legacy probe sweeps are rejected with a migration message", async () => {
-  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-legacy-sweep-"))
+test("non-transient simulation definitions are rejected", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-static-curve-"))
   const model_dir = join(job_dir, "spice")
   await mkdir(join(model_dir, "benchmarks"), { recursive: true })
   await mkdir(join(job_dir, "dist", "spice", "benchmarks", "old"), { recursive: true })
@@ -269,12 +262,12 @@ test("legacy probe sweeps are rejected with a migration message", async () => {
   await Bun.write(
     join(model_dir, "benchmarks.json"),
     JSON.stringify({
-      benchmarks: [{ id: "old", simulation: { kind: "probe_sweep", points: [{ x: 0 }, { x: 1 }] } }],
+      benchmarks: [{ id: "old", simulation: { kind: "static_curve" } }],
     }),
   )
   await Bun.write(join(model_dir, "benchmarks", "old.circuit.tsx"), "export default () => <board />\n")
   await Bun.write(join(job_dir, "dist", "spice", "benchmarks", "old", "circuit.json"), "[]")
   const result = await verifySimulationBenchmark({ model_dir, benchmark_id: "old" })
-  expect(result.error_message).toContain("use parameter_sweep")
+  expect(result.error_message).toContain('must be "transient_voltage"')
   await rm(job_dir, { recursive: true, force: true })
 })

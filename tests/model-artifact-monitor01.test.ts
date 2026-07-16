@@ -55,7 +55,6 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
   await Promise.all([
     Bun.write(join(benchmark_dir, "transfer.circuit.tsx"), "export default () => <board />\n"),
     Bun.write(join(benchmark_dir, "output.circuit.tsx"), "export default () => <board />\n"),
-    Bun.write(join(benchmark_dir, "__run_transfer_000.circuit.tsx"), "export default () => <board />\n"),
     Bun.write(join(evidence_dir, "transfer.csv"), "x,y\n0,0\n1,1\n"),
     Bun.write(join(evidence_dir, "output.csv"), "x,y\n0,1\n1,2\n"),
     Bun.write(join(model_dir, "model.lib"), modelSourceOne),
@@ -78,7 +77,12 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
             y_scale: "linear",
             reference_file: "evidence/curves/transfer.csv",
             result_file: "results/champion/transfer.csv",
-            simulation: { kind: "transient_voltage", probe_name: "RESULT", dut_spice_node: "OUT" },
+            simulation: {
+              kind: "transient_voltage",
+              x_axis: "time_ms",
+              probe_name: "RESULT",
+              dut_spice_node: "OUT",
+            },
           },
           {
             id: "output",
@@ -91,7 +95,12 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
             y_scale: "linear",
             reference_file: "evidence/curves/output.csv",
             result_file: "results/champion/output.csv",
-            simulation: { kind: "transient_voltage", probe_name: "RESULT", dut_spice_node: "OUT" },
+            simulation: {
+              kind: "transient_voltage",
+              x_axis: "time_ms",
+              probe_name: "RESULT",
+              dut_spice_node: "OUT",
+            },
           },
         ],
       }),
@@ -152,7 +161,6 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
   expect(model_run?.reference_preview?.title).toBe("Transfer curve")
   expect(model_run?.reference_preview?.result_points?.[1]).toEqual({ x: 1, y: 0.9 })
   expect(model_run?.preview_options.map((option) => option.benchmark_id)).toEqual(["output", "transfer"])
-  expect(await loadModelSelectedPreview({ model_dir, benchmark_id: "__run_transfer_000" })).toBeUndefined()
 
   const output_mtime_before = (await stat(output_output)).mtimeMs
   const selected_workspace_preview = await loadModelSelectedPreview({
@@ -204,43 +212,9 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
   expect(selected_failed_preview?.circuit_preview?.build_status).toBe("failed")
   expect(selected_failed_preview?.circuit_preview?.error_message).toContain("VoltageProbe")
 
-  const isolated_output = join(
-    job_dir,
-    "dist",
-    "spice",
-    ".agent-simulation-runs",
-    "output",
-    "point-000",
-    "circuit.json",
-  )
   await rm(output_output, { force: true })
-  await mkdir(join(isolated_output, ".."), { recursive: true })
-  await Bun.write(
-    isolated_output,
-    JSON.stringify(verifiedCircuit(modelSourceOne, "RESULT", "output-isolated-run", [1, 2])),
-  )
   await writeSimulationValidationReport(model_dir, [transfer_verification])
-  const selected_isolated_preview = await loadModelSelectedPreview({
-    model_dir,
-    benchmark_id: "output",
-  })
-  expect(selected_isolated_preview?.circuit_preview?.snapshot_origin).toBe("workspace")
-  expect(
-    selected_isolated_preview?.circuit_preview?.circuit_json?.some(
-      (element) =>
-        (element as { source_component_id?: string }).source_component_id === "output-isolated-run",
-    ),
-  ).toBe(true)
-
-  const durable_output = join(
-    model_dir,
-    "validation-artifacts",
-    "output",
-    "runs",
-    "point-000",
-    "circuit.json",
-  )
-  await rm(isolated_output, { force: true })
+  const durable_output = join(model_dir, "validation-artifacts", "output", "runs", "default", "circuit.json")
   await mkdir(join(durable_output, ".."), { recursive: true })
   await Bun.write(
     durable_output,

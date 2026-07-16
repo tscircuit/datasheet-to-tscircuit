@@ -35,11 +35,14 @@ extra effort only permits more refinement iterations.
    If your runtime has no image-viewing tool, do not pretend to inspect pixels:
    extract vector paths/SVG geometry where possible, use OCR only for labels,
    and record the method and uncertainty in the evidence notes.
-2. Create a complete evidence package for every useful electrical graph before
-   fitting. Digitize graph data into two-column CSV files with an \`x,y\` header.
-   Write \`benchmark-draft.json\` with graph sources, conditions, and proposed
-   tolerances, then write \`setup-complete.json\`. Do not create or tune a model
-   during setup.
+2. Create executable evidence only for datasheet graphs whose printed x-axis is
+   time. Digitize each complete time waveform into a two-column CSV with an
+   \`x,y\` header, where x is elapsed time in milliseconds. Do not digitize,
+   draft, or preserve executable benchmark definitions for static curves whose
+   x-axis is voltage, current, load, temperature, frequency, or another
+   parameter. Write \`benchmark-draft.json\` with only the eligible time-waveform
+   sources, conditions, and proposed tolerances, then write
+   \`setup-complete.json\`. Do not create or tune a model during setup.
 3. When component.circuit.tsx becomes available, the server starts a separate,
    untimed benchmark-finalization pass. During that pass, verify the pinout and
    convert the draft into \`benchmarks.json\` plus one executable tscircuit test
@@ -52,8 +55,8 @@ extra effort only permits more refinement iterations.
    validation later detects a structural harness defect, the server may pause the
    timed segment, discard every model artifact, and start a bounded benchmark-only
    recovery pass. In that pass only \`benchmarks/*.circuit.tsx\` may change; the
-   manifest, evidence, conditions, weights, critical flags, tolerances, and sweep
-   points remain byte-locked. A successful repair creates a new audited lock
+   manifest, evidence, conditions, weights, critical flags, tolerances, and
+   transient waveform definitions remain byte-locked. A successful repair creates a new audited lock
    generation and model refinement restarts from a clean time boundary.
    Every locked benchmark must include the server-verifiable \`simulation\`
    extraction mapping described below. Write the first usable baseline immediately to canonical
@@ -67,13 +70,9 @@ extra effort only permits more refinement iterations.
    Do not duplicate the server's exhaustive suite. After the first usable baseline
    is checkpointed, run only the smallest local smoke or targeted diagnostic needed
    to catch syntax/convergence mistakes, then exit promptly. The server immediately
-   runs one saved point from every benchmark in a bounded fair pool, publishes each
-   partial reference overlay, finishes the full suite, and returns exact failures
+   runs every benchmark once in a bounded pool, publishes each complete transient
+   waveform against its reference as soon as that simulation finishes, and returns exact failures
    for the next correction pass.
-   For injected parameter-sweep points, create wrapper TSX only under
-   \`.agent-simulation-runs/<benchmark-id>/\`; never create \`__run_*\` files or any
-   other temporary circuit under \`benchmarks/\`. The server and UI treat
-   \`benchmarks/\` as the immutable manifest-declared suite.
    The embedded \`<analogsimulation>\` runs ngspice and saves Circuit JSON under
    \`../dist/spice/benchmarks/<benchmark-id>/circuit.json\`. The UI only reads
    saved output and never executes TSX. \`tsci simulate analog\` may be useful for
@@ -208,41 +207,34 @@ workspace and every referenced CSV contains numeric \`x,y\` rows:
     "reference_file": "evidence/curves/stable-id.csv",
     "result_file": "results/champion/stable-id.csv",
     "simulation": {
-      "kind": "parameter_sweep",
+      "kind": "transient_voltage",
+      "x_axis": "time_ms",
       "probe_name": "RESULT",
       "dut_spice_node": "OUT",
-      "reducer": "tail_mean",
-      "points": [
-        { "x": 0, "props": { "sweepValue": 0 } },
-        { "x": 1, "props": { "sweepValue": 1 } }
-      ]
+      "scale": 1,
+      "offset": 0
     }
   }]
 }
 \`\`\`
 
-Use \`simulation.kind: "transient_voltage"\` with \`probe_name\`,
-\`dut_spice_node\`, optional
-\`scale\`, and optional \`offset\` when the reference x axis is elapsed time in
-milliseconds. For a parameter sweep, use \`kind: "parameter_sweep"\`. The
-benchmark must contain exactly one DUT and one common voltage probe.
+Only \`simulation.kind: "transient_voltage"\` is supported. Set
+\`simulation.x_axis\` to \`"time_ms"\`; every reference CSV x value is elapsed
+simulation time in milliseconds. Use \`probe_name\`, \`dut_spice_node\`, and
+optional \`scale\` and \`offset\`. Static parameter curves are not executable
+benchmarks in this workflow. The benchmark must contain exactly one DUT and one
+voltage probe, and one simulation produces the entire comparison waveform.
 \`dut_spice_node\` is the exact canonical \`.SUBCKT\` pin whose behavior the
 probe measures. The probe must resolve to that DUT pin and must not be tied
-directly to an independent voltage source. Export a
-props-based benchmark (for example \`function Benchmark({ sweepValue = 0 })\`) and
-the server runs that same TSX once per point through isolated props-injecting
-wrapper entrypoints. Never clone the DUT, groups, sources, or probes for sweep points,
-and never use RESULT_0/RESULT_1-style probe sets. Points contain JSON-safe
-\`props\`. Points support \`last\`, \`tail_mean\`, \`peak_to_peak\`, or
-\`frequency_hz\` reducers plus optional scale and offset. Convert currents or
+directly to an independent voltage source. Never clone the DUT, groups, sources,
+or probes to manufacture graph points. Convert currents or
 other quantities into probe voltages with explicit sense elements and document
 the conversion. Every probe must measure behavior caused by the DUT model; never
 hardcode reference y values into sources or the test bench.
 
 Every benchmark must import \`../component-with-model.circuit\`, instantiate exactly
 one model component with \`name="DUT"\`, declare the named \`<voltageprobe>\`, and
-run \`<analogsimulation spiceEngine="ngspice" ... />\`. Every parameter-sweep prop
-key in benchmarks.json must be consumed by the TSX benchmark. The server verifies
+run \`<analogsimulation spiceEngine="ngspice" ... />\`. The server verifies
 from Circuit JSON that DUT owns the canonical model.lib subcircuit and that the
 named probe is electrically connected to DUT.
 Set the probe's \`connectsTo\` to a direct DUT port selector such as
@@ -298,9 +290,12 @@ export function buildModelSetupPrompt(): string {
   return `Prepare the untimed evidence and benchmark-reference package for a SPICE behavioral model.
 
 Read AGENTS.md first. Analyze datasheet.pdf, render and inspect every relevant
-electrical graph, digitize reference curves, record operating conditions and
-provenance, and write benchmark-draft.json. This phase runs in parallel with the
-component agent, so component.circuit.tsx may not exist yet.
+electrical graph, but digitize and draft only graphs whose printed x-axis is
+time. Each eligible reference CSV must contain the complete waveform with elapsed
+time in milliseconds as x. Ignore static curves whose x-axis is a swept voltage,
+current, load, temperature, frequency, or other parameter. Record operating
+conditions and provenance and write benchmark-draft.json. This phase runs in
+parallel with the component agent, so component.circuit.tsx may not exist yet.
 
 Create model-progress.json immediately, then update it throughout extraction,
 graph digitization, and benchmark drafting as specified in AGENTS.md.
@@ -329,7 +324,7 @@ ${validation_feedback}
 
 Do not weaken, remove, or replace benchmarks to avoid the error. ${
         options.locked_circuit_repair
-          ? "The server will reject any change outside benchmarks/*.circuit.tsx: do not edit benchmarks.json, evidence, conditions, weights, critical flags, tolerances, or sweep points."
+          ? "The server will reject any change outside benchmarks/*.circuit.tsx: do not edit benchmarks.json, evidence, conditions, weights, critical flags, tolerances, or transient waveform definitions."
           : "Preserve the draft's evidence, conditions, weights, critical flags, and tolerances while repairing the manifest or executable testbench contract."
       } Then exit for another server validation pass.`
     : ""
@@ -342,10 +337,9 @@ benchmark. Every benchmark must declare its server-verifiable simulation mapping
 including probe_name and dut_spice_node, and must cite immutable evidence under
 evidence/. Update model-progress.json while working.
 
-For every parameter sweep, choose enough x points that linearly interpolating the
-published reference values sampled on that grid satisfies both the benchmark RMSE
-and maximum-error tolerances. The server checks this before locking and will return
-an overly sparse grid for correction; do not leave the model an impossible score.
+Accept only drafts whose reference x-axis is time. Every accepted benchmark
+must use simulation.kind \`"transient_voltage"\`, simulation.x_axis \`"time_ms"\`,
+and one analog transient run that emits the complete comparison waveform.
 
 Omit the analogsimulation \`simulationType\` prop or set it exactly to
 \`"spice_transient_analysis"\`. Before committing the lock, the server performs
@@ -379,11 +373,9 @@ Run or refresh saved viewer output with
 --disable-pcb --routing-disabled --disable-parts-engine\`. The project runtime
 config preserves ngspice while skipping unrelated PCB work. The UI only reads
 persisted Circuit JSON and will not execute the TSX for you.
-For parameter-sweep diagnostics, put injected wrapper circuits under
-\`.agent-simulation-runs/<benchmark-id>/\`, import the locked benchmark from there,
-and delete the wrappers when the diagnostic run finishes. Never add, copy, or
-temporarily write circuit files under \`benchmarks/\`; names such as \`__run_fig*\`
-are internal sweep points, not benchmarks or datasheet graphs.
+Never add, copy, or temporarily write circuit files under \`benchmarks/\`. Each
+locked benchmark is already a complete time-domain simulation; build the affected
+benchmark directly for a targeted diagnostic.
 
 If champion artifacts already exist, continue from them and preserve their
 history. If a server-owned benchmark lock already exists, do not edit
