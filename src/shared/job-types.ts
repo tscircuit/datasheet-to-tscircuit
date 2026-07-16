@@ -186,7 +186,8 @@ export interface ModelReferencePreview {
   y_scale: "linear" | "log"
   reference_points: ModelCurvePoint[]
   result_points?: ModelCurvePoint[]
-  result_status?: "partial" | "verified"
+  result_status?: "unverified" | "partial" | "verified" | "deprecated"
+  result_origin?: "workspace" | "server_validation"
   is_stale?: boolean
   updated_at: string
 }

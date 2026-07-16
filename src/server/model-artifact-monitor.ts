@@ -9,10 +9,12 @@ import type {
 } from "@/shared/job-types"
 import type { ModelRunStore } from "./model-run-store"
 import {
+  extractSimulationResultPoints,
   getModelSimulationSourceSignature,
   getSimulationBenchmarkVerification,
   getVerifiedResultFile,
   getVerifiedSimulationArtifact,
+  parseSimulationDefinition,
 } from "./model-simulation-validator"
 
 interface BenchmarkPreviewRecord {
@@ -21,6 +23,7 @@ interface BenchmarkPreviewRecord {
   reference_file?: string
   x_scale?: string
   y_scale?: string
+  simulation?: unknown
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -38,6 +41,7 @@ function parseBenchmarks(value: unknown): BenchmarkPreviewRecord[] {
         reference_file: typeof benchmark.reference_file === "string" ? benchmark.reference_file : undefined,
         x_scale: benchmark.x_scale === "log" ? "log" : "linear",
         y_scale: benchmark.y_scale === "log" ? "log" : "linear",
+        simulation: benchmark.simulation,
       },
     ]
   })
@@ -54,19 +58,24 @@ async function readBenchmarkRecords(model_dir: string): Promise<BenchmarkPreview
   return []
 }
 
-function parseCurveCsv(text: string): ModelCurvePoint[] {
-  const points = text
-    .split(/\r?\n/)
-    .slice(1)
-    .flatMap((line) => {
-      const [raw_x, raw_y] = line.split(",")
-      const x = Number(raw_x?.trim())
-      const y = Number(raw_y?.trim())
-      return Number.isFinite(x) && Number.isFinite(y) ? [{ x, y }] : []
-    })
+function downsampleCurvePoints(points: ModelCurvePoint[]): ModelCurvePoint[] {
   if (points.length <= 600) return points
   const stride = Math.ceil(points.length / 600)
   return points.filter((_, index) => index % stride === 0 || index === points.length - 1)
+}
+
+function parseCurveCsv(text: string): ModelCurvePoint[] {
+  return downsampleCurvePoints(
+    text
+      .split(/\r?\n/)
+      .slice(1)
+      .flatMap((line) => {
+        const [raw_x, raw_y] = line.split(",")
+        const x = Number(raw_x?.trim())
+        const y = Number(raw_y?.trim())
+        return Number.isFinite(x) && Number.isFinite(y) ? [{ x, y }] : []
+      }),
+  )
 }
 
 async function listFiles(directory: string, suffix: string): Promise<string[]> {
@@ -95,6 +104,7 @@ async function readReferencePreview(input: {
   model_dir: string
   current_benchmark?: string
   require_exact?: boolean
+  circuit_preview?: ModelCircuitPreview
 }): Promise<ModelReferencePreview | undefined> {
   const benchmarks = await readBenchmarkRecords(input.model_dir)
   const normalized_current = input.current_benchmark?.replace(/\.circuit\.tsx$/i, "")
@@ -116,40 +126,58 @@ async function readReferencePreview(input: {
     selected = { id: basename(reference_file, ".csv"), title: basename(reference_file, ".csv") }
   }
 
-  const reference_text = await readFile(join(input.model_dir, reference_file), "utf8").catch(() => undefined)
+  const reference_path = join(input.model_dir, reference_file)
+  const [reference_text, reference_stat] = await Promise.all([
+    readFile(reference_path, "utf8").catch(() => undefined),
+    stat(reference_path).catch(() => undefined),
+  ])
   if (!reference_text) return undefined
   const reference_points = parseCurveCsv(reference_text)
   if (reference_points.length === 0) return undefined
 
-  const verified_artifact = selected?.id
-    ? await getVerifiedSimulationArtifact(input.model_dir, selected.id).catch(() => undefined)
-    : undefined
-  const current_signature = selected?.id
-    ? await getModelSimulationSourceSignature(input.model_dir, selected.id).catch(() => undefined)
-    : undefined
-  const result_points = verified_artifact?.result_text
-    ? parseCurveCsv(verified_artifact.result_text)
+  const result_points = (() => {
+    if (!input.circuit_preview?.circuit_json || !selected?.simulation) return undefined
+    try {
+      return downsampleCurvePoints(
+        extractSimulationResultPoints(
+          input.circuit_preview.circuit_json,
+          parseSimulationDefinition(selected.simulation),
+        ),
+      )
+    } catch {
+      return undefined
+    }
+  })()
+  const is_stale = Boolean(input.circuit_preview?.is_stale)
+  const result_origin = result_points?.length ? input.circuit_preview?.snapshot_origin : undefined
+  const result_status = result_points?.length
+    ? is_stale
+      ? "deprecated"
+      : result_origin === "workspace"
+        ? "unverified"
+        : input.circuit_preview?.build_status === "ready"
+          ? "verified"
+          : input.circuit_preview?.build_status === "building"
+            ? "partial"
+            : "unverified"
     : undefined
   return {
     benchmark_id: selected?.id,
     title: selected?.title ?? selected?.id ?? basename(reference_file, ".csv"),
     source_file: reference_file,
-    result_file: verified_artifact?.result_file,
+    result_file:
+      result_status === "verified" && selected?.id ? `results/verified/${selected.id}.csv` : undefined,
     x_scale: selected?.x_scale === "log" ? "log" : "linear",
     y_scale: selected?.y_scale === "log" ? "log" : "linear",
     reference_points,
     result_points: result_points && result_points.length > 0 ? result_points : undefined,
-    result_status: verified_artifact?.passed
-      ? "verified"
-      : verified_artifact?.status === "building" && result_points?.length
-        ? "partial"
-        : undefined,
-    is_stale: Boolean(
-      verified_artifact?.source_signature &&
-        current_signature &&
-        verified_artifact.source_signature !== current_signature,
-    ),
-    updated_at: verified_artifact?.generated_at ?? new Date().toISOString(),
+    result_status,
+    result_origin,
+    is_stale,
+    updated_at:
+      (result_points?.length ? input.circuit_preview?.updated_at : undefined) ??
+      reference_stat?.mtime.toISOString() ??
+      new Date().toISOString(),
   }
 }
 
@@ -346,18 +374,17 @@ export async function loadModelSelectedPreview(input: {
   })
   if (!source_path) return undefined
   try {
-    const [circuit_preview, reference_preview] = await Promise.all([
-      readPersistedCircuitPreview({
-        model_dir: input.model_dir,
-        source_path,
-        benchmark_id: input.benchmark_id,
-      }),
-      readReferencePreview({
-        model_dir: input.model_dir,
-        current_benchmark: input.benchmark_id,
-        require_exact: true,
-      }),
-    ])
+    const circuit_preview = await readPersistedCircuitPreview({
+      model_dir: input.model_dir,
+      source_path,
+      benchmark_id: input.benchmark_id,
+    })
+    const reference_preview = await readReferencePreview({
+      model_dir: input.model_dir,
+      current_benchmark: input.benchmark_id,
+      require_exact: true,
+      circuit_preview,
+    })
     return { circuit_preview, reference_preview }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
@@ -378,8 +405,7 @@ export function startModelArtifactMonitor(input: {
 }): ModelArtifactMonitor {
   let is_stopped = false
   let sync_in_flight: Promise<void> | undefined
-  let reference_signature: string | undefined
-  let circuit_signature: string | undefined
+  let preview_signature: string | undefined
 
   const sync = async () => {
     if (is_stopped) return
@@ -397,19 +423,10 @@ export function startModelArtifactMonitor(input: {
       const selected = await loadModelSelectedPreview({ model_dir: input.model_dir, benchmark_id })
       if (!selected) return
 
-      if (selected.reference_preview) {
-        const signature = JSON.stringify({ ...selected.reference_preview, updated_at: undefined })
-        if (signature !== reference_signature) {
-          reference_signature = signature
-          input.model_run_store.updateReferencePreview(input.model_run_id, selected.reference_preview)
-        }
-      }
-      if (selected.circuit_preview) {
-        const signature = JSON.stringify(selected.circuit_preview)
-        if (signature !== circuit_signature) {
-          circuit_signature = signature
-          input.model_run_store.updateCircuitPreview(input.model_run_id, selected.circuit_preview)
-        }
+      const signature = JSON.stringify(selected)
+      if (signature !== preview_signature) {
+        preview_signature = signature
+        input.model_run_store.updatePreviews(input.model_run_id, selected)
       }
     })()
     try {

@@ -98,7 +98,7 @@ export default function App() {
             <LoaderCircle className="spin" size={22} /> Loading task…
           </main>
         ) : (
-          <main className="job-main">
+          <main className={`job-main ${workspace_tab === "component" ? "component-page" : "model-page"}`}>
             <nav className="workspace-tabs" aria-label="Datasheet artifacts">
               <button
                 className={workspace_tab === "component" ? "active" : ""}
@@ -115,20 +115,22 @@ export default function App() {
                 <FlaskConical size={15} /> SPICE Model
               </button>
             </nav>
-            {workspace_tab === "component" ? (
-              <div className="workspace-grid">
-                <AgentLogs
-                  job={job}
-                  is_stopping={job.display_status === "cancelling" || cancelling_job_ids.has(job.job_id)}
-                  on_cancel={() => cancelTask(job.job_id)}
-                />
-                <div className="preview-column">
-                  <CircuitPreview job={job} />
+            <div className="workspace-body">
+              {workspace_tab === "component" ? (
+                <div className="workspace-grid">
+                  <AgentLogs
+                    job={job}
+                    is_stopping={job.display_status === "cancelling" || cancelling_job_ids.has(job.job_id)}
+                    on_cancel={() => cancelTask(job.job_id)}
+                  />
+                  <div className="preview-column">
+                    <CircuitPreview job={job} />
+                  </div>
                 </div>
-              </div>
-            ) : (
-              <ModelPanel job={job} />
-            )}
+              ) : (
+                <ModelPanel job={job} />
+              )}
+            </div>
           </main>
         )}
       </div>

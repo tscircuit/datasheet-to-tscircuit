@@ -12,10 +12,11 @@ import {
   Square,
   Terminal,
 } from "lucide-react"
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
 import type { Job, ModelProgressPhase, ModelRun, ModelRunStatus } from "@/shared/job-types"
 import { getModelRunFileUrl } from "../api"
 import { useModelRun } from "../use-model-run"
+import { AgentLogViewer } from "./agent-log-viewer"
 import { ModelLivePreview } from "./model-live-preview"
 
 const STATUS_COPY: Record<ModelRunStatus, string> = {
@@ -84,12 +85,6 @@ function getElapsedTime(model_run: ModelRun, now: number): number {
 }
 
 function ModelRunLogs({ model_run }: { model_run: ModelRun }) {
-  const terminal_ref = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    const terminal = terminal_ref.current
-    if (terminal) terminal.scrollTop = terminal.scrollHeight
-  }, [model_run.logs])
-
   return (
     <section className="model-subcard model-log-card" aria-label="SPICE model agent logs">
       <header>
@@ -100,15 +95,12 @@ function ModelRunLogs({ model_run }: { model_run: ModelRun }) {
           <Download size={14} /> Log
         </a>
       </header>
-      <div className="model-terminal" ref={terminal_ref} aria-live="polite">
-        {model_run.logs.length === 0 && <span className="terminal-muted">Waiting for the model agent…</span>}
-        {model_run.logs.map((log) => (
-          <span className={`terminal-chunk terminal-${log.stream}`} key={log.log_id}>
-            {log.message}
-          </span>
-        ))}
-        {!model_run.is_complete && <span className="terminal-cursor" />}
-      </div>
+      <AgentLogViewer
+        className="model-terminal"
+        empty_message="Waiting for the model agent…"
+        is_running={!model_run.is_complete}
+        logs={model_run.logs}
+      />
     </section>
   )
 }
@@ -137,17 +129,7 @@ function LiveProgress({ model_run }: { model_run: ModelRun }) {
   )
 
   return (
-    <section className="model-subcard model-live-card" aria-label="Live model progress">
-      <header>
-        <span>
-          <Activity size={15} /> Live progress
-        </span>
-        {!model_run.is_complete && (
-          <strong className="model-live-indicator">
-            <i /> Live
-          </strong>
-        )}
-      </header>
+    <div className="model-live-panel" aria-label="Live model progress">
       {!progress ? (
         <p className="model-muted-copy" aria-live="polite">
           Waiting for the first progress checkpoint…
@@ -269,7 +251,7 @@ function LiveProgress({ model_run }: { model_run: ModelRun }) {
           )}
         </div>
       )}
-    </section>
+    </div>
   )
 }
 
@@ -278,7 +260,7 @@ function ValidationSummary({ model_run }: { model_run: ModelRun }) {
   if (!validation) return null
 
   return (
-    <section className="model-subcard model-validation-card">
+    <section className="model-validation-card">
       <header>
         <span>
           <FlaskConical size={15} /> Validation
@@ -304,6 +286,96 @@ function ValidationSummary({ model_run }: { model_run: ModelRun }) {
           </div>
         ))}
       </div>
+    </section>
+  )
+}
+
+function ModelSummaryTabs({ model_run }: { model_run: ModelRun }) {
+  const [active_tab, setActiveTab] = useState<"progress" | "model">("progress")
+
+  return (
+    <section className="model-subcard model-summary-tabs" aria-label="SPICE model progress and output">
+      <header className="model-summary-tabs-header">
+        <div className="model-summary-tab-list" role="tablist" aria-label="SPICE model details">
+          <button
+            id="model-progress-tab"
+            className={active_tab === "progress" ? "active" : ""}
+            type="button"
+            role="tab"
+            aria-selected={active_tab === "progress"}
+            aria-controls="model-progress-panel"
+            onClick={() => setActiveTab("progress")}
+          >
+            <Activity size={14} /> Progress
+          </button>
+          <button
+            id="model-output-tab"
+            className={active_tab === "model" ? "active" : ""}
+            type="button"
+            role="tab"
+            aria-selected={active_tab === "model"}
+            aria-controls="model-output-panel"
+            onClick={() => setActiveTab("model")}
+          >
+            <FileCode2 size={14} /> Model
+          </button>
+        </div>
+        {active_tab === "progress" && !model_run.is_complete && (
+          <strong className="model-live-indicator">
+            <i /> Live
+          </strong>
+        )}
+      </header>
+
+      {active_tab === "progress" ? (
+        <div
+          id="model-progress-panel"
+          className="model-summary-tab-panel"
+          role="tabpanel"
+          aria-labelledby="model-progress-tab"
+        >
+          <LiveProgress model_run={model_run} />
+          <ValidationSummary model_run={model_run} />
+        </div>
+      ) : (
+        <div
+          id="model-output-panel"
+          className="model-summary-tab-panel model-output-panel"
+          role="tabpanel"
+          aria-labelledby="model-output-tab"
+        >
+          {model_run.model_source ? (
+            <>
+              <div className="model-output-toolbar">
+                <span>model.lib · {model_run.manifest?.dialect}</span>
+                <div className="model-downloads">
+                  <a href={getModelRunFileUrl(model_run.job_id, "model")}>
+                    <Download size={13} /> Model
+                  </a>
+                  <a href={getModelRunFileUrl(model_run.job_id, "component")}>
+                    <Download size={13} /> Component
+                  </a>
+                  <a href={getModelRunFileUrl(model_run.job_id, "report")}>
+                    <Download size={13} /> Report
+                  </a>
+                  <a href={getModelRunFileUrl(model_run.job_id, "model_card")}>
+                    <Download size={13} /> Model card
+                  </a>
+                </div>
+              </div>
+              <pre className="model-source-code">
+                <code>{model_run.model_source}</code>
+              </pre>
+            </>
+          ) : (
+            <div className="model-output-empty">
+              <FileCode2 size={24} />
+              <strong>Waiting for the first model</strong>
+              <p>The generated model source will appear here as soon as the agent saves a candidate.</p>
+            </div>
+          )}
+        </div>
+      )}
     </section>
   )
 }
@@ -401,18 +473,20 @@ export function ModelPanel({ job }: { job: Job }) {
   return (
     <div className="model-workspace">
       <section className={`model-run-header model-status-${model_run.status}`}>
-        <div>
-          <span className="model-status-label">
-            {is_running && model_run.status !== "cancelling" ? (
-              <LoaderCircle className="spin" size={15} />
-            ) : model_run.status === "complete" ? (
-              <CheckCircle2 size={15} />
-            ) : (
-              <FlaskConical size={15} />
-            )}
-            {getStatusCopy(model_run)}
-          </span>
-          <h2>{model_run.manifest?.part_number ?? job.file_name.replace(/\.pdf$/i, "")}</h2>
+        <div className="model-header-copy">
+          <div className="model-header-title-row">
+            <h2>{model_run.manifest?.part_number ?? job.file_name.replace(/\.pdf$/i, "")}</h2>
+            <span className="model-status-label">
+              {is_running && model_run.status !== "cancelling" ? (
+                <LoaderCircle className="spin" size={14} />
+              ) : model_run.status === "complete" ? (
+                <CheckCircle2 size={14} />
+              ) : (
+                <FlaskConical size={14} />
+              )}
+              {getStatusCopy(model_run)}
+            </span>
+          </div>
           <p>
             {model_run.error_message ??
               "The fixed workflow and benchmark suite are unchanged across effort levels."}
@@ -466,10 +540,7 @@ export function ModelPanel({ job }: { job: Job }) {
 
       <div className="model-grid">
         <ModelRunLogs model_run={model_run} />
-        <div className="model-summary-column" aria-label="Model run summary">
-          <LiveProgress model_run={model_run} />
-          <ValidationSummary model_run={model_run} />
-        </div>
+        <ModelSummaryTabs model_run={model_run} />
       </div>
 
       <ModelLivePreview
@@ -479,33 +550,6 @@ export function ModelPanel({ job }: { job: Job }) {
         reference_preview={model_run.reference_preview}
         preview_options={model_run.preview_options}
       />
-
-      {model_run.model_source && (
-        <section className="model-subcard model-source-card">
-          <header>
-            <span>
-              <FileCode2 size={15} /> model.lib · {model_run.manifest?.dialect}
-            </span>
-            <div className="model-downloads">
-              <a href={getModelRunFileUrl(job.job_id, "model")}>
-                <Download size={13} /> Model
-              </a>
-              <a href={getModelRunFileUrl(job.job_id, "component")}>
-                <Download size={13} /> Component
-              </a>
-              <a href={getModelRunFileUrl(job.job_id, "report")}>
-                <Download size={13} /> Report
-              </a>
-              <a href={getModelRunFileUrl(job.job_id, "model_card")}>
-                <Download size={13} /> Model card
-              </a>
-            </div>
-          </header>
-          <pre>
-            <code>{model_run.model_source}</code>
-          </pre>
-        </section>
-      )}
     </div>
   )
 }

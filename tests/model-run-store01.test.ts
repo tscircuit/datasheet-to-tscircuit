@@ -87,6 +87,60 @@ test("ModelRunStore publishes structured progress and keeps a bounded timeline",
   await rm(model_dir, { recursive: true, force: true })
 })
 
+test("ModelRunStore publishes circuit and reference previews atomically", async () => {
+  const model_dir = await mkdtemp(join(tmpdir(), "datasheet-model-preview-store-"))
+  const store = new ModelRunStore()
+  store.createModelRun({
+    model_run_id: "model_preview",
+    job_id: "job_preview",
+    model_dir,
+    effort_multiplier: 1,
+    base_effort_ms: 10_000,
+  })
+  const published: ModelRun[] = []
+  const unsubscribe = store.subscribe("model_preview", (event) => {
+    if (event.event_type !== "log") published.push(event.model_run)
+  })
+
+  const updated_at = "2026-07-16T12:00:00.000Z"
+  store.updatePreviews("model_preview", {
+    circuit_preview: {
+      source_file: "benchmarks/transfer.circuit.tsx",
+      code: "export default () => <board />",
+      build_status: "ready",
+      updated_at,
+      circuit_json: [],
+      snapshot_origin: "workspace",
+    },
+    reference_preview: {
+      benchmark_id: "transfer",
+      title: "Transfer",
+      source_file: "evidence/curves/transfer.csv",
+      x_scale: "linear",
+      y_scale: "linear",
+      reference_points: [
+        { x: 0, y: 0 },
+        { x: 1, y: 1 },
+      ],
+      result_points: [
+        { x: 0, y: 0 },
+        { x: 1, y: 0.9 },
+      ],
+      result_status: "unverified",
+      result_origin: "workspace",
+      updated_at,
+    },
+  })
+
+  expect(published).toHaveLength(1)
+  expect(published[0]?.circuit_preview?.snapshot_origin).toBe("workspace")
+  expect(published[0]?.reference_preview?.result_origin).toBe("workspace")
+  expect(published[0]?.circuit_preview?.updated_at).toBe(published[0]?.reference_preview?.updated_at)
+
+  unsubscribe?.()
+  await rm(model_dir, { recursive: true, force: true })
+})
+
 test("ModelRunStore preserves persisted active-segment effort across a restart", async () => {
   const model_dir = await mkdtemp(join(tmpdir(), "datasheet-model-restart-effort-"))
   const segment_started_at = new Date(Date.now() - 2_500).toISOString()

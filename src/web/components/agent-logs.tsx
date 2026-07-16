@@ -1,7 +1,7 @@
 import { Download, Square, Terminal } from "lucide-react"
-import { useEffect, useRef } from "react"
 import type { Job } from "@/shared/job-types"
 import { getJobFileUrl } from "../api"
+import { AgentLogViewer } from "./agent-log-viewer"
 
 export function AgentLogs({
   job,
@@ -12,12 +12,6 @@ export function AgentLogs({
   is_stopping: boolean
   on_cancel: () => void
 }) {
-  const terminal_ref = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    const terminal = terminal_ref.current
-    if (terminal) terminal.scrollTop = terminal.scrollHeight
-  }, [job.logs])
-
   const is_running = !job.is_complete
 
   return (
@@ -48,15 +42,12 @@ export function AgentLogs({
           </a>
         </div>
       </header>
-      <div className="terminal-window" ref={terminal_ref} aria-live="polite">
-        {job.logs.length === 0 ? <span className="terminal-muted">Waiting for the agent…</span> : null}
-        {job.logs.map((log) => (
-          <span className={`terminal-chunk terminal-${log.stream}`} key={log.log_id}>
-            {log.message}
-          </span>
-        ))}
-        {is_running && <span className="terminal-cursor" />}
-      </div>
+      <AgentLogViewer
+        className="terminal-window"
+        empty_message="Waiting for the agent…"
+        is_running={is_running}
+        logs={job.logs}
+      />
     </section>
   )
 }
