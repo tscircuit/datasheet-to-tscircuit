@@ -53,6 +53,8 @@ class ModelProcessStaleError extends Error {
   }
 }
 
+const DEFAULT_MODEL_STALE_TIMEOUT_MS = 10 * 60_000
+
 function killProcessGroup(child_process: Bun.Subprocess, signal: NodeJS.Signals): void {
   try {
     if (process.platform === "win32") child_process.kill(signal)
@@ -98,10 +100,12 @@ async function streamModelProcess(input: StreamModelProcessInput): Promise<numbe
     stderr: "pipe",
   })
 
-  const configured_stale_timeout = Number(process.env.MODEL_STALE_TIMEOUT_MS ?? 5 * 60_000)
+  const configured_stale_timeout = Number(
+    process.env.MODEL_STALE_TIMEOUT_MS ?? DEFAULT_MODEL_STALE_TIMEOUT_MS,
+  )
   const stale_timeout_ms = Number.isFinite(configured_stale_timeout)
     ? Math.max(1_000, configured_stale_timeout)
-    : 5 * 60_000
+    : DEFAULT_MODEL_STALE_TIMEOUT_MS
   let stale = false
   let stale_timer: ReturnType<typeof setTimeout> | undefined
   let force_kill_timer: ReturnType<typeof setTimeout> | undefined
@@ -136,6 +140,24 @@ async function streamModelProcess(input: StreamModelProcessInput): Promise<numbe
     if (force_kill_timer) clearTimeout(force_kill_timer)
     if (stale_timer) clearTimeout(stale_timer)
   }
+}
+
+function captureProcessOutput(current: string, message: string): string {
+  return `${current}${message}`.slice(-16_000)
+}
+
+function summarizeProcessFailure(output: string): string | undefined {
+  const lines = output
+    .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  const diagnostic_lines = lines.filter((line) =>
+    /(?:fatal error|error:|build exiting with code|enoent|timed out)/i.test(line),
+  )
+  const selected = diagnostic_lines.length > 0 ? diagnostic_lines.slice(-4) : lines.slice(-8)
+  const unique = selected.filter((line, index) => selected.indexOf(line) === index)
+  return unique.length > 0 ? unique.join(" | ").slice(-4_000) : undefined
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -532,7 +554,11 @@ async function runParameterSweepBuilds(input: {
   signal: AbortSignal
   tsci_bin: string
   append: (stream: JobLogStream, message: string) => Promise<void>
-}): Promise<{ exit_code: number; point_paths: Array<{ path: string; x: number }> }> {
+}): Promise<{
+  exit_code: number
+  point_paths: Array<{ path: string; x: number }>
+  error_message?: string
+}> {
   const build_root = join(input.model_dir, ".server-validation-builds", input.benchmark_id)
   await rm(build_root, { recursive: true, force: true })
   await mkdir(build_root, { recursive: true })
@@ -549,7 +575,8 @@ async function runParameterSweepBuilds(input: {
       return { point, point_x, point_index, wrapper_path }
     }),
   )
-  const results: Array<{ exit_code: number; path?: string; x: number } | undefined> = Array(runs.length)
+  const results: Array<{ exit_code: number; path?: string; x: number; error_message?: string } | undefined> =
+    Array(runs.length)
   let next_index = 0
   const concurrency_value = Number(process.env.MODEL_VALIDATION_CONCURRENCY ?? 4)
   const concurrency = Number.isInteger(concurrency_value) ? Math.max(1, Math.min(8, concurrency_value)) : 4
@@ -564,11 +591,15 @@ async function runParameterSweepBuilds(input: {
         `Building locked benchmark ${input.benchmark_file} (${run.point_index + 1}/${runs.length}) at x=${run.point.x}…\n`,
       )
       const source_relative = relative(input.model_dir, run.wrapper_path)
+      let process_output = ""
       const exit_code = await streamModelProcess({
         command: [input.tsci_bin, "build", source_relative, "--ignore-warnings"],
         cwd: input.model_dir,
         signal: input.signal,
-        on_chunk: input.append,
+        on_chunk: async (stream, message) => {
+          process_output = captureProcessOutput(process_output, message)
+          await input.append(stream, message)
+        },
       })
       const generated_path = join(
         input.job_dir,
@@ -580,7 +611,11 @@ async function runParameterSweepBuilds(input: {
         "circuit.json",
       )
       if (exit_code !== 0) {
-        results[run_index] = { exit_code, x: run.point_x }
+        results[run_index] = {
+          exit_code,
+          x: run.point_x,
+          error_message: summarizeProcessFailure(process_output),
+        }
         continue
       }
       const saved_path = join(
@@ -598,14 +633,18 @@ async function runParameterSweepBuilds(input: {
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, runs.length) }, () => worker()))
   const completed = results.filter(
-    (result): result is { exit_code: number; path?: string; x: number } => result !== undefined,
+    (result): result is { exit_code: number; path?: string; x: number; error_message?: string } =>
+      result !== undefined,
   )
+  const failed = completed.find((result) => result.exit_code !== 0)
   return {
-    exit_code:
-      completed.find((result) => result.exit_code !== 0)?.exit_code ?? (input.signal.aborted ? 143 : 0),
+    exit_code: failed?.exit_code ?? (input.signal.aborted ? 143 : 0),
     point_paths: completed.flatMap((result) =>
       result.exit_code === 0 && result.path ? [{ path: result.path, x: result.x }] : [],
     ),
+    error_message: failed?.error_message
+      ? `Sweep point x=${failed.x} failed: ${failed.error_message}`
+      : undefined,
   }
 }
 
@@ -669,9 +708,21 @@ async function validateChampion(
       integration_errors.push("The independent benchmark re-run reached its validation time limit")
       break
     }
+    const source_signature = await getModelSimulationSourceSignature(input.model_dir, benchmark_id)
+    await writeSimulationValidationReport(input.model_dir, [
+      ...simulation_verifications,
+      {
+        benchmark_id,
+        passed: false,
+        status: "building",
+        generated_at: new Date().toISOString(),
+        source_signature,
+      },
+    ])
     const build_plan = await getSimulationBuildPlan(input.model_dir, benchmark_id)
     let point_paths: Array<{ path: string; x: number }> = []
     let simulation_exit_code = 0
+    let simulation_build_error: string | undefined
     if (build_plan.length > 1) {
       const sweep_result = await runParameterSweepBuilds({
         benchmark_id,
@@ -685,6 +736,7 @@ async function validateChampion(
       })
       simulation_exit_code = sweep_result.exit_code
       point_paths = sweep_result.point_paths
+      simulation_build_error = sweep_result.error_message
     } else {
       await append("system", `Building and running locked benchmark ${benchmark_file}…\n`)
       await rm(join(input.job_dir, "dist", "spice", "benchmarks", benchmark_id), {
@@ -692,28 +744,29 @@ async function validateChampion(
         force: true,
       })
       const command = [context.tsci_bin, "build", join("benchmarks", benchmark_file), "--ignore-warnings"]
+      let process_output = ""
       simulation_exit_code = await streamModelProcess({
         command,
         cwd: input.model_dir,
         signal: input.signal,
-        on_chunk: append,
+        on_chunk: async (stream, message) => {
+          process_output = captureProcessOutput(process_output, message)
+          await append(stream, message)
+        },
       })
+      simulation_build_error = summarizeProcessFailure(process_output)
     }
     if (simulation_exit_code !== 0) {
-      const captured = await verifySimulationBenchmark({
-        model_dir: input.model_dir,
-        benchmark_id,
-        source_signature: await getModelSimulationSourceSignature(input.model_dir, benchmark_id),
-        circuit_json_paths: point_paths.length ? point_paths : undefined,
-      })
       const error_message = `${benchmark_file} build exited with code ${simulation_exit_code}${
-        captured.error_message ? `: ${captured.error_message}` : ""
+        simulation_build_error ? `: ${simulation_build_error}` : ""
       }`
       integration_errors.push(error_message)
       simulation_verifications.push({
-        ...captured,
         benchmark_id,
         passed: false,
+        status: "failed",
+        generated_at: new Date().toISOString(),
+        source_signature,
         error_message,
       })
       await writeSimulationValidationReport(input.model_dir, simulation_verifications)
@@ -722,7 +775,7 @@ async function validateChampion(
     const verification = await verifySimulationBenchmark({
       model_dir: input.model_dir,
       benchmark_id,
-      source_signature: await getModelSimulationSourceSignature(input.model_dir, benchmark_id),
+      source_signature,
       circuit_json_paths: point_paths.length ? point_paths : undefined,
     })
     simulation_verifications.push(verification)
@@ -872,31 +925,73 @@ export async function runModel(input: { model_run_id: string }, context: ModelRu
         "system",
         "Starting the untimed benchmark-finalization pass. Model refinement has not started.\n",
       )
-      const benchmark_exit_code = await streamModelProcess({
-        command: [context.agent_bin, "do", "--prompt", buildModelBenchmarkPrompt(), "--dir", model_dir],
-        cwd: model_dir,
-        signal: process_controller.signal,
-        on_chunk: append,
-      })
-      if (cancellation_signal.aborted) {
-        await append("system", "\nBenchmark finalization was stopped. Draft evidence was preserved.\n")
-        markModelRunCancelled(input.model_run_id, context.model_run_store)
-        return
-      }
-      if (benchmark_exit_code !== 0) {
-        throw new Error(`Benchmark-finalization agent exited with code ${benchmark_exit_code}`)
-      }
-      const finalized_premature_artifacts = await findPrematureRefinementArtifacts(model_dir)
-      if (finalized_premature_artifacts.length > 0) {
-        throw new Error(
-          `Benchmark finalization created forbidden model artifacts before the suite was locked: ${finalized_premature_artifacts.join(", ")}`,
+      const configured_attempts = Number(process.env.MODEL_BENCHMARK_FINALIZATION_ATTEMPTS ?? 4)
+      const max_attempts = Number.isInteger(configured_attempts)
+        ? Math.max(1, Math.min(8, configured_attempts))
+        : 4
+      let benchmark_validation_feedback: string | undefined
+      for (let attempt = 1; attempt <= max_attempts; attempt += 1) {
+        const benchmark_exit_code = await streamModelProcess({
+          command: [
+            context.agent_bin,
+            "do",
+            "--prompt",
+            buildModelBenchmarkPrompt(benchmark_validation_feedback),
+            "--dir",
+            model_dir,
+          ],
+          cwd: model_dir,
+          signal: process_controller.signal,
+          on_chunk: append,
+        })
+        if (cancellation_signal.aborted) {
+          await append("system", "\nBenchmark finalization was stopped. Draft evidence was preserved.\n")
+          markModelRunCancelled(input.model_run_id, context.model_run_store)
+          return
+        }
+        if (benchmark_exit_code !== 0) {
+          throw new Error(`Benchmark-finalization agent exited with code ${benchmark_exit_code}`)
+        }
+        const finalized_premature_artifacts = await findPrematureRefinementArtifacts(model_dir)
+        if (finalized_premature_artifacts.length > 0) {
+          throw new Error(
+            `Benchmark finalization created forbidden model artifacts before the suite was locked: ${finalized_premature_artifacts.join(", ")}`,
+          )
+        }
+
+        let rejection: string | undefined
+        if (!(await hasBenchmarkManifest(model_dir))) {
+          rejection = "The benchmark-finalization agent did not create benchmarks.json"
+        } else {
+          try {
+            benchmark_lock = await createOrVerifyBenchmarkLock(model_dir)
+          } catch (error) {
+            rejection = error instanceof Error ? error.message : String(error)
+          }
+        }
+        if (benchmark_lock) {
+          context.model_run_store.rememberBenchmarkLock(input.model_run_id, benchmark_lock)
+          break
+        }
+        if (!rejection) rejection = "The benchmark suite did not pass server validation"
+        if (attempt >= max_attempts) {
+          throw new Error(
+            `Benchmark finalization still failed server validation after ${attempt} attempts: ${rejection}`,
+          )
+        }
+        benchmark_validation_feedback = rejection.slice(0, 8_000)
+        await append(
+          "system",
+          `The server rejected benchmark-finalization attempt ${attempt}: ${rejection}\nReturning the exact validation error to the benchmark agent for correction; model refinement remains untimed and has not started.\n`,
+        )
+        updateServerProgress(
+          input.model_run_id,
+          context.model_run_store,
+          "locking_benchmarks",
+          `Correcting benchmark suite after server validation attempt ${attempt}`,
         )
       }
-      if (!(await hasBenchmarkManifest(model_dir))) {
-        throw new Error("The benchmark-finalization agent did not create benchmarks.json")
-      }
-      benchmark_lock = await createOrVerifyBenchmarkLock(model_dir)
-      context.model_run_store.rememberBenchmarkLock(input.model_run_id, benchmark_lock)
+      if (!benchmark_lock) throw new Error("The benchmark suite could not be locked")
     } else {
       await clearEphemeralBenchmarkRuns(model_dir)
       benchmark_lock = await verifyBenchmarkLock(model_dir, benchmark_lock)

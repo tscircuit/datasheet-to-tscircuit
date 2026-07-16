@@ -106,6 +106,36 @@ test("benchmark locks reject synthetic channels and unconsumed sweep props", asy
   await rm(job_dir, { recursive: true, force: true })
 })
 
+test("benchmark locks reject voltage probes that target an unresolved net", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-benchmark-probe-target-"))
+  const model_dir = join(job_dir, "spice")
+  await createLockedFixture(model_dir)
+  await Bun.write(
+    join(model_dir, "benchmarks", "transfer.circuit.tsx"),
+    benchmarkSource.replace('connectsTo="DUT.pin2"', 'connectsTo="net.OUT"'),
+  )
+
+  await expect(createOrVerifyBenchmarkLock(model_dir)).rejects.toThrow("connect directly to a DUT port")
+
+  await rm(job_dir, { recursive: true, force: true })
+})
+
+test("benchmark locks accept direct DUT selectors containing a greater-than separator", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-benchmark-direct-probe-target-"))
+  const model_dir = join(job_dir, "spice")
+  await createLockedFixture(model_dir)
+  await Bun.write(
+    join(model_dir, "benchmarks", "transfer.circuit.tsx"),
+    benchmarkSource.replace('connectsTo="DUT.pin2"', 'connectsTo=".DUT > .VOUT"'),
+  )
+
+  await expect(createOrVerifyBenchmarkLock(model_dir)).resolves.toMatchObject({
+    benchmark_ids: ["transfer"],
+  })
+
+  await rm(job_dir, { recursive: true, force: true })
+})
+
 test("benchmark locks reject incomplete manifests, malformed references, and invalid TSX", async () => {
   const job_dir = await mkdtemp(join(tmpdir(), "datasheet-benchmark-schema-"))
   const model_dir = join(job_dir, "spice")

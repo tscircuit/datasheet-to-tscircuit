@@ -129,6 +129,8 @@ validation, so a validation timeout cannot hide an available checkpoint.
 Set `MODEL_BASE_EFFORT_MS` to change the local duration represented by 1× effort
 (30 minutes by default). Refinement and independent validation share that effort
 window, but the server stops refinement early enough to reserve validation time.
+Set `MODEL_STALE_TIMEOUT_MS` to change the agent-process inactivity watchdog
+(10 minutes by default); every stdout or stderr chunk resets this timeout.
 Sweep points use isolated build outputs and bounded parallelism. Reference setup
 and waiting for the component remain untimed. The result is not described as
 PSpice-validated unless a PSpice execution backend actually runs it.

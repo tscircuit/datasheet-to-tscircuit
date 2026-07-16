@@ -39,6 +39,7 @@ interface SimulationGraph {
 export interface SimulationBenchmarkVerification {
   benchmark_id: string
   passed: boolean
+  status?: "building" | "passed" | "failed"
   generated_at: string
   source_file?: string
   source_sha256?: string
@@ -570,12 +571,25 @@ async function readTrustedReport(model_dir: string): Promise<SimulationValidatio
         !isRecord(benchmark) ||
         typeof benchmark.benchmark_id !== "string" ||
         typeof benchmark.passed !== "boolean" ||
+        (benchmark.status !== undefined &&
+          benchmark.status !== "building" &&
+          benchmark.status !== "passed" &&
+          benchmark.status !== "failed") ||
         typeof benchmark.generated_at !== "string",
     )
   ) {
     return undefined
   }
   return value as unknown as SimulationValidationReport
+}
+
+export async function getSimulationBenchmarkVerification(
+  model_dir: string,
+  benchmark_id: string,
+): Promise<SimulationBenchmarkVerification | undefined> {
+  assertSafeBenchmarkId(benchmark_id)
+  const report = await readTrustedReport(model_dir)
+  return report?.benchmarks.find((benchmark) => benchmark.benchmark_id === benchmark_id)
 }
 
 async function writeArtifactCopies(input: {
@@ -732,6 +746,7 @@ export async function verifySimulationBenchmark(input: {
     return {
       benchmark_id: input.benchmark_id,
       passed: true,
+      status: "passed",
       generated_at,
       ...artifact,
       verified_result_file: relative(getValidationRoot(input.model_dir), trusted_result_file),
@@ -741,6 +756,7 @@ export async function verifySimulationBenchmark(input: {
     return {
       benchmark_id: input.benchmark_id,
       passed: false,
+      status: "failed",
       generated_at,
       ...artifact,
       error_message: error instanceof Error ? error.message : String(error),

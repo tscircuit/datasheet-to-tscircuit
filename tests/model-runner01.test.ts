@@ -46,6 +46,12 @@ test("model prompt keeps benchmarks fixed while effort only extends iteration ti
   expect(benchmark_prompt).toContain("benchmark-only pass")
   expect(benchmark_prompt).toContain("dut_spice_node")
   expect(benchmark_prompt).toContain("Do not create or modify model.lib")
+  const corrected_benchmark_prompt = buildModelBenchmarkPrompt(
+    "Benchmark transfer voltage probe RESULT must connect directly to a DUT port",
+  )
+  expect(corrected_benchmark_prompt).toContain("server-benchmark-validation-feedback")
+  expect(corrected_benchmark_prompt).toContain("must connect directly to a DUT port")
+  expect(corrected_benchmark_prompt).toContain("Do not weaken, remove, or replace benchmarks")
 })
 
 test("model manifests cannot claim an unexecuted simulator", () => {
@@ -194,6 +200,69 @@ process.exit(8)
   expect(await Bun.file(join(job_dir, "benchmark-attempt.txt")).text()).toBe("2")
   expect(model_run_store.getModelRun("model_benchmark_retry")?.error_message).toContain("code 8")
   expect(await Bun.file(join(job_dir, ".model-benchmark-lock", "lock.json")).exists()).toBe(false)
+  await rm(job_dir, { recursive: true, force: true })
+})
+
+test("benchmark contract rejections are returned to the untimed finalization agent", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-model-benchmark-correction-"))
+  const model_dir = join(job_dir, "spice")
+  const agent_path = join(job_dir, "benchmark-correction-agent")
+  const tsci_path = join(job_dir, "unused-tsci")
+  await Promise.all([
+    Bun.write(join(job_dir, "datasheet.pdf"), "%PDF-1.7\nfixture"),
+    Bun.write(join(job_dir, "index.circuit.tsx"), 'export default () => <chip name="U1" />\n'),
+    Bun.write(
+      agent_path,
+      `#!/usr/bin/env bun
+import { mkdir } from "node:fs/promises"
+const args = process.argv.slice(2)
+const dir = args[args.indexOf("--dir") + 1]
+const prompt = args[args.indexOf("--prompt") + 1]
+if (!prompt.includes("benchmark-only pass")) process.exit(9)
+const attemptFile = dir + "/../benchmark-correction-attempt.txt"
+const attempt = Number(await Bun.file(attemptFile).text().catch(() => "0")) + 1
+await Bun.write(attemptFile, String(attempt))
+if (attempt === 2 && prompt.includes("must connect directly to a DUT port")) {
+  await Bun.write(dir + "/../benchmark-feedback-seen.txt", "yes")
+}
+await mkdir(dir + "/benchmarks", { recursive: true })
+await mkdir(dir + "/evidence/curves", { recursive: true })
+const validSource = ${JSON.stringify(lockedBenchmarkSource)}
+await Bun.write(dir + "/benchmarks/transfer.circuit.tsx", attempt === 1 ? validSource.replace('connectsTo="DUT.pin2"', 'connectsTo="net.OUT"') : validSource)
+await Bun.write(dir + "/benchmarks.json", JSON.stringify({ version: 1, locked_at: new Date().toISOString(), benchmarks: [{ id: "transfer", title: "Transfer", source: { page: 3 }, critical: true, weight: 1, tolerance: 0.05, reference_file: "evidence/curves/transfer.csv", result_file: "results/champion/transfer.csv", simulation: { kind: "transient_voltage", probe_name: "VOUT_PROBE", dut_spice_node: "OUT" } }] }))
+await Bun.write(dir + "/evidence/curves/transfer.csv", "x,y\\n0,0\\n1,1\\n")
+`,
+    ),
+    Bun.write(tsci_path, "#!/usr/bin/env bun\nprocess.exit(99)\n"),
+  ])
+  await Promise.all([chmod(agent_path, 0o755), chmod(tsci_path, 0o755)])
+
+  const job_store = new JobStore()
+  const model_run_store = new ModelRunStore()
+  job_store.createJob({ job_id: "job_benchmark_correction", job_dir, file_name: "part.pdf" })
+  job_store.updateJob("job_benchmark_correction", { display_status: "complete", is_complete: true })
+  model_run_store.createModelRun({
+    model_run_id: "model_benchmark_correction",
+    job_id: "job_benchmark_correction",
+    model_dir,
+    effort_multiplier: 1,
+    base_effort_ms: 2_000,
+  })
+  await Bun.write(join(model_dir, "setup-complete.json"), JSON.stringify({ version: 1 }))
+
+  await runModel(
+    { model_run_id: "model_benchmark_correction" },
+    { job_store, model_run_store, agent_bin: agent_path, tsci_bin: tsci_path },
+  )
+
+  expect(await Bun.file(join(job_dir, "benchmark-correction-attempt.txt")).text()).toBe("2")
+  expect(await Bun.file(join(job_dir, "benchmark-feedback-seen.txt")).text()).toBe("yes")
+  expect(await Bun.file(join(job_dir, ".model-benchmark-lock", "lock.json")).exists()).toBe(true)
+  expect(
+    model_run_store
+      .getModelRun("model_benchmark_correction")
+      ?.logs.some((log) => log.message.includes("Returning the exact validation error")),
+  ).toBe(true)
   await rm(job_dir, { recursive: true, force: true })
 })
 

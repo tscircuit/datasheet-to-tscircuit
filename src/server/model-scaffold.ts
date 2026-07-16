@@ -228,6 +228,11 @@ run \`<analogsimulation spiceEngine="ngspice" ... />\`. Every parameter-sweep pr
 key in benchmarks.json must be consumed by the TSX benchmark. The server verifies
 from Circuit JSON that DUT owns the canonical model.lib subcircuit and that the
 named probe is electrically connected to DUT.
+Set the probe's \`connectsTo\` to a direct DUT port selector such as
+\`.DUT > .VOUT\` (or \`DUT.pin2\` for numbered component pins), never a bare net
+such as \`net.VOUT\`; tscircuit cannot resolve a voltage probe's simulation source
+from a net-only target. The selected DUT port must correspond to
+\`simulation.dut_spice_node\` through the canonical model pin mapping.
 
 Never repurpose physical component pins as benchmark selectors, curve indices,
 telemetry channels, or generic metric outputs. Model pins must retain their
@@ -286,7 +291,22 @@ with a version, completion timestamp, evidence-file count, and draft-benchmark
 count, then exit. The server will wait for and provide the component.`
 }
 
-export function buildModelBenchmarkPrompt(): string {
+export function buildModelBenchmarkPrompt(validation_feedback?: string): string {
+  const correction = validation_feedback
+    ? `
+
+The server rejected the previous benchmark suite before locking it. Correct the
+existing benchmark files and manifest using this exact validation feedback:
+
+<server-benchmark-validation-feedback>
+${validation_feedback}
+</server-benchmark-validation-feedback>
+
+Do not weaken, remove, or replace benchmarks to avoid the error. Preserve the
+draft's evidence, conditions, weights, critical flags, and tolerances while
+repairing the manifest or executable testbench contract, then exit for another
+server validation pass.`
+    : ""
   return `Finalize and freeze the benchmark suite for this SPICE behavioral-model run.
 
 The authoritative component.circuit.tsx is now available. Read AGENTS.md,
@@ -300,7 +320,7 @@ This is an untimed benchmark-only pass. Do not create or modify model.lib,
 model-manifest.json, component-with-model.circuit.tsx, candidates/,
 iteration-history.json, model-card.md, validation-report.json, or any simulated
 result CSV. Do not fit, tune, or run a model. Exit as soon as the complete
-benchmark suite is ready; the server will validate and lock it before refinement.`
+benchmark suite is ready; the server will validate and lock it before refinement.${correction}`
 }
 
 export function buildModelAgentPrompt(): string {

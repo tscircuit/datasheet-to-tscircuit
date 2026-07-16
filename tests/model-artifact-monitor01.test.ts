@@ -172,6 +172,66 @@ test("model previews read persisted Circuit JSON and never rerun TSX on selectio
   expect(selected_verified_preview?.circuit_preview?.snapshot_origin).toBe("server_validation")
   expect(selected_verified_preview?.reference_preview?.result_points?.[1]).toEqual({ x: 1, y: 2.1 })
 
+  await writeSimulationValidationReport(model_dir, [
+    transfer_verification,
+    {
+      benchmark_id: "output",
+      passed: false,
+      status: "building",
+      generated_at: new Date().toISOString(),
+    },
+  ])
+  const selected_building_preview = await loadModelSelectedPreview({
+    model_dir,
+    benchmark_id: "output",
+  })
+  expect(selected_building_preview?.circuit_preview?.build_status).toBe("building")
+
+  await writeSimulationValidationReport(model_dir, [
+    transfer_verification,
+    {
+      benchmark_id: "output",
+      passed: false,
+      status: "failed",
+      generated_at: new Date().toISOString(),
+      error_message: "Could not identify connected source for VoltageProbe",
+    },
+  ])
+  const selected_failed_preview = await loadModelSelectedPreview({
+    model_dir,
+    benchmark_id: "output",
+  })
+  expect(selected_failed_preview?.circuit_preview?.build_status).toBe("failed")
+  expect(selected_failed_preview?.circuit_preview?.error_message).toContain("VoltageProbe")
+
+  const isolated_output = join(
+    job_dir,
+    "dist",
+    "spice",
+    ".agent-simulation-runs",
+    "output",
+    "point-000",
+    "circuit.json",
+  )
+  await rm(output_output, { force: true })
+  await mkdir(join(isolated_output, ".."), { recursive: true })
+  await Bun.write(
+    isolated_output,
+    JSON.stringify(verifiedCircuit(modelSourceOne, "RESULT", "output-isolated-run", [1, 2])),
+  )
+  await writeSimulationValidationReport(model_dir, [transfer_verification])
+  const selected_isolated_preview = await loadModelSelectedPreview({
+    model_dir,
+    benchmark_id: "output",
+  })
+  expect(selected_isolated_preview?.circuit_preview?.snapshot_origin).toBe("workspace")
+  expect(
+    selected_isolated_preview?.circuit_preview?.circuit_json?.some(
+      (element) =>
+        (element as { source_component_id?: string }).source_component_id === "output-isolated-run",
+    ),
+  ).toBe(true)
+
   await Bun.write(join(model_dir, "model.lib"), modelSourceTwo)
   await monitor.sync()
   expect(store.getModelRun("model_1")?.circuit_preview?.is_stale).toBe(true)

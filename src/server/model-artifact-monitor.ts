@@ -10,6 +10,7 @@ import type {
 import type { ModelRunStore } from "./model-run-store"
 import {
   getModelSimulationSourceSignature,
+  getSimulationBenchmarkVerification,
   getVerifiedResultFile,
   getVerifiedSimulationArtifact,
 } from "./model-simulation-validator"
@@ -193,22 +194,30 @@ async function readWorkspaceCircuitJson(input: {
 }): Promise<
   { circuit_json: NonNullable<ModelCircuitPreview["circuit_json"]>; updated_at: string } | undefined
 > {
-  const output_file = join(
-    dirname(input.model_dir),
-    "dist",
-    "spice",
-    "benchmarks",
-    input.benchmark_id,
-    "circuit.json",
+  const dist_root = join(dirname(input.model_dir), "dist", "spice")
+  const canonical_file = join(dist_root, "benchmarks", input.benchmark_id, "circuit.json")
+  const isolated_files = (
+    await Promise.all([
+      listFiles(join(dist_root, ".agent-simulation-runs", input.benchmark_id), "circuit.json"),
+      listFiles(join(dist_root, ".server-validation-builds", input.benchmark_id), "circuit.json"),
+    ])
+  ).flat()
+  const candidates = [canonical_file, ...isolated_files]
+  const dated = await Promise.all(
+    candidates.map(async (file) => ({ file, file_stat: await stat(file).catch(() => undefined) })),
   )
-  const [value, file_stat] = await Promise.all([
-    readFile(output_file, "utf8")
+  for (const candidate of dated.sort(
+    (first, second) => (second.file_stat?.mtimeMs ?? 0) - (first.file_stat?.mtimeMs ?? 0),
+  )) {
+    if (!candidate.file_stat?.isFile()) continue
+    const value = await readFile(candidate.file, "utf8")
       .then((text) => JSON.parse(text) as unknown)
-      .catch(() => undefined),
-    stat(output_file).catch(() => undefined),
-  ])
-  if (!file_stat || !isCircuitJson(value)) return undefined
-  return { circuit_json: value, updated_at: file_stat.mtime.toISOString() }
+      .catch(() => undefined)
+    if (isCircuitJson(value)) {
+      return { circuit_json: value, updated_at: candidate.file_stat.mtime.toISOString() }
+    }
+  }
+  return undefined
 }
 
 async function readPersistedCircuitPreview(input: {
@@ -216,18 +225,50 @@ async function readPersistedCircuitPreview(input: {
   source_path: string
   benchmark_id: string
 }): Promise<ModelCircuitPreview> {
-  const [current_code, source_stat, current_signature, verified, workspace] = await Promise.all([
-    readFile(input.source_path, "utf8"),
-    stat(input.source_path),
-    getModelSimulationSourceSignature(input.model_dir, input.benchmark_id),
-    getVerifiedSimulationArtifact(input.model_dir, input.benchmark_id).catch(() => undefined),
-    readWorkspaceCircuitJson(input),
-  ])
+  const [current_code, source_stat, current_signature, verified, workspace, verification] = await Promise.all(
+    [
+      readFile(input.source_path, "utf8"),
+      stat(input.source_path),
+      getModelSimulationSourceSignature(input.model_dir, input.benchmark_id),
+      getVerifiedSimulationArtifact(input.model_dir, input.benchmark_id).catch(() => undefined),
+      readWorkspaceCircuitJson(input),
+      getSimulationBenchmarkVerification(input.model_dir, input.benchmark_id).catch(() => undefined),
+    ],
+  )
   const source_file = relative(input.model_dir, input.source_path)
   const verified_time = verified ? new Date(verified.generated_at).valueOf() : 0
   const workspace_time = workspace ? new Date(workspace.updated_at).valueOf() : 0
+  const verification_time = verification ? new Date(verification.generated_at).valueOf() : 0
+  const verification_status = verification?.status ?? (verification?.passed ? "passed" : "failed")
+  const verification_is_current = Boolean(
+    verification &&
+      Number.isFinite(verification_time) &&
+      verification_time >= source_stat.mtimeMs &&
+      (!verification.source_signature || verification.source_signature === current_signature),
+  )
 
-  if (verified && verified_time >= workspace_time) {
+  if (
+    verification_is_current &&
+    (verification_status === "building" ||
+      (verification_status === "failed" && verification_time >= Math.max(verified_time, workspace_time)))
+  ) {
+    const state_circuit_json = verified?.circuit_json ?? workspace?.circuit_json
+    return {
+      source_file: verified?.source_file ?? source_file,
+      code: verified?.code ?? current_code,
+      build_status: verification_status,
+      ...(state_circuit_json ? { circuit_json: state_circuit_json } : {}),
+      ...(verified
+        ? { snapshot_origin: "server_validation" as const }
+        : workspace
+          ? { snapshot_origin: "workspace" as const }
+          : {}),
+      error_message: verification_status === "failed" ? verification?.error_message : undefined,
+      updated_at: workspace_time > verification_time ? workspace!.updated_at : verification!.generated_at,
+    }
+  }
+
+  if (verified?.passed && verified_time >= workspace_time) {
     return {
       source_file: verified.source_file,
       code: verified.code,
