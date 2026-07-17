@@ -1,3 +1,4 @@
+import type { TabId } from "@tscircuit/runframe"
 import { Boxes, CircuitBoard, LoaderCircle } from "lucide-react"
 import { lazy, Suspense, useEffect, useState } from "react"
 import type { Job } from "@/shared/job-types"
@@ -9,6 +10,7 @@ const CircuitJsonPreview = lazy(async () => {
 })
 
 type ComponentArtifact = "component" | "typical_application"
+export type ComponentPreviewTab = Extract<TabId, "code" | "pcb" | "schematic">
 
 function EmptyPreview({ job, artifact }: { job: Job; artifact: ComponentArtifact }) {
   const is_application = artifact === "typical_application"
@@ -58,7 +60,17 @@ function EmptyPreview({ job, artifact }: { job: Job; artifact: ComponentArtifact
   )
 }
 
-function ArtifactRunframe({ job, artifact }: { job: Job; artifact: ComponentArtifact }) {
+function ArtifactRunframe({
+  job,
+  artifact,
+  active_tab,
+  on_active_tab_change,
+}: {
+  job: Job
+  artifact: ComponentArtifact
+  active_tab: ComponentPreviewTab
+  on_active_tab_change: (tab: ComponentPreviewTab) => void
+}) {
   const is_application = artifact === "typical_application"
   const circuit_json = is_application ? job.typical_application_circuit_json : job.circuit_json
   const code = is_application ? job.typical_application_code : job.component_code
@@ -74,8 +86,11 @@ function ArtifactRunframe({ job, artifact }: { job: Job; artifact: ComponentArti
         showCodeTab={Boolean(code)}
         codeTabContent={<CodePanel job={job} artifact={artifact} />}
         availableTabs={["code", "pcb", "schematic"]}
-        defaultActiveTab="pcb"
-        defaultTab="pcb"
+        defaultActiveTab={active_tab}
+        defaultTab={active_tab}
+        onActiveTabChange={(tab) => {
+          if (tab === "code" || tab === "pcb" || tab === "schematic") on_active_tab_change(tab)
+        }}
         showJsonTab={false}
         showRenderLogTab={false}
         showFileMenu
@@ -86,7 +101,15 @@ function ArtifactRunframe({ job, artifact }: { job: Job; artifact: ComponentArti
   )
 }
 
-export function CircuitPreview({ job }: { job: Job }) {
+export function CircuitPreview({
+  job,
+  active_tab,
+  on_active_tab_change,
+}: {
+  job: Job
+  active_tab: ComponentPreviewTab
+  on_active_tab_change: (tab: ComponentPreviewTab) => void
+}) {
   const [artifact, setArtifact] = useState<ComponentArtifact>("component")
 
   useEffect(() => setArtifact("component"), [job.job_id])
@@ -115,7 +138,12 @@ export function CircuitPreview({ job }: { job: Job }) {
         </button>
       </div>
       <div className="viewer-shell">
-        <ArtifactRunframe job={job} artifact={artifact} />
+        <ArtifactRunframe
+          job={job}
+          artifact={artifact}
+          active_tab={active_tab}
+          on_active_tab_change={on_active_tab_change}
+        />
       </div>
     </section>
   )
