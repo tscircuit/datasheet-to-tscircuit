@@ -125,6 +125,7 @@ function ModelCircuitPreview({ preview }: { preview?: ModelCircuitPreviewData })
               defaultActiveTab="analog_simulation"
               defaultTab="analog_simulation"
               showJsonTab={false}
+              hideSchematicInAnalogSimulation
               showRenderLogTab={false}
               showFileMenu={false}
               allowSelectingVersion={false}

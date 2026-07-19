@@ -2732,6 +2732,19 @@ a {
   display: none;
 }
 
+.model-runframe-shell [role="tabpanel"][data-state="active"] {
+  height: auto !important;
+  min-height: 0 !important;
+  flex: 1 1 0%;
+  overflow: hidden !important;
+}
+
+.model-runframe-shell [role="tabpanel"][data-state="active"] > div {
+  height: 100% !important;
+  min-height: 0 !important;
+  overflow: clip !important;
+}
+
 .model-preview-placeholder,
 .model-reference-empty {
   display: flex;
