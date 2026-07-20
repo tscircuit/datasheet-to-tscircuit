@@ -12,6 +12,8 @@ RUN bun run build:web
 
 FROM oven/bun:1.3.9 AS runtime
 
+ARG SOURCE_COMMIT=unavailable
+
 WORKDIR /app
 
 RUN apt-get update \
@@ -20,7 +22,8 @@ RUN apt-get update \
 
 ENV HOST=0.0.0.0 \
     NODE_ENV=production \
-    PORT=3000
+    PORT=3000 \
+    SOURCE_COMMIT=${SOURCE_COMMIT}
 
 COPY --from=build --chown=bun:bun /app/package.json ./package.json
 COPY --from=build --chown=bun:bun /app/tsconfig.json ./tsconfig.json

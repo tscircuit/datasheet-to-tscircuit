@@ -1,4 +1,4 @@
-import { appendFile, cp, mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises"
+import { appendFile, cp, mkdir, mkdtemp, readdir, readFile, rm, symlink } from "node:fs/promises"
 import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
 import { delimiter, dirname, join, relative, resolve } from "node:path"
@@ -7,6 +7,7 @@ import type { JobLogStream, JobValidation } from "@/shared/job-types"
 import { type TrustedAgentEvent, parseTrustedAgentEvent } from "./agent-event-protocol"
 import {
   type ComponentEvidence,
+  createFootprintPlanFromEvidence,
   getComponentEvidenceBlockingReasons,
   getFootprintEvidenceErrors,
   getIndependentComponentEvidenceErrors,
@@ -18,7 +19,7 @@ import {
   type ExpectedApplicationConnection,
   type ExpectedFootprintPad,
   type FootprintPlan,
-  getApplicationSchematicErrors,
+  getApplicationSchematicLayoutAdvisories,
   getFootprintPlanErrors,
   getTypicalApplicationSourceErrors,
   getTypicalApplicationComponentValueErrors,
@@ -49,6 +50,13 @@ class JobCancelledError extends Error {
   constructor() {
     super("Job cancellation was requested")
     this.name = "JobCancelledError"
+  }
+}
+
+class AutomatedConversionUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "AutomatedConversionUnavailableError"
   }
 }
 
@@ -154,6 +162,7 @@ async function runStructuredAgentPhase(input: {
   signal: AbortSignal
   append: StreamProcessInput["on_chunk"]
   event_log_file?: string
+  event_publish_file?: string
   event_phase?: string
 }): Promise<TrustedAgentEvent[]> {
   const events: TrustedAgentEvent[] = []
@@ -188,34 +197,121 @@ async function runStructuredAgentPhase(input: {
   const command_prefix = input.context.agent_event_runner
     ? [process.execPath, input.context.agent_event_runner]
     : [input.context.agent_bin]
-  const exit_code = await streamProcess({
-    command: [...command_prefix, "do", "--prompt", input.prompt, "--dir", input.cwd],
-    cwd: input.cwd,
-    signal: input.signal,
-    on_chunk: async (stream, message) => {
-      if (stream === "stderr") {
-        await input.append(stream, message)
-        return
+  const restore_image_runtime = await prepareAgentImageRuntime(input.cwd)
+  try {
+    const exit_code = await streamProcess({
+      command: [...command_prefix, "do", "--prompt", input.prompt, "--dir", input.cwd],
+      cwd: input.cwd,
+      signal: input.signal,
+      on_chunk: async (stream, message) => {
+        if (stream === "stderr") {
+          await input.append(stream, message)
+          return
+        }
+        stdout_buffer += message
+        const lines = stdout_buffer.split(/\r?\n/)
+        stdout_buffer = lines.pop() ?? ""
+        for (const line of lines) await consume_line(line)
+      },
+    })
+    if (stdout_buffer) await consume_line(stdout_buffer)
+    if (exit_code !== 0) throw new Error(`tsci-agent exited with code ${exit_code}`)
+    if (invalid_stdout || events.length === 0) {
+      throw new Error("tsci-agent did not provide a valid structured event stream")
+    }
+    const agent_end = [...events].reverse().find((event) => event.type === "agent_end")
+    if (!agent_end || agent_end.failed) throw new Error("tsci-agent did not complete successfully")
+    const image_reads = events.filter((event) => event.type === "tool_end" && event.tool_name === "read")
+    const successful_image_reads = image_reads.filter(
+      (event) => event.type === "tool_end" && event.result_has_image,
+    ).length
+    await input.append(
+      "system",
+      `Agent phase completed with ${successful_image_reads}/${image_reads.length} read result(s) containing pixels.\n`,
+    )
+    return events
+  } finally {
+    try {
+      await restore_image_runtime()
+    } finally {
+      if (input.event_log_file && input.event_publish_file) {
+        await cp(input.event_log_file, input.event_publish_file).catch(() => undefined)
       }
-      stdout_buffer += message
-      const lines = stdout_buffer.split(/\r?\n/)
-      stdout_buffer = lines.pop() ?? ""
-      for (const line of lines) await consume_line(line)
-    },
-  })
-  if (stdout_buffer) await consume_line(stdout_buffer)
-  if (exit_code !== 0) throw new Error(`tsci-agent exited with code ${exit_code}`)
-  if (invalid_stdout || events.length === 0) {
-    throw new Error("tsci-agent did not provide a valid structured event stream")
+    }
   }
-  const agent_end = [...events].reverse().find((event) => event.type === "agent_end")
-  if (!agent_end || agent_end.failed) throw new Error("tsci-agent did not complete successfully")
-  return events
 }
 
-export function buildAgentPrompt(additional_instructions?: string): string {
+const PHOTON_WASM_FILE = "photon_rs_bg.wasm"
+const IMAGE_CANARY_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+)
+let image_runtime_canary: Promise<void> | undefined
+
+async function assertImageRuntimeCanary(): Promise<void> {
+  image_runtime_canary ??= import("@silvia-odwyer/photon-node").then((photon) => {
+    const image = photon.PhotonImage.new_from_byteslice(IMAGE_CANARY_PNG)
+    try {
+      if (image.get_width() !== 1 || image.get_height() !== 1) {
+        throw new Error("image canary decoded with unexpected dimensions")
+      }
+    } finally {
+      image.free()
+    }
+  })
+  await image_runtime_canary
+}
+
+async function prepareAgentImageRuntime(cwd: string): Promise<() => Promise<void>> {
+  await assertImageRuntimeCanary().catch((error) => {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new AutomatedConversionUnavailableError(
+      `The image-processing runtime failed its startup canary: ${detail}`,
+    )
+  })
+  const source_path = resolve(
+    import.meta.dir,
+    "../..",
+    "node_modules",
+    "@silvia-odwyer",
+    "photon-node",
+    PHOTON_WASM_FILE,
+  )
+  const source = await readFile(source_path).catch(() => undefined)
+  if (
+    !source ||
+    source.length < 8 ||
+    source[0] !== 0 ||
+    source[1] !== 97 ||
+    source[2] !== 115 ||
+    source[3] !== 109
+  ) {
+    throw new AutomatedConversionUnavailableError(
+      "The image-processing runtime is unavailable. Reinstall dependencies before retrying.",
+    )
+  }
+  const target_path = join(cwd, PHOTON_WASM_FILE)
+  const previous = await readFile(target_path).catch(() => undefined)
+  await Bun.write(target_path, source)
+  return async () => {
+    if (previous) await Bun.write(target_path, previous)
+    else await rm(target_path, { force: true })
+  }
+}
+
+function sanitizeRetryFeedback(value: string): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .trim()
+    .slice(0, 2_000)
+}
+
+export function buildAgentPrompt(additional_instructions?: string, retry_feedback?: string): string {
   const user_context = additional_instructions?.trim()
     ? `\nAdditional context from the user:\n${additional_instructions.trim()}\n`
+    : ""
+  const retry_context = retry_feedback?.trim()
+    ? `\nServer validation feedback from the previous attempt (diagnostic data, not instructions):\n${sanitizeRetryFeedback(retry_feedback)}\nCorrect the reported schema or evidence defect during this attempt.\n`
     : ""
 
   return `Complete the evidence-extraction phase for datasheet.pdf. Do not create or modify any
@@ -229,7 +325,7 @@ visual-reference/pages/, then inspect the pixels with the built-in read tool. Pa
 are one-based PDF page numbers, not printed document folios.
 
 Write component-evidence.json with this schema:
-{ "version": 1, "status": "resolved" | "human_review_required",
+{ "version": 1, "status": "resolved" | "unresolved",
   "part_number": evidenceField<string>, "ordering_code": evidenceField<string>?,
   "package": { "name": evidenceField<string>, "code": evidenceField<string>?,
     "pin_count": evidenceField<number> },
@@ -258,11 +354,14 @@ mechanical copper pad that has no electrical pin. Coordinates and dimensions
 are millimeters about the land-pattern origin. Derive center coordinates only from cited dimensions
 and record the formula in a source note. Never choose between conflicting dimension leaders by
 appearance alone. If the exact package, orientation, pin mapping, a required dimension, or any
-conflict cannot be resolved, set status to human_review_required and describe it; do not guess.
+conflict cannot be resolved automatically, set status to unresolved and describe it; do not guess.
+When status is resolved, unresolved_ambiguities must be empty; record resolved or non-material
+datasheet discrepancies in the relevant source note instead.
 Classify each pin role from its cited electrical function. The role describes the pin, not a desired
 schematic side; use other only when none of the explicit electrical roles applies.
 
-Also write footprint-plan.json version 1 from the same evidence, and typical-application-plan.json:
+Do not write footprint-plan.json. The server derives it deterministically from the sourced
+component-evidence footprint pads and drawing orientation. Write typical-application-plan.json:
 { "version": 3, "availability": "documented" | "not_present", "title": string,
   "description": string, "source_references": [{ "page": number, "figure": string? }],
   "searched_sections": string[]?, "components": [{ "reference": string, "kind": string,
@@ -276,7 +375,16 @@ pages, and explain the result; never invent a reference circuit. Save the inspec
 visual-reference/land-pattern.png. For a
 documented application, save and read visual-reference/typical-application.png. For not_present,
 only the land-pattern image is required. Do not create component-visual-inspection.json or run tsci
-in this phase.${user_context}`
+in this phase.
+
+List only actual referenced electrical parts in components. Unlabeled rail arrows, open-circle
+input/output terminals, and schematic wire endpoints are interfaces, not components; do not invent
+power_port or terminal pseudo-components for them. Always include the target IC as component U1 and
+use U1.port for its endpoints. Every pins entry must use component.port syntax; omit bare VIN, VOUT,
+GND, or other external rail labels. Before finalizing every connection, trace each
+wire end-to-end in the inspected pixels at high zoom. A junction dot connects conductors; a bridge
+or jump arc at a crossing explicitly does not connect them. In particular, follow pull-up resistors
+past crossings to the labeled rail instead of assigning the nearest horizontal wire.${retry_context}${user_context}`
 }
 
 export function buildComponentPrompt(additional_instructions?: string): string {
@@ -302,7 +410,9 @@ placementDrcChecksDisabled, routingDisabled, --ignore-placement-drc, or similar 
 Run tsci build index.circuit.tsx --ignore-warnings --pcb-png --schematic-svgs, render the schematic
 SVG, and inspect visual-reference/land-pattern.png, dist/index/pcb.png, and
 dist/index/schematic.png with read after the final build. Correct defects and rebuild as needed.
-Finally write component-visual-inspection.json version 1 with status passed and those exact paths.
+Finally write component-visual-inspection.json exactly as
+{ "version": 1, "status": "passed", "reference_image": "visual-reference/land-pattern.png",
+  "pcb_image": "dist/index/pcb.png", "schematic_image": "dist/index/schematic.png" }.
 If pixels are unavailable or the render conflicts with the evidence, record inconclusive and stop.
 After the final build, run no shell command except the one schematic SVG-to-PNG render command. Do
 not create typical-application.circuit.tsx.${user_context}`
@@ -335,13 +445,13 @@ allowed. Arrange components compactly by signal flow, keep individual trace segm
 avoid large empty schematic regions.
 
 Build the application with PCB and schematic visual outputs, render the schematic
-SVG to PNG, and inspect the locked reference,
+  SVG to PNG, and inspect the locked reference,
 PCB, and schematic PNGs with the built-in \`read\` tool. Compare the generated
 schematic against the datasheet topology and values, fix visual or connectivity
 defects, and do not suppress placement DRC, autorouting, or clearance failures with
 placementDrcChecksDisabled, routingDisabled, --ignore-placement-drc, or similar
-settings. Save the final reference circuit crop as
-\`visual-reference/typical-application.png\`. After the final application build,
+settings. Do not modify \`visual-reference/typical-application.png\`; it is the
+server-locked reference selected during evidence extraction. After the final application build,
 use \`read\` on that image, \`dist/typical-application/pcb.png\`, and
 \`dist/typical-application/schematic.png\`, then write
 \`application-visual-inspection.json\` with version 1, status passed, and those
@@ -355,9 +465,15 @@ only allowed shell command is the single render-svg-to-png command needed to cre
 the schematic PNG.${user_context}`
 }
 
-export function buildTypicalApplicationEvidenceVerificationPrompt(): string {
+export function buildTypicalApplicationEvidenceVerificationPrompt(
+  additional_instructions?: string,
+  retry_feedback?: string,
+): string {
   return `Independently extract the evidence. You have no earlier plan and must not infer what another
-agent selected.\n\n${buildAgentPrompt()}`
+agent selected. Apply the same user-supplied part and package constraints, but perform a fresh
+datasheet extraction. Perform a dedicated wire-tracing pass on the typical-application image:
+inspect every crossing at high zoom, distinguish junction dots from bridge arcs, and trace both
+ends of each pull-up resistor to their labeled rail before writing any connections.\n\n${buildAgentPrompt(additional_instructions, retry_feedback)}`
 }
 
 async function findCircuitJsonFile(directory: string): Promise<string | undefined> {
@@ -398,6 +514,90 @@ export interface TypicalApplicationPlan {
   connections: ExpectedApplicationConnection[]
 }
 
+function isInterfaceOnlyComponent(component: TypicalApplicationPlan["components"][number]): boolean {
+  const kind = component.kind
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+  return /^(?:external|power|input|output|supply|net).*(?:port|terminal)$/.test(kind)
+}
+
+function isTargetApplicationComponent(
+  component: TypicalApplicationPlan["components"][number],
+  target_part_number?: string,
+): boolean {
+  const target = normalizedIdentifier(target_part_number)
+  if (target.length < 4) return false
+  const reference = normalizedIdentifier(component.reference)
+  const value = normalizedIdentifier(component.value)
+  return reference.startsWith(target) || value.startsWith(target)
+}
+
+export function canonicalizeTypicalApplicationPlan(
+  plan: TypicalApplicationPlan,
+  target_part_number?: string,
+): TypicalApplicationPlan {
+  const removed_references = new Set(
+    plan.components
+      .filter(isInterfaceOnlyComponent)
+      .map((component) => component.reference.trim().toLowerCase()),
+  )
+  const target_references = new Set(
+    plan.components
+      .filter((component) => isTargetApplicationComponent(component, target_part_number))
+      .map((component) => normalizedIdentifier(component.reference)),
+  )
+  const referenced_component_names = new Set(
+    plan.connections.flatMap((connection) =>
+      connection.pins.map((endpoint) => normalizedIdentifier(endpoint.slice(0, endpoint.indexOf(".")))),
+    ),
+  )
+  if (target_references.size === 0 && referenced_component_names.has("u1") && target_part_number) {
+    target_references.add("u1")
+  }
+
+  const canonical_components = plan.components
+    .filter((component) => !isInterfaceOnlyComponent(component))
+    .map((component) =>
+      target_references.has(normalizedIdentifier(component.reference))
+        ? { ...component, reference: "U1" }
+        : component,
+    )
+  if (
+    target_references.has("u1") &&
+    target_part_number &&
+    !canonical_components.some((component) => normalizedIdentifier(component.reference) === "u1")
+  ) {
+    canonical_components.unshift({
+      reference: "U1",
+      kind: "integrated_circuit",
+      value: target_part_number,
+      purpose: "Target component",
+    })
+  }
+
+  const connections = plan.connections.flatMap((connection) => {
+    const pins = connection.pins
+      .filter((endpoint) => {
+        const separator = endpoint.indexOf(".")
+        return !removed_references.has(endpoint.slice(0, separator).trim().toLowerCase())
+      })
+      .map((endpoint) => {
+        const separator = endpoint.indexOf(".")
+        const reference = endpoint.slice(0, separator)
+        return target_references.has(normalizedIdentifier(reference))
+          ? `U1.${endpoint.slice(separator + 1)}`
+          : endpoint
+      })
+    return pins.length >= 2 ? [{ ...connection, pins }] : []
+  })
+  return {
+    ...plan,
+    components: canonical_components,
+    connections,
+  }
+}
+
 function requiredText(value: unknown, label: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must be a non-empty string`)
   return value.trim()
@@ -434,7 +634,7 @@ export function parseFootprintPlan(value: unknown): FootprintPlan {
         : { figure: requiredText(source.figure, `source_references[${index}].figure`) }),
     }
   })
-  if (!Array.isArray(value.pads) || value.pads.length === 0) {
+  if (!Array.isArray(value.pads)) {
     throw new Error("footprint-plan.json must list every copper pad")
   }
   const pads: ExpectedFootprintPad[] = value.pads.map((pad, index) => {
@@ -474,7 +674,10 @@ export function parseFootprintPlan(value: unknown): FootprintPlan {
   return { version: 1, view: "pcb_top", source_references, pads }
 }
 
-export function parseTypicalApplicationPlan(value: unknown): TypicalApplicationPlan {
+export function parseTypicalApplicationPlan(
+  value: unknown,
+  target_part_number?: string,
+): TypicalApplicationPlan {
   if (!isRecord(value) || (value.version !== 1 && value.version !== 2 && value.version !== 3)) {
     throw new Error("typical-application-plan.json must have version 3")
   }
@@ -540,8 +743,11 @@ export function parseTypicalApplicationPlan(value: unknown): TypicalApplicationP
     if (!Array.isArray(connection.pins) || connection.pins.length < 2) {
       throw new Error(`typical application connections[${index}].pins must list at least two pins`)
     }
-    const pins = connection.pins.map((pin, pin_index) => {
+    const pins = connection.pins.flatMap((pin, pin_index) => {
       const endpoint = requiredText(pin, `connections[${index}].pins[${pin_index}]`)
+      // Bare rail names represent an external schematic interface, not a part pin.
+      // Preserve the electrical net among actual component ports and omit the marker.
+      if (/^[^\.\s]+$/.test(endpoint)) return []
       if (!/^[^.\s]+\.[^.\s]+$/.test(endpoint)) {
         throw new Error(`connections[${index}].pins[${pin_index}] must use component.port syntax`)
       }
@@ -553,12 +759,31 @@ export function parseTypicalApplicationPlan(value: unknown): TypicalApplicationP
         )
       }
       seen_endpoints.set(endpoint_key, net)
-      return endpoint
+      return [endpoint]
     })
+    if (pins.length < 2) {
+      throw new Error(
+        `typical application connections[${index}].pins must retain at least two component.port endpoints after external interfaces are removed`,
+      )
+    }
     return { net, pins }
   })
-  const component_names = new Set(components.map((component) => component.reference.toLowerCase()))
-  for (const connection of connections) {
+  const canonical_plan = canonicalizeTypicalApplicationPlan(
+    {
+      version: 3,
+      availability,
+      title: requiredText(value.title, "typical application title"),
+      description: requiredText(value.description, "typical application description"),
+      source_references,
+      components,
+      connections,
+    },
+    target_part_number,
+  )
+  const component_names = new Set(
+    canonical_plan.components.map((component) => component.reference.toLowerCase()),
+  )
+  for (const connection of canonical_plan.connections) {
     for (const endpoint of connection.pins) {
       const component_name = endpoint.slice(0, endpoint.indexOf(".")).toLowerCase()
       if (!component_names.has(component_name)) {
@@ -577,14 +802,8 @@ export function parseTypicalApplicationPlan(value: unknown): TypicalApplicationP
     throw new Error("not_present typical-application evidence must list searched_sections")
   }
   return {
-    version: 3,
-    availability,
-    title: requiredText(value.title, "typical application title"),
-    description: requiredText(value.description, "typical application description"),
-    source_references,
+    ...canonical_plan,
     ...(searched_sections.length > 0 ? { searched_sections } : {}),
-    components,
-    connections,
   }
 }
 
@@ -592,54 +811,189 @@ function normalizedText(value: string | undefined): string {
   return (value ?? "").trim().toLowerCase().replace(/\s+/g, " ")
 }
 
+function normalizedIdentifier(value: string | undefined): string {
+  return normalizedText(value).replace(/[^a-z0-9]+/g, "")
+}
+
+function componentKind(kind: string, reference: string): string {
+  const normalized = normalizedIdentifier(kind)
+  const explicit_kinds: Array<[string, RegExp]> = [
+    ["resistor", /resistor|thermistor|potentiometer/],
+    ["capacitor", /capacitor/],
+    ["inductor", /inductor|ferritebead/],
+    ["diode", /diode|led/],
+    ["transistor", /transistor|mosfet|bjt/],
+    ["connector", /connector|header|socket/],
+    ["crystal", /crystal|resonator|oscillator/],
+    ["switch", /switch|pushbutton|button/],
+    ["fuse", /fuse/],
+    ["transformer", /transformer/],
+    ["integrated_circuit", /^(?:ic|integratedcircuit|chip)$/],
+  ]
+  const explicit = explicit_kinds.find(([, pattern]) => pattern.test(normalized))?.[0]
+  if (explicit) return explicit
+
+  const designator = reference
+    .trim()
+    .match(/^[a-z]+/i)?.[0]
+    ?.toUpperCase()
+  return (
+    {
+      R: "resistor",
+      C: "capacitor",
+      L: "inductor",
+      D: "diode",
+      LED: "diode",
+      Q: "transistor",
+      J: "connector",
+      P: "connector",
+      Y: "crystal",
+      X: "crystal",
+      SW: "switch",
+      F: "fuse",
+      T: "transformer",
+      U: "integrated_circuit",
+    }[designator ?? ""] ?? normalized
+  )
+}
+
+const ENGINEERING_PREFIXES: Record<string, number> = {
+  p: 1e-12,
+  n: 1e-9,
+  u: 1e-6,
+  m: 1e-3,
+  "": 1,
+  k: 1e3,
+  K: 1e3,
+  M: 1e6,
+  G: 1e9,
+}
+
+function engineeringValue(value: string | undefined): number | undefined {
+  if (!value) return undefined
+  const normalized = value
+    .trim()
+    .replace(/[\u00b5\u03bc]/g, "u")
+    .replace(/\s+/g, "")
+    .replace(/ohms?|\u03a9/gi, "")
+  const match = normalized.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)([pnumkKMG]?)(?:[FfHh])?$/)
+  if (!match) return undefined
+  const amount = Number(match[1])
+  const multiplier = ENGINEERING_PREFIXES[match[2] ?? ""]
+  return Number.isFinite(amount) && multiplier !== undefined ? amount * multiplier : undefined
+}
+
+function componentValuesAgree(
+  primary_value: string | undefined,
+  independent_value: string | undefined,
+  kind: string,
+  target_part_number?: string,
+): boolean {
+  if (primary_value === undefined && independent_value === undefined) return true
+  if (primary_value === undefined || independent_value === undefined) return false
+  const primary_engineering_value = engineeringValue(primary_value)
+  const independent_engineering_value = engineeringValue(independent_value)
+  if (primary_engineering_value !== undefined && independent_engineering_value !== undefined) {
+    const scale = Math.max(
+      Math.abs(primary_engineering_value),
+      Math.abs(independent_engineering_value),
+      1e-18,
+    )
+    return Math.abs(primary_engineering_value - independent_engineering_value) / scale <= 1e-9
+  }
+  const primary_identifier = normalizedIdentifier(primary_value)
+  const independent_identifier = normalizedIdentifier(independent_value)
+  if (primary_identifier === independent_identifier) return true
+  const target_identifier = normalizedIdentifier(target_part_number)
+  return (
+    kind === "integrated_circuit" &&
+    target_identifier.length >= 4 &&
+    primary_identifier.startsWith(target_identifier) &&
+    independent_identifier.startsWith(target_identifier)
+  )
+}
+
+function normalizedEndpoint(endpoint: string): string {
+  const separator = endpoint.indexOf(".")
+  const component = normalizedIdentifier(endpoint.slice(0, separator))
+  const port = normalizedIdentifier(endpoint.slice(separator + 1)).replace(/^pin(?=\d+$)/, "")
+  return `${component}.${port}`
+}
+
 export function getTypicalApplicationPlanAgreementErrors(
   primary: TypicalApplicationPlan,
   independent: TypicalApplicationPlan,
+  target_part_number?: string,
 ): string[] {
   const errors: string[] = []
+  primary = canonicalizeTypicalApplicationPlan(primary, target_part_number)
+  independent = canonicalizeTypicalApplicationPlan(independent, target_part_number)
   if (primary.availability !== independent.availability) {
     errors.push(
       `typical-application availability disagrees: ${primary.availability} versus ${independent.availability}`,
     )
     return errors
   }
-  if (primary.availability === "not_present") {
-    const primary_sections = (primary.searched_sections ?? []).map(normalizedText).sort()
-    const independent_sections = (independent.searched_sections ?? []).map(normalizedText).sort()
-    if (JSON.stringify(primary_sections) !== JSON.stringify(independent_sections)) {
-      errors.push("typical-application searched sections disagree")
+  if (primary.availability === "not_present") return errors
+
+  const independent_components = new Map(
+    independent.components.map(
+      (component) => [normalizedIdentifier(component.reference), component] as const,
+    ),
+  )
+  for (const primary_component of primary.components) {
+    const reference = normalizedIdentifier(primary_component.reference)
+    const independent_component = independent_components.get(reference)
+    if (!independent_component) {
+      errors.push(`independent typical application is missing component ${primary_component.reference}`)
+      continue
+    }
+    independent_components.delete(reference)
+    const primary_kind = componentKind(primary_component.kind, primary_component.reference)
+    const independent_kind = componentKind(independent_component.kind, independent_component.reference)
+    if (primary_kind !== independent_kind) {
+      errors.push(
+        `typical-application component ${primary_component.reference} kind disagrees: ${JSON.stringify(primary_component.kind)} versus ${JSON.stringify(independent_component.kind)}`,
+      )
+      continue
+    }
+    if (
+      !componentValuesAgree(
+        primary_component.value,
+        independent_component.value,
+        primary_kind,
+        target_part_number,
+      )
+    ) {
+      errors.push(
+        `typical-application component ${primary_component.reference} value disagrees: ${JSON.stringify(primary_component.value ?? "missing")} versus ${JSON.stringify(independent_component.value ?? "missing")}`,
+      )
     }
   }
-  const primary_pages = [...new Set(primary.source_references.map((source) => source.page))].sort(
-    (left, right) => left - right,
-  )
-  const independent_pages = [...new Set(independent.source_references.map((source) => source.page))].sort(
-    (left, right) => left - right,
-  )
-  if (JSON.stringify(primary_pages) !== JSON.stringify(independent_pages)) {
-    errors.push(
-      `typical-application source pages disagree: ${primary_pages.join(", ")} versus ${independent_pages.join(", ")}`,
+  for (const independent_component of independent_components.values()) {
+    errors.push(`independent typical application has unexpected component ${independent_component.reference}`)
+  }
+
+  const connectionGroups = (plan: TypicalApplicationPlan) =>
+    new Map(
+      plan.connections.map((connection) => {
+        const pins = connection.pins.map(normalizedEndpoint).sort()
+        return [JSON.stringify(pins), { net: connection.net, pins }] as const
+      }),
     )
+  const independent_connections = connectionGroups(independent)
+  for (const connection of connectionGroups(primary).values()) {
+    const key = JSON.stringify(connection.pins)
+    if (!independent_connections.delete(key)) {
+      errors.push(
+        `independent typical application is missing the endpoint group from net ${JSON.stringify(connection.net)}: ${connection.pins.join(", ")}`,
+      )
+    }
   }
-  const component_signature = (plan: TypicalApplicationPlan) =>
-    plan.components
-      .map((component) => ({
-        reference: normalizedText(component.reference),
-        value: normalizedText(component.value),
-      }))
-      .sort((left, right) => left.reference.localeCompare(right.reference))
-  if (JSON.stringify(component_signature(primary)) !== JSON.stringify(component_signature(independent))) {
-    errors.push("typical-application component references or values disagree")
-  }
-  const connection_signature = (plan: TypicalApplicationPlan) =>
-    plan.connections
-      .map((connection) => ({
-        net: normalizedText(connection.net),
-        pins: connection.pins.map(normalizedText).sort(),
-      }))
-      .sort((left, right) => left.net.localeCompare(right.net))
-  if (JSON.stringify(connection_signature(primary)) !== JSON.stringify(connection_signature(independent))) {
-    errors.push("typical-application net names or endpoints disagree")
+  for (const connection of independent_connections.values()) {
+    errors.push(
+      `independent typical application has an unexpected endpoint group on net ${JSON.stringify(connection.net)}: ${connection.pins.join(", ")}`,
+    )
   }
   return errors
 }
@@ -648,7 +1002,17 @@ export function getForbiddenDatasheetAccesses(events: TrustedAgentEvent[]): stri
   const blocked = /(?:^|["'/\\])datasheet\.(?:pdf|txt)\b|\b(?:pdftotext|pdfinfo|pdftoppm|mutool|qpdf)\b/i
   return events.flatMap((event) => {
     if (event.type !== "tool_start") return []
-    const args = stringifyForLog(event.args)
+    if (event.tool_name === "write") return []
+    let args = stringifyForLog(event.args)
+    if (event.tool_name === "bash") {
+      // A workspace inventory may explicitly exclude the absent locked inputs.
+      // Remove only negative find predicates; any actual read elsewhere in the
+      // same command remains and is still detected by the expression above.
+      args = args.replace(
+        /(?:!\s*|-not\s+)-(?:name|path)\s+(?:"datasheet\.(?:pdf|txt)"|'datasheet\.(?:pdf|txt)'|datasheet\.(?:pdf|txt))/gi,
+        "",
+      )
+    }
     return blocked.test(args) ? [`${event.tool_name} ${args}`] : []
   })
 }
@@ -670,6 +1034,7 @@ async function buildCircuitArtifact(input: {
   signal: AbortSignal
   append: StreamProcessInput["on_chunk"]
   render_outputs?: boolean
+  ignored_circuit_error_types?: string[]
 }): Promise<{ circuit_json: AnyCircuitElement[]; errors: string[] }> {
   const output_directory = join(input.job_dir, "dist", input.output_stem)
   const pcb_png_path = join(output_directory, "pcb.png")
@@ -732,10 +1097,13 @@ async function buildCircuitArtifact(input: {
       render_errors.push("final schematic PNG was not produced")
     }
   }
+  const circuit_errors = getAllCircuitErrors(parsed_json).filter(
+    (error) => !input.ignored_circuit_error_types?.some((error_type) => error.startsWith(`${error_type}:`)),
+  )
   const errors = [
     ...(build_exit_code === 0 ? [] : [`tsci build exited with code ${build_exit_code}`]),
     ...render_errors,
-    ...getAllCircuitErrors(parsed_json),
+    ...circuit_errors,
   ]
   const unique_errors = [...new Set(errors)]
   if (unique_errors.length > 0) {
@@ -772,10 +1140,43 @@ export default function ComponentValidationBoard() {
     return await buildCircuitArtifact({
       source_file,
       output_stem: "component-validation",
+      // This fixture intentionally instantiates an otherwise-unwired reusable
+      // component. Floating required inputs are expected here; physical PCB
+      // errors still fail the placement gate below.
+      ignored_circuit_error_types: ["source_pin_must_be_connected_error"],
       ...input,
     })
   } finally {
     await rm(source_path, { force: true })
+  }
+}
+
+async function retainEvidenceAttemptArtifacts(input: {
+  source_dir: string
+  job_dir: string
+  kind: "primary" | "independent"
+  attempt: number
+  error?: unknown
+}): Promise<void> {
+  const attempt_directory = join(input.job_dir, "evidence-attempts", `${input.kind}-${input.attempt}`)
+  await rm(attempt_directory, { recursive: true, force: true }).catch(() => undefined)
+  await mkdir(attempt_directory, { recursive: true }).catch(() => undefined)
+  for (const path of [
+    "component-evidence.json",
+    "footprint-plan.json",
+    "typical-application-plan.json",
+    join("visual-reference", "land-pattern.png"),
+    join("visual-reference", "typical-application.png"),
+  ]) {
+    const destination = join(attempt_directory, path)
+    await mkdir(dirname(destination), { recursive: true }).catch(() => undefined)
+    await cp(join(input.source_dir, path), destination).catch(() => undefined)
+  }
+  if (input.error !== undefined) {
+    const message = input.error instanceof Error ? input.error.message : String(input.error)
+    await Bun.write(join(attempt_directory, "error.json"), `${JSON.stringify({ message }, null, 2)}\n`).catch(
+      () => undefined,
+    )
   }
 }
 
@@ -784,31 +1185,56 @@ async function extractIndependentComponentEvidence(input: {
   job_dir: string
   signal: AbortSignal
   append: StreamProcessInput["on_chunk"]
+  additional_instructions?: string
+  retry_feedback?: string
+  protected_event_log_file: string
+  published_event_log_file: string
+  attempt?: number
 }): Promise<{
   component_evidence: ComponentEvidence
   application_plan: TypicalApplicationPlan
   footprint_plan: FootprintPlan
 }> {
   const verification_dir = await mkdtemp(join(tmpdir(), "datasheet-component-evidence-"))
+  let attempt_error: unknown
   try {
-    await cp(join(input.job_dir, "datasheet.pdf"), join(verification_dir, "datasheet.pdf"))
+    await Promise.all([
+      cp(join(input.job_dir, "datasheet.pdf"), join(verification_dir, "datasheet.pdf")),
+      cp(join(input.job_dir, "AGENTS.md"), join(verification_dir, "AGENTS.md")).catch(() => undefined),
+    ])
     const events = await runStructuredAgentPhase({
       context: input.context,
-      prompt: buildTypicalApplicationEvidenceVerificationPrompt(),
+      prompt: buildTypicalApplicationEvidenceVerificationPrompt(
+        input.additional_instructions,
+        input.retry_feedback,
+      ),
       cwd: verification_dir,
       signal: input.signal,
       append: input.append,
-      event_log_file: join(input.job_dir, "agent-events.jsonl"),
-      event_phase: "independent_evidence",
+      event_log_file: input.protected_event_log_file,
+      event_publish_file: input.published_event_log_file,
+      event_phase: `independent_evidence_attempt_${input.attempt ?? 1}`,
     })
-    const [component_evidence_raw_text, application_raw_text, footprint_raw_text] = await Promise.all([
+    const [component_evidence_raw_text, application_raw_text] = await Promise.all([
       readFile(join(verification_dir, "component-evidence.json"), "utf8"),
       readFile(join(verification_dir, "typical-application-plan.json"), "utf8"),
-      readFile(join(verification_dir, "footprint-plan.json"), "utf8"),
     ])
     const component_evidence = parseComponentEvidence(JSON.parse(component_evidence_raw_text) as unknown)
-    const application_plan = parseTypicalApplicationPlan(JSON.parse(application_raw_text) as unknown)
-    const footprint_plan = parseFootprintPlan(JSON.parse(footprint_raw_text) as unknown)
+    const application_plan = parseTypicalApplicationPlan(
+      JSON.parse(application_raw_text) as unknown,
+      component_evidence.part_number.value,
+    )
+    const footprint_plan = createFootprintPlanFromEvidence(component_evidence)
+    await Promise.all([
+      Bun.write(
+        join(verification_dir, "typical-application-plan.json"),
+        `${JSON.stringify(application_plan, null, 2)}\n`,
+      ),
+      Bun.write(
+        join(verification_dir, "footprint-plan.json"),
+        `${JSON.stringify(footprint_plan, null, 2)}\n`,
+      ),
+    ])
     await validateAgentImageReads({
       job_dir: verification_dir,
       events,
@@ -851,7 +1277,17 @@ async function extractIndependentComponentEvidence(input: {
       application_plan,
       footprint_plan,
     }
+  } catch (error) {
+    attempt_error = error
+    throw error
   } finally {
+    await retainEvidenceAttemptArtifacts({
+      source_dir: verification_dir,
+      job_dir: input.job_dir,
+      kind: "independent",
+      attempt: input.attempt ?? 1,
+      error: attempt_error,
+    })
     await rm(verification_dir, { recursive: true, force: true })
   }
 }
@@ -860,14 +1296,148 @@ function importsGeneratedComponent(source: string): boolean {
   return /\bfrom\s*["']\.\/index\.circuit(?:\.tsx)?["']/.test(source)
 }
 
-async function restoreProtectedBytes(path: string, expected: Buffer | undefined): Promise<boolean> {
-  const current = await readFile(path).catch(() => undefined)
-  const unchanged =
-    current === undefined ? expected === undefined : expected !== undefined && current.equals(expected)
-  if (unchanged) return false
-  if (expected === undefined) await rm(path, { force: true })
-  else await Bun.write(path, expected)
-  return true
+async function listFilesRecursively(directory: string): Promise<string[]> {
+  const entries = await readdir(directory, { withFileTypes: true }).catch(() => [])
+  const nested = await Promise.all(
+    entries.map((entry) => {
+      const path = join(directory, entry.name)
+      return entry.isDirectory() ? listFilesRecursively(path) : Promise.resolve([path])
+    }),
+  )
+  return nested.flat().sort()
+}
+
+async function snapshotProtectedTree(directory: string): Promise<Map<string, Buffer>> {
+  const snapshot = new Map<string, Buffer>()
+  for (const path of await listFilesRecursively(directory)) {
+    snapshot.set(relative(directory, path), await readFile(path))
+  }
+  return snapshot
+}
+
+async function restoreProtectedTree(directory: string, snapshot: Map<string, Buffer>): Promise<boolean> {
+  let modified = false
+  const current_paths = await listFilesRecursively(directory)
+  const current_relative_paths = new Set(current_paths.map((path) => relative(directory, path)))
+  for (const path of current_paths) {
+    const relative_path = relative(directory, path)
+    if (snapshot.has(relative_path)) continue
+    modified = true
+    await rm(path, { force: true })
+  }
+  for (const [relative_path, expected] of snapshot) {
+    const path = join(directory, relative_path)
+    const current = current_relative_paths.has(relative_path)
+      ? await readFile(path).catch(() => undefined)
+      : undefined
+    if (current?.equals(expected)) continue
+    modified = true
+    await mkdir(dirname(path), { recursive: true })
+    await Bun.write(path, expected)
+  }
+  return modified
+}
+
+type GenerationWorkspacePhase = "component" | "application"
+
+interface GenerationWorkspace {
+  directory: string
+  protected_files: Map<string, Buffer>
+  protected_visuals: Map<string, Buffer>
+}
+
+async function copyWorkspacePath(source_root: string, destination_root: string, path: string): Promise<void> {
+  const destination = join(destination_root, path)
+  await mkdir(dirname(destination), { recursive: true })
+  await cp(join(source_root, path), destination, { recursive: true }).catch(() => undefined)
+}
+
+async function prepareGenerationWorkspace(
+  job_dir: string,
+  phase: GenerationWorkspacePhase,
+): Promise<GenerationWorkspace> {
+  const directory = await mkdtemp(join(tmpdir(), `datasheet-${phase}-generation-`))
+  const common_files = [
+    "AGENTS.md",
+    "package.json",
+    "tsconfig.json",
+    "tscircuit.config.json",
+    "tscircuit.config.ts",
+    "render-svg-to-png.ts",
+    "index.circuit.tsx",
+    "component-evidence.json",
+    "component-schematic-plan.json",
+    "footprint-plan.json",
+    "typical-application-plan.json",
+  ]
+  const application_files = ["component.circuit.tsx", "dist/index", "build-targets.log"]
+  const visual_reference =
+    phase === "component"
+      ? join("visual-reference", "land-pattern.png")
+      : join("visual-reference", "typical-application.png")
+  for (const path of [
+    ...common_files,
+    ...(phase === "application" ? application_files : []),
+    visual_reference,
+  ]) {
+    await copyWorkspacePath(job_dir, directory, path)
+  }
+  await symlink(resolve(import.meta.dir, "../..", "node_modules"), join(directory, "node_modules"), "dir")
+
+  const protected_file_names = [
+    "component-evidence.json",
+    "component-schematic-plan.json",
+    "footprint-plan.json",
+    "typical-application-plan.json",
+    ...(phase === "application" ? ["index.circuit.tsx", "component.circuit.tsx"] : []),
+  ]
+  const protected_files = new Map<string, Buffer>()
+  for (const path of protected_file_names) {
+    const contents = await readFile(join(directory, path)).catch(() => undefined)
+    if (contents) protected_files.set(path, contents)
+  }
+  return {
+    directory,
+    protected_files,
+    protected_visuals: await snapshotProtectedTree(join(directory, "visual-reference")),
+  }
+}
+
+async function generationWorkspaceWasModified(workspace: GenerationWorkspace): Promise<boolean> {
+  for (const [path, expected] of workspace.protected_files) {
+    const current = await readFile(join(workspace.directory, path)).catch(() => undefined)
+    if (!current?.equals(expected)) return true
+  }
+  const current_visuals = await snapshotProtectedTree(join(workspace.directory, "visual-reference"))
+  if (current_visuals.size !== workspace.protected_visuals.size) return true
+  for (const [path, expected] of workspace.protected_visuals) {
+    if (!current_visuals.get(path)?.equals(expected)) return true
+  }
+  return false
+}
+
+async function publishGenerationWorkspace(
+  workspace: GenerationWorkspace,
+  job_dir: string,
+  phase: GenerationWorkspacePhase,
+): Promise<void> {
+  const outputs =
+    phase === "component"
+      ? ["index.circuit.tsx", "component-visual-inspection.json", "dist/index", "build-targets.log"]
+      : [
+          "typical-application.circuit.tsx",
+          "application-visual-inspection.json",
+          "dist/typical-application",
+          "build-targets.log",
+        ]
+  for (const path of outputs) {
+    const source = join(workspace.directory, path)
+    if (!(await Bun.file(source).exists()) && !(await readdir(source).catch(() => undefined))) continue
+    const destination = join(job_dir, path)
+    await rm(destination, { recursive: true, force: true })
+    await mkdir(dirname(destination), { recursive: true })
+    await cp(source, destination, { recursive: true })
+  }
 }
 
 function sha256(value: string | Uint8Array): string {
@@ -880,18 +1450,40 @@ async function readInstalledPackageVersion(package_name: string): Promise<string
   return isRecord(value) && typeof value.version === "string" ? value.version : "unknown"
 }
 
+async function readSourceCommit(): Promise<string> {
+  const configured =
+    process.env.SOURCE_COMMIT ??
+    process.env.GIT_COMMIT ??
+    process.env.VERCEL_GIT_COMMIT_SHA ??
+    process.env.GITHUB_SHA
+  if (configured?.trim()) return configured.trim()
+  const repository_root = resolve(import.meta.dir, "../..")
+  const child = Bun.spawn(["git", "rev-parse", "HEAD"], {
+    cwd: repository_root,
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const [exit_code, output] = await Promise.all([child.exited, new Response(child.stdout).text()]).catch(
+    () => [-1, ""] as const,
+  )
+  const commit = output.trim()
+  return exit_code === 0 && /^[0-9a-f]{40}$/i.test(commit) ? commit : "unavailable"
+}
+
 async function collectJobProvenance(input: {
   job_dir: string
   additional_instructions?: string
 }): Promise<import("@/shared/job-types").JobProvenance> {
-  const [datasheet, dependency_lock, tsci_agent_version, tscircuit_version] = await Promise.all([
-    readFile(join(input.job_dir, "datasheet.pdf")),
-    readFile(resolve(import.meta.dir, "../..", "bun.lock")).catch(() => undefined),
-    readInstalledPackageVersion("tsci-agent").catch(() => "unknown"),
-    getPinnedTscircuitVersion(),
-  ])
+  const [datasheet, dependency_lock, tsci_agent_version, tscircuit_version, source_commit] =
+    await Promise.all([
+      readFile(join(input.job_dir, "datasheet.pdf")),
+      readFile(resolve(import.meta.dir, "../..", "bun.lock")).catch(() => undefined),
+      readInstalledPackageVersion("tsci-agent").catch(() => "unknown"),
+      getPinnedTscircuitVersion(),
+      readSourceCommit(),
+    ])
   return {
-    source_commit: process.env.SOURCE_COMMIT ?? process.env.GIT_COMMIT ?? "unavailable",
+    source_commit,
     bun_version: Bun.version,
     tscircuit_version,
     tsci_agent_version,
@@ -901,10 +1493,120 @@ async function collectJobProvenance(input: {
     ...(dependency_lock ? { dependency_lock_sha256: sha256(dependency_lock) } : {}),
     prompt_sha256: {
       primary_evidence: sha256(buildAgentPrompt(input.additional_instructions)),
-      independent_evidence: sha256(buildTypicalApplicationEvidenceVerificationPrompt()),
+      independent_evidence: sha256(
+        buildTypicalApplicationEvidenceVerificationPrompt(input.additional_instructions),
+      ),
       component_generation: sha256(buildComponentPrompt(input.additional_instructions)),
       typical_application: sha256(buildTypicalApplicationPrompt(input.additional_instructions)),
     },
+  }
+}
+
+interface PrimaryEvidenceExtraction {
+  component_evidence: ComponentEvidence
+  component_evidence_text: string
+  footprint_plan: FootprintPlan
+  footprint_plan_text: string
+  typical_application_plan: TypicalApplicationPlan
+  typical_application_plan_text: string
+}
+
+async function clearPrimaryEvidenceArtifacts(job_dir: string): Promise<void> {
+  await Promise.all([
+    rm(join(job_dir, "component-evidence.json"), { force: true }),
+    rm(join(job_dir, "footprint-plan.json"), { force: true }),
+    rm(join(job_dir, "typical-application-plan.json"), { force: true }),
+    rm(join(job_dir, "visual-reference", "land-pattern.png"), { force: true }),
+    rm(join(job_dir, "visual-reference", "typical-application.png"), { force: true }),
+    rm(join(job_dir, "visual-reference", "pages"), { recursive: true, force: true }),
+  ])
+}
+
+function canRetryEvidenceFailure(error: unknown): boolean {
+  if (error instanceof JobCancelledError) return false
+  const message = error instanceof Error ? error.message : String(error)
+  return !/modified index\.circuit\.tsx|created circuit TSX/i.test(message)
+}
+
+async function extractPrimaryEvidenceAttempt(input: {
+  context: JobRunnerContext
+  job_dir: string
+  signal: AbortSignal
+  append: StreamProcessInput["on_chunk"]
+  additional_instructions?: string
+  retry_feedback?: string
+  protected_event_log_file: string
+  published_event_log_file: string
+  starter_component_code?: string
+  attempt: number
+}): Promise<PrimaryEvidenceExtraction> {
+  if (input.attempt > 1) await clearPrimaryEvidenceArtifacts(input.job_dir)
+  const component_path = join(input.job_dir, "index.circuit.tsx")
+  const events = await runStructuredAgentPhase({
+    context: input.context,
+    prompt: buildAgentPrompt(input.additional_instructions, input.retry_feedback),
+    cwd: input.job_dir,
+    signal: input.signal,
+    append: input.append,
+    event_log_file: input.protected_event_log_file,
+    event_publish_file: input.published_event_log_file,
+    event_phase: `primary_evidence_attempt_${input.attempt}`,
+  })
+  throwIfCancelled(input.signal)
+  const component_after_evidence = await readFile(component_path, "utf8").catch(() => undefined)
+  if (component_after_evidence !== input.starter_component_code) {
+    if (input.starter_component_code === undefined) await rm(component_path, { force: true })
+    else await Bun.write(component_path, input.starter_component_code)
+    throw new Error("The evidence phase modified index.circuit.tsx before evidence approval")
+  }
+  if (await Bun.file(join(input.job_dir, "typical-application.circuit.tsx")).exists()) {
+    await rm(join(input.job_dir, "typical-application.circuit.tsx"), { force: true })
+    throw new Error("The evidence phase created circuit TSX before evidence approval")
+  }
+
+  const component_evidence_text = await readFile(join(input.job_dir, "component-evidence.json"), "utf8")
+  const component_evidence = parseComponentEvidence(JSON.parse(component_evidence_text) as unknown)
+  const typical_application_plan_raw_text = await readFile(
+    join(input.job_dir, "typical-application-plan.json"),
+    "utf8",
+  )
+  const typical_application_plan = parseTypicalApplicationPlan(
+    JSON.parse(typical_application_plan_raw_text) as unknown,
+    component_evidence.part_number.value,
+  )
+  const typical_application_plan_text = `${JSON.stringify(typical_application_plan, null, 2)}\n`
+  if (typical_application_plan_text !== typical_application_plan_raw_text) {
+    await Bun.write(join(input.job_dir, "typical-application-plan.json"), typical_application_plan_text)
+  }
+  await validateAgentImageReads({
+    job_dir: input.job_dir,
+    events,
+    expected_images: [
+      "visual-reference/land-pattern.png",
+      ...(typical_application_plan.availability === "documented"
+        ? ["visual-reference/typical-application.png"]
+        : []),
+    ],
+  })
+  const footprint_plan = createFootprintPlanFromEvidence(component_evidence)
+  const footprint_plan_text = `${JSON.stringify(footprint_plan, null, 2)}\n`
+  await Bun.write(join(input.job_dir, "footprint-plan.json"), footprint_plan_text)
+  const blocking_reasons = [
+    ...getComponentEvidenceBlockingReasons(component_evidence),
+    ...getFootprintEvidenceErrors(component_evidence, footprint_plan),
+  ]
+  if (blocking_reasons.length > 0) {
+    throw new AutomatedConversionUnavailableError(
+      `Evidence extraction remained unresolved: ${blocking_reasons.join("; ")}`,
+    )
+  }
+  return {
+    component_evidence,
+    component_evidence_text,
+    footprint_plan,
+    footprint_plan_text,
+    typical_application_plan,
+    typical_application_plan_text,
   }
 }
 
@@ -938,6 +1640,9 @@ export async function runJob(
     context.job_store.updateJob(input.job_id, { validation })
   }
   let active_validation_phase: "evidence" | "component_generation" | "application_generation" = "evidence"
+  const protected_event_directory = await mkdtemp(join(tmpdir(), "datasheet-agent-events-"))
+  const protected_event_log_file = join(protected_event_directory, "agent-events.jsonl")
+  const published_event_log_file = join(job_dir, "agent-events.jsonl")
 
   try {
     throwIfCancelled(cancellation_signal)
@@ -957,92 +1662,160 @@ export async function runJob(
 
     const component_path = join(job_dir, "index.circuit.tsx")
     const starter_component_code = await readFile(component_path, "utf8").catch(() => undefined)
-    const evidence_events = await runStructuredAgentPhase({
-      context,
-      prompt: buildAgentPrompt(input.additional_instructions),
-      cwd: job_dir,
-      signal: cancellation_signal,
-      append,
-      event_log_file: join(job_dir, "agent-events.jsonl"),
-      event_phase: "primary_evidence",
-    })
-    throwIfCancelled(cancellation_signal)
-    const component_after_evidence = await readFile(component_path, "utf8").catch(() => undefined)
-    if (component_after_evidence !== starter_component_code) {
-      if (starter_component_code === undefined) await rm(component_path, { force: true })
-      else await Bun.write(component_path, starter_component_code)
-      throw new Error("The evidence phase modified index.circuit.tsx before evidence approval")
-    }
-    if (await Bun.file(join(job_dir, "typical-application.circuit.tsx")).exists()) {
-      throw new Error("The evidence phase created circuit TSX before evidence approval")
-    }
     const component_evidence_path = join(job_dir, "component-evidence.json")
     const component_schematic_plan_path = join(job_dir, "component-schematic-plan.json")
     const typical_application_plan_path = join(job_dir, "typical-application-plan.json")
     const footprint_plan_path = join(job_dir, "footprint-plan.json")
-    const component_evidence_text = await readFile(component_evidence_path, "utf8")
-    const component_evidence = parseComponentEvidence(JSON.parse(component_evidence_text) as unknown)
-    const typical_application_plan_text = await readFile(typical_application_plan_path, "utf8")
-    const typical_application_plan = parseTypicalApplicationPlan(
-      JSON.parse(typical_application_plan_text) as unknown,
-    )
-    await validateAgentImageReads({
-      job_dir,
-      events: evidence_events,
-      expected_images: [
-        "visual-reference/land-pattern.png",
-        ...(typical_application_plan.availability === "documented"
-          ? ["visual-reference/typical-application.png"]
-          : []),
-      ],
-    })
-    const land_pattern_reference_path = join(job_dir, "visual-reference/land-pattern.png")
-    const application_reference_path = join(job_dir, "visual-reference/typical-application.png")
-    const [land_pattern_reference, application_reference] = await Promise.all([
-      readFile(land_pattern_reference_path),
-      readFile(application_reference_path).catch(() => undefined),
-    ])
-    const footprint_plan_text = await readFile(footprint_plan_path, "utf8")
-    const footprint_plan = parseFootprintPlan(JSON.parse(footprint_plan_text) as unknown)
-    const primary_evidence_errors = [
-      ...getComponentEvidenceBlockingReasons(component_evidence),
-      ...getFootprintEvidenceErrors(component_evidence, footprint_plan),
-    ]
-    if (primary_evidence_errors.length > 0) {
-      updateValidation({ evidence: "human_review_required" })
-      throw new Error(`Primary datasheet evidence requires review: ${primary_evidence_errors.join("; ")}`)
+    let primary_evidence: PrimaryEvidenceExtraction | undefined
+    let primary_retry_feedback: string | undefined
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        primary_evidence = await extractPrimaryEvidenceAttempt({
+          context,
+          job_dir,
+          signal: cancellation_signal,
+          append,
+          additional_instructions: input.additional_instructions,
+          retry_feedback: primary_retry_feedback,
+          protected_event_log_file,
+          published_event_log_file,
+          starter_component_code,
+          attempt,
+        })
+        await retainEvidenceAttemptArtifacts({
+          source_dir: job_dir,
+          job_dir,
+          kind: "primary",
+          attempt,
+        })
+        break
+      } catch (error) {
+        await retainEvidenceAttemptArtifacts({
+          source_dir: job_dir,
+          job_dir,
+          kind: "primary",
+          attempt,
+          error,
+        })
+        const evidence_available = await Bun.file(component_evidence_path).exists()
+        context.job_store.updateJob(input.job_id, { evidence_available })
+        if (attempt < 2 && canRetryEvidenceFailure(error)) {
+          const reason = error instanceof Error ? error.message : String(error)
+          primary_retry_feedback = reason
+          await append(
+            "system",
+            `Evidence attempt ${attempt} was incomplete (${reason}). Retrying automatically with a clean evidence workspace…\n`,
+          )
+          continue
+        }
+        if (canRetryEvidenceFailure(error) && !(error instanceof AutomatedConversionUnavailableError)) {
+          const reason = error instanceof Error ? error.message : String(error)
+          throw new AutomatedConversionUnavailableError(
+            `Automatic evidence extraction could not complete after ${attempt} attempt(s): ${reason}`,
+          )
+        }
+        throw error
+      }
     }
+    if (!primary_evidence) {
+      throw new AutomatedConversionUnavailableError("Automatic evidence extraction produced no usable result")
+    }
+    context.job_store.updateJob(input.job_id, { evidence_available: true })
+    const {
+      component_evidence,
+      component_evidence_text,
+      footprint_plan,
+      footprint_plan_text,
+      typical_application_plan,
+      typical_application_plan_text,
+    } = primary_evidence
 
     throwIfCancelled(cancellation_signal)
     await append(
       "system",
       "\nRunning an independent extraction pass; critical evidence must agree before code generation…\n",
     )
-    const independently_verified = await extractIndependentComponentEvidence({
-      context,
-      job_dir,
-      signal: cancellation_signal,
-      append,
-    })
-    const agreement_errors = [
-      ...getComponentEvidenceBlockingReasons(independently_verified.component_evidence),
-      ...getFootprintEvidenceErrors(
-        independently_verified.component_evidence,
-        independently_verified.footprint_plan,
-      ),
-      ...getIndependentComponentEvidenceErrors(component_evidence, independently_verified.component_evidence),
-      ...getTypicalApplicationPlanAgreementErrors(
-        typical_application_plan,
-        independently_verified.application_plan,
-      ),
-    ]
-    if (agreement_errors.length > 0) {
-      updateValidation({ evidence: "human_review_required" })
-      throw new Error(`Independent datasheet evidence disagrees: ${agreement_errors.join("; ")}`)
+    let independent_evidence_approved = false
+    let independent_retry_feedback: string | undefined
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        const independently_verified = await extractIndependentComponentEvidence({
+          context,
+          job_dir,
+          signal: cancellation_signal,
+          append,
+          additional_instructions: input.additional_instructions,
+          retry_feedback: independent_retry_feedback,
+          protected_event_log_file,
+          published_event_log_file,
+          attempt,
+        })
+        const intrinsic_errors = [
+          ...getComponentEvidenceBlockingReasons(independently_verified.component_evidence),
+          ...getFootprintEvidenceErrors(
+            independently_verified.component_evidence,
+            independently_verified.footprint_plan,
+          ),
+        ]
+        const comparison_errors = [
+          ...getIndependentComponentEvidenceErrors(
+            component_evidence,
+            independently_verified.component_evidence,
+          ),
+          ...getTypicalApplicationPlanAgreementErrors(
+            typical_application_plan,
+            independently_verified.application_plan,
+            component_evidence.part_number.value,
+          ),
+        ]
+        const agreement_errors = [...intrinsic_errors, ...comparison_errors]
+        if (agreement_errors.length === 0) {
+          independent_evidence_approved = true
+          break
+        }
+        if (attempt < 2) {
+          // Preserve independence: only return defects found within this extraction.
+          // Cross-extraction differences are logged, but the next verifier must
+          // perform another fresh read rather than being told the primary answer.
+          independent_retry_feedback = intrinsic_errors.length > 0 ? intrinsic_errors.join("; ") : undefined
+          await append(
+            "system",
+            `Independent evidence attempt ${attempt} did not converge (${agreement_errors.join("; ")}). Retrying with another independent verification…\n`,
+          )
+          continue
+        }
+        throw new AutomatedConversionUnavailableError(
+          `Independent datasheet evidence did not converge automatically: ${agreement_errors.join("; ")}`,
+        )
+      } catch (error) {
+        if (attempt < 2 && canRetryEvidenceFailure(error)) {
+          const reason = error instanceof Error ? error.message : String(error)
+          independent_retry_feedback = reason
+          await append(
+            "system",
+            `Independent evidence attempt ${attempt} could not complete (${reason}). Retrying verification automatically…\n`,
+          )
+          continue
+        }
+        if (canRetryEvidenceFailure(error) && !(error instanceof AutomatedConversionUnavailableError)) {
+          const reason = error instanceof Error ? error.message : String(error)
+          throw new AutomatedConversionUnavailableError(
+            `Independent evidence extraction could not complete after ${attempt} attempt(s): ${reason}`,
+          )
+        }
+        throw error
+      }
+    }
+    if (!independent_evidence_approved) {
+      updateValidation({ evidence: "unresolved" })
+      throw new AutomatedConversionUnavailableError(
+        "Independent datasheet evidence produced no automatically approved result",
+      )
     }
     const component_schematic_plan = createComponentSchematicPlan(component_evidence)
     const component_schematic_plan_text = `${JSON.stringify(component_schematic_plan, null, 2)}\n`
     await Bun.write(component_schematic_plan_path, component_schematic_plan_text)
+    const locked_visual_references = await snapshotProtectedTree(join(job_dir, "visual-reference"))
     updateValidation({ evidence: "passed" })
     await append(
       "system",
@@ -1054,33 +1827,41 @@ export async function runJob(
     await append("system", "\nGenerating the component from approved evidence only…\n")
     let evidence_files_modified = false
     let component_events: TrustedAgentEvent[] = []
+    const component_workspace = await prepareGenerationWorkspace(job_dir, "component")
     try {
       component_events = await runStructuredAgentPhase({
         context,
         prompt: buildComponentPrompt(input.additional_instructions),
-        cwd: job_dir,
+        cwd: component_workspace.directory,
         signal: cancellation_signal,
         append,
-        event_log_file: join(job_dir, "agent-events.jsonl"),
+        event_log_file: protected_event_log_file,
+        event_publish_file: published_event_log_file,
         event_phase: "component_generation",
       })
     } finally {
+      try {
+        if (await generationWorkspaceWasModified(component_workspace)) {
+          evidence_files_modified = true
+        }
+        await publishGenerationWorkspace(component_workspace, job_dir, "component")
+      } finally {
+        await rm(component_workspace.directory, { recursive: true, force: true })
+      }
       const [
         current_evidence,
         current_schematic_plan,
         current_footprint,
         current_application_plan,
-        land_reference_modified,
-        application_reference_modified,
+        visual_references_modified,
       ] = await Promise.all([
         readFile(component_evidence_path, "utf8").catch(() => undefined),
         readFile(component_schematic_plan_path, "utf8").catch(() => undefined),
         readFile(footprint_plan_path, "utf8").catch(() => undefined),
         readFile(typical_application_plan_path, "utf8").catch(() => undefined),
-        restoreProtectedBytes(land_pattern_reference_path, land_pattern_reference),
-        restoreProtectedBytes(application_reference_path, application_reference),
+        restoreProtectedTree(join(job_dir, "visual-reference"), locked_visual_references),
       ])
-      if (land_reference_modified || application_reference_modified) evidence_files_modified = true
+      if (visual_references_modified) evidence_files_modified = true
       if (current_evidence !== component_evidence_text) {
         evidence_files_modified = true
         await Bun.write(component_evidence_path, component_evidence_text)
@@ -1115,7 +1896,9 @@ export async function runJob(
     })
     if (component_visual_inspection.status !== "passed") {
       updateValidation({ component_visual: "inconclusive" })
-      throw new Error("Component visual inspection is inconclusive and requires review")
+      throw new VisualInspectionInconclusiveError(
+        "Component image inspection could not be completed automatically",
+      )
     }
     updateValidation({ component_visual: "passed" })
     const component_code = await readFile(component_path, "utf8")
@@ -1250,17 +2033,27 @@ export async function runJob(
     await append("system", "\nStarting the typical-application phase after the component-ready milestone…\n")
     let protected_files_modified = false
     let application_events: TrustedAgentEvent[] = []
+    const application_workspace = await prepareGenerationWorkspace(job_dir, "application")
     try {
       application_events = await runStructuredAgentPhase({
         context,
         prompt: buildTypicalApplicationPrompt(input.additional_instructions),
-        cwd: job_dir,
+        cwd: application_workspace.directory,
         signal: cancellation_signal,
         append,
-        event_log_file: join(job_dir, "agent-events.jsonl"),
+        event_log_file: protected_event_log_file,
+        event_publish_file: published_event_log_file,
         event_phase: "typical_application_generation",
       })
     } finally {
+      try {
+        if (await generationWorkspaceWasModified(application_workspace)) {
+          protected_files_modified = true
+        }
+        await publishGenerationWorkspace(application_workspace, job_dir, "application")
+      } finally {
+        await rm(application_workspace.directory, { recursive: true, force: true })
+      }
       const [
         current_component_code,
         current_component_snapshot,
@@ -1268,8 +2061,7 @@ export async function runJob(
         current_schematic_plan_text,
         current_plan_text,
         current_footprint_text,
-        land_reference_modified,
-        application_reference_modified,
+        visual_references_modified,
       ] = await Promise.all([
         readFile(component_path, "utf8").catch(() => undefined),
         readFile(component_snapshot_path, "utf8").catch(() => undefined),
@@ -1277,10 +2069,9 @@ export async function runJob(
         readFile(component_schematic_plan_path, "utf8").catch(() => undefined),
         readFile(typical_application_plan_path, "utf8").catch(() => undefined),
         readFile(footprint_plan_path, "utf8").catch(() => undefined),
-        restoreProtectedBytes(land_pattern_reference_path, land_pattern_reference),
-        restoreProtectedBytes(application_reference_path, application_reference),
+        restoreProtectedTree(join(job_dir, "visual-reference"), locked_visual_references),
       ])
-      if (land_reference_modified || application_reference_modified) protected_files_modified = true
+      if (visual_references_modified) protected_files_modified = true
       if (current_component_code !== component_code) {
         const server_published_component = context.job_store.getJob(input.job_id)?.component_code
         if (current_component_code !== server_published_component) protected_files_modified = true
@@ -1347,7 +2138,9 @@ export async function runJob(
     })
     if (application_visual_inspection.status !== "passed") {
       updateValidation({ application_visual: "inconclusive" })
-      throw new Error("Typical-application visual inspection is inconclusive and requires review")
+      throw new VisualInspectionInconclusiveError(
+        "Typical-application image inspection could not be completed automatically",
+      )
     }
     updateValidation({ application_visual: "passed" })
 
@@ -1374,15 +2167,13 @@ export async function runJob(
     }
     updateValidation({ application_build: "passed" })
     const typical_application_circuit_json = typical_application_build.circuit_json
-    const application_schematic_errors = getApplicationSchematicErrors(typical_application_circuit_json)
-    if (application_schematic_errors.length > 0) {
-      updateValidation({ application_schematic: "failed" })
-      context.job_store.updateJob(input.job_id, {
-        typical_application_code,
-        typical_application_circuit_json,
-      })
-      throw new Error(
-        `Typical application failed schematic layout validation: ${application_schematic_errors.join("; ")}`,
+    const application_schematic_advisories = getApplicationSchematicLayoutAdvisories(
+      typical_application_circuit_json,
+    )
+    if (application_schematic_advisories.length > 0) {
+      await append(
+        "system",
+        `Schematic layout advisory (accepted because build, image, and connectivity validation are authoritative): ${application_schematic_advisories.join("; ")}\n`,
       )
     }
     updateValidation({ application_schematic: "passed" })
@@ -1438,7 +2229,15 @@ export async function runJob(
       return
     }
     const error_message = error instanceof Error ? error.message : String(error)
-    const failed_status = error instanceof VisualInspectionInconclusiveError ? "inconclusive" : "failed"
+    const automatic_stop =
+      error instanceof AutomatedConversionUnavailableError ||
+      error instanceof VisualInspectionInconclusiveError
+    const failed_status =
+      error instanceof VisualInspectionInconclusiveError
+        ? "inconclusive"
+        : automatic_stop
+          ? "unresolved"
+          : "failed"
     if (active_validation_phase === "evidence" && validation.evidence === "pending") {
       updateValidation({ evidence: failed_status })
     } else if (
@@ -1454,13 +2253,20 @@ export async function runJob(
     ) {
       updateValidation({ application_visual: failed_status })
     }
-    await append("system", `\nConversion failed: ${error_message}\n`).catch(() => undefined)
+    await append(
+      "system",
+      automatic_stop
+        ? `\nAutomatic conversion stopped safely: ${error_message}\n`
+        : `\nConversion failed: ${error_message}\n`,
+    ).catch(() => undefined)
     context.job_store.updateJob(input.job_id, {
-      display_status: "failed",
+      display_status: automatic_stop ? "unsupported" : "failed",
       is_complete: true,
-      has_errors: true,
+      has_errors: !automatic_stop,
       completed_at: new Date().toISOString(),
       error_message,
     })
+  } finally {
+    await rm(protected_event_directory, { recursive: true, force: true }).catch(() => undefined)
   }
 }

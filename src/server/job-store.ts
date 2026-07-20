@@ -9,6 +9,7 @@ type JobListSubscriber = (job_event: JobListEvent) => void
 interface JobRecord extends Job {
   job_dir: string
   additional_instructions?: string
+  retry_source_job_id?: string
   cancellation_controller: AbortController
   subscriber_set: Set<JobSubscriber>
 }
@@ -27,6 +28,7 @@ export interface CreateJobInput {
   job_dir: string
   file_name: string
   additional_instructions?: string
+  retry_source_job_id?: string
 }
 
 export interface RestoreJobInput extends CreateJobInput {
@@ -44,6 +46,7 @@ export interface RestoreJobInput extends CreateJobInput {
   typical_application_circuit_json?: Job["typical_application_circuit_json"]
   validation?: Job["validation"]
   provenance?: Job["provenance"]
+  evidence_available?: boolean
 }
 
 export type JobUpdate = Partial<
@@ -61,6 +64,7 @@ export type JobUpdate = Partial<
     | "typical_application_circuit_json"
     | "validation"
     | "provenance"
+    | "evidence_available"
   >
 >
 
@@ -82,6 +86,7 @@ function getPublicJob(job_record: JobRecord): Job {
     typical_application_circuit_json: job_record.typical_application_circuit_json,
     validation: job_record.validation,
     provenance: job_record.provenance,
+    evidence_available: job_record.evidence_available,
   }
 }
 
@@ -108,6 +113,7 @@ export class JobStore {
       job_dir: input.job_dir,
       file_name: input.file_name,
       additional_instructions: input.additional_instructions,
+      retry_source_job_id: input.retry_source_job_id,
       created_at: new Date().toISOString(),
       display_status: "queued",
       is_complete: false,
@@ -161,6 +167,13 @@ export class JobStore {
       additional_instructions: job_record.additional_instructions,
       display_status: job_record.display_status,
     }
+  }
+
+  getActiveRetryForSource(source_job_id: string): Job | undefined {
+    const retry = [...this.job_map.values()]
+      .reverse()
+      .find((job_record) => job_record.retry_source_job_id === source_job_id && !job_record.is_complete)
+    return retry ? getPublicJob(retry) : undefined
   }
 
   getCancellationSignal(job_id: string): AbortSignal | undefined {
@@ -257,9 +270,11 @@ export class JobStore {
           has_errors: job_record.has_errors,
           error_message: job_record.error_message,
           additional_instructions: job_record.additional_instructions,
+          retry_source_job_id: job_record.retry_source_job_id,
           component_ready: job_record.component_ready,
           validation: job_record.validation,
           provenance: job_record.provenance,
+          evidence_available: job_record.evidence_available,
         },
         null,
         2,

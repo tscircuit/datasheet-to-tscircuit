@@ -15,25 +15,28 @@ export type ComponentPreviewTab = Extract<TabId, "code" | "pcb" | "schematic">
 function EmptyPreview({ job, artifact }: { job: Job; artifact: ComponentArtifact }) {
   const is_application = artifact === "typical_application"
   const is_cancelled = job.display_status === "cancelled"
+  const is_unsupported = job.display_status === "unsupported"
   const is_terminal = job.has_errors || is_cancelled || job.is_complete
   const title = is_application ? "Typical application" : "Component preview"
   const copy = is_cancelled
     ? `This conversion was cancelled before the ${is_application ? "typical application" : "component preview"} was built.`
-    : job.has_errors
-      ? (job.error_message ?? `The agent could not build the ${title.toLowerCase()}.`)
-      : job.is_complete
-        ? `No ${title.toLowerCase()} artifact is available for this task.`
-        : is_application
-          ? job.component_ready
-            ? "The component is ready. The agent is now creating and verifying the datasheet's typical application."
-            : "The typical application will start after the reusable component passes its build milestone."
-          : job.display_status === "building"
-            ? "Compiling TSX into Circuit JSON…"
-            : "The preview will appear as soon as the component builds."
+    : is_unsupported
+      ? (job.error_message ?? "This datasheet could not be converted automatically without guessing.")
+      : job.has_errors
+        ? (job.error_message ?? `The agent could not build the ${title.toLowerCase()}.`)
+        : job.is_complete
+          ? `No ${title.toLowerCase()} artifact is available for this task.`
+          : is_application
+            ? job.component_ready
+              ? "The component is ready. The agent is now creating and verifying the datasheet's typical application."
+              : "The typical application will start after the reusable component passes its build milestone."
+            : job.display_status === "building"
+              ? "Compiling TSX into Circuit JSON…"
+              : "The preview will appear as soon as the component builds."
 
   return (
     <div
-      className={`empty-preview ${job.has_errors ? "preview-error" : ""} ${is_cancelled ? "preview-cancelled" : ""}`}
+      className={`empty-preview ${job.has_errors ? "preview-error" : ""} ${is_cancelled ? "preview-cancelled" : ""} ${is_unsupported ? "preview-unsupported" : ""}`}
     >
       <span className="preview-loader-ring">
         {is_terminal ? <Boxes size={27} /> : <LoaderCircle className="spin" size={27} />}
@@ -41,11 +44,13 @@ function EmptyPreview({ job, artifact }: { job: Job; artifact: ComponentArtifact
       <strong>
         {is_cancelled
           ? "Conversion cancelled"
-          : job.has_errors
-            ? `${title} unavailable`
-            : is_application
-              ? "Preparing typical application"
-              : "Preparing component preview"}
+          : is_unsupported
+            ? "Automatic conversion unavailable"
+            : job.has_errors
+              ? `${title} unavailable`
+              : is_application
+                ? "Preparing typical application"
+                : "Preparing component preview"}
       </strong>
       <p>{copy}</p>
       {!is_terminal && (

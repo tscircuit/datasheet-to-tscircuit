@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import type { Job, JobEvent, JobListEvent, JobSummary } from "@/shared/job-types"
 import { cancelJob, deleteJob, getJob, getJobs, retryJob } from "./api"
 
@@ -44,6 +44,7 @@ export function useActiveJob() {
   const [action_error, setActionError] = useState<string>()
   const [cancelling_job_ids, setCancellingJobIds] = useState<Set<string>>(new Set())
   const [retrying_job_ids, setRetryingJobIds] = useState<Set<string>>(new Set())
+  const retrying_job_id_ref = useRef(new Set<string>())
   const [deleting_job_ids, setDeletingJobIds] = useState<Set<string>>(new Set())
 
   useEffect(() => {
@@ -158,7 +159,8 @@ export function useActiveJob() {
   }
 
   const retryTask = async (target_job_id: string) => {
-    if (retrying_job_ids.has(target_job_id)) return
+    if (retrying_job_id_ref.current.has(target_job_id)) return
+    retrying_job_id_ref.current.add(target_job_id)
     setRetryingJobIds((current_ids) => new Set(current_ids).add(target_job_id))
     setActionError(undefined)
     try {
@@ -166,6 +168,7 @@ export function useActiveJob() {
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "The task could not be retried.")
     } finally {
+      retrying_job_id_ref.current.delete(target_job_id)
       setRetryingJobIds((current_ids) => {
         const next_ids = new Set(current_ids)
         next_ids.delete(target_job_id)

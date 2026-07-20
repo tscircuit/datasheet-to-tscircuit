@@ -39,6 +39,60 @@ function verifiedCircuit(
   ]
 }
 
+test("model previews never expose server benchmark-stub simulations", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-model-stub-preview-"))
+  const model_dir = join(job_dir, "spice")
+  const benchmark_dir = join(model_dir, "benchmarks")
+  const evidence_dir = join(model_dir, "evidence", "curves")
+  const output_dir = join(job_dir, "dist", "spice", "benchmarks", "startup")
+  await Promise.all([
+    mkdir(benchmark_dir, { recursive: true }),
+    mkdir(evidence_dir, { recursive: true }),
+    mkdir(output_dir, { recursive: true }),
+  ])
+  await Promise.all([
+    Bun.write(join(benchmark_dir, "startup.circuit.tsx"), "export default () => <board />\n"),
+    Bun.write(join(evidence_dir, "startup.csv"), "x,y\n0,0\n1,3.3\n"),
+    Bun.write(
+      join(model_dir, "benchmarks.json"),
+      JSON.stringify({
+        version: 1,
+        benchmarks: [
+          {
+            id: "startup",
+            title: "Startup",
+            reference_file: "evidence/curves/startup.csv",
+            simulation: {
+              kind: "transient_voltage",
+              x_axis: "time_ms",
+              probe_name: "RESULT",
+              dut_spice_node: "OUT",
+            },
+          },
+        ],
+      }),
+    ),
+    Bun.write(
+      join(output_dir, "circuit.json"),
+      JSON.stringify(
+        verifiedCircuit(
+          ".SUBCKT SERVER_BENCHMARK_STUB IN OUT\nR1 IN OUT 1G\n.ENDS SERVER_BENCHMARK_STUB\n",
+          "RESULT",
+          "stub",
+          [0, 1e-10],
+        ),
+      ),
+    ),
+  ])
+
+  const preview = await loadModelSelectedPreview({ model_dir, benchmark_id: "startup" })
+  expect(preview?.circuit_preview?.build_status).toBe("source_ready")
+  expect(preview?.circuit_preview?.circuit_json).toBeUndefined()
+  expect(preview?.reference_preview?.result_points).toBeUndefined()
+
+  await rm(job_dir, { recursive: true, force: true })
+})
+
 test("model previews read persisted Circuit JSON and never rerun TSX on selection", async () => {
   const job_dir = await mkdtemp(join(tmpdir(), "datasheet-model-artifacts-"))
   const model_dir = join(job_dir, "spice")

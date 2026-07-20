@@ -699,7 +699,11 @@ if (attempt === 2 && prompt.includes("must connect directly to a DUT port")) {
   await Bun.write(dir + "/../benchmark-feedback-seen.txt", "yes")
 }
 if (attempt === 3 && prompt.includes("Shorted voltage source V1")) {
+  if (await Bun.file(dir + "/../dist/spice/benchmarks/transfer/circuit.json").exists()) {
+    throw new Error("server benchmark-stub output leaked into the model preview workspace")
+  }
   await Bun.write(dir + "/../benchmark-preflight-feedback-seen.txt", "yes")
+  await Bun.write(dir + "/../benchmark-preflight-output-cleaned.txt", "yes")
 }
 await mkdir(dir + "/benchmarks", { recursive: true })
 await mkdir(dir + "/evidence/curves", { recursive: true })
@@ -756,6 +760,7 @@ await Bun.write(output + "/circuit.json", JSON.stringify(circuit))
   expect(await Bun.file(join(job_dir, "benchmark-correction-attempt.txt")).text()).toBe("3")
   expect(await Bun.file(join(job_dir, "benchmark-feedback-seen.txt")).text()).toBe("yes")
   expect(await Bun.file(join(job_dir, "benchmark-preflight-feedback-seen.txt")).text()).toBe("yes")
+  expect(await Bun.file(join(job_dir, "benchmark-preflight-output-cleaned.txt")).text()).toBe("yes")
   expect(await Bun.file(join(job_dir, ".model-benchmark-lock", "lock.json")).exists()).toBe(true)
   expect(
     model_run_store

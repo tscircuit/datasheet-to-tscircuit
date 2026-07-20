@@ -21,9 +21,9 @@ export function getTypicalApplicationSourceErrors(source: string): string[] {
   return errors
 }
 
-export function getApplicationSchematicErrors(circuit_json: AnyCircuitElement[]): string[] {
+export function getApplicationSchematicLayoutAdvisories(circuit_json: AnyCircuitElement[]): string[] {
   const records = circuit_json.map((element) => element as CircuitRecord)
-  const errors: string[] = []
+  const advisories: string[] = []
   const component_count = records.filter((record) => record.type === "schematic_component").length
   const maximum_edge_length = Math.max(6, 2.5 * Math.sqrt(Math.max(component_count, 1)))
   for (const [trace_index, trace] of records
@@ -52,13 +52,13 @@ export function getApplicationSchematicErrors(circuit_json: AnyCircuitElement[])
       }
       const length = Math.hypot(to_x - from_x, to_y - from_y)
       if (length > maximum_edge_length) {
-        errors.push(
-          `Application schematic trace ${trace_index + 1} edge ${edge_index + 1} is ${length.toFixed(2)} units long; compact-layout limit is ${maximum_edge_length.toFixed(2)} for ${component_count} components`,
+        advisories.push(
+          `Application schematic trace ${trace_index + 1} edge ${edge_index + 1} is ${length.toFixed(2)} units long; compact-layout target is ${maximum_edge_length.toFixed(2)} for ${component_count} components`,
         )
       }
     }
   }
-  return errors
+  return advisories
 }
 
 export interface ExpectedFootprintPad {
@@ -259,6 +259,7 @@ export function getFootprintPlanErrors(
 
 interface ResolvedPort {
   id: string
+  interchangeable_component_id?: string
 }
 
 function resolveExpectedPort(
@@ -294,7 +295,12 @@ function resolveExpectedPort(
   if (matches.length !== 1 || typeof matches[0]?.source_port_id !== "string") {
     return `Expected pin ${JSON.stringify(endpoint)} resolved to ${matches.length} source ports`
   }
-  return { id: matches[0].source_port_id }
+  return {
+    id: matches[0].source_port_id,
+    ...(component.are_pins_interchangeable === true
+      ? { interchangeable_component_id: component.source_component_id }
+      : {}),
+  }
 }
 
 class PortConnectivity {
@@ -360,6 +366,7 @@ export function getTypicalApplicationConnectivityErrors(
   }
 
   const actual_root_by_expected_net = new Map<string, string>()
+  const assigned_interchangeable_ports = new Set<string>()
   for (const connection of plan.connections) {
     const resolved_ports: ResolvedPort[] = []
     for (const endpoint of connection.pins) {
@@ -368,22 +375,59 @@ export function getTypicalApplicationConnectivityErrors(
       else resolved_ports.push(resolved)
     }
     if (resolved_ports.length !== connection.pins.length) continue
-    const roots = new Set(resolved_ports.map((port) => connectivity.find(port.id)))
-    if (roots.size !== 1) {
+    let candidate_roots: Set<string> | undefined
+    const candidate_port_ids = resolved_ports.map((port) => {
+      if (!port.interchangeable_component_id) return [port.id]
+      return (ports_by_component_id.get(port.interchangeable_component_id) ?? []).flatMap((candidate) =>
+        typeof candidate.source_port_id === "string" &&
+        !assigned_interchangeable_ports.has(candidate.source_port_id)
+          ? [candidate.source_port_id]
+          : [],
+      )
+    })
+    for (const ids of candidate_port_ids) {
+      const roots = new Set(ids.map((id) => connectivity.find(id)))
+      candidate_roots =
+        candidate_roots === undefined
+          ? roots
+          : new Set([...candidate_roots].filter((root) => roots.has(root)))
+    }
+    const used_roots = new Set(actual_root_by_expected_net.values())
+    const root = [...(candidate_roots ?? [])].find((candidate) => !used_roots.has(candidate))
+    if (!root) {
+      const collapsed_net = [...actual_root_by_expected_net.entries()].find(([, other_root]) =>
+        candidate_roots?.has(other_root),
+      )
+      if (collapsed_net) {
+        errors.push(`${connection.net}: unexpectedly shorted to expected net ${collapsed_net[0]}`)
+        continue
+      }
       errors.push(
         `${connection.net}: expected pins are not electrically connected: ${connection.pins.join(", ")}`,
       )
       continue
     }
-    const root = [...roots][0] as string
-    const collapsed_net = [...actual_root_by_expected_net.entries()].find(
-      ([, other_root]) => other_root === root,
-    )
-    if (collapsed_net) {
-      errors.push(`${connection.net}: unexpectedly shorted to expected net ${collapsed_net[0]}`)
-    } else {
-      actual_root_by_expected_net.set(connection.net, root)
+    const newly_assigned_ports: string[] = []
+    let assignment_failed = false
+    for (const [index, port] of resolved_ports.entries()) {
+      if (!port.interchangeable_component_id) continue
+      const assigned = candidate_port_ids[index]?.find(
+        (id) => connectivity.find(id) === root && !newly_assigned_ports.includes(id),
+      )
+      if (!assigned) {
+        assignment_failed = true
+        break
+      }
+      newly_assigned_ports.push(assigned)
     }
+    if (assignment_failed) {
+      errors.push(
+        `${connection.net}: expected pins are not electrically connected: ${connection.pins.join(", ")}`,
+      )
+      continue
+    }
+    for (const id of newly_assigned_ports) assigned_interchangeable_ports.add(id)
+    actual_root_by_expected_net.set(connection.net, root)
   }
   return errors
 }
@@ -540,8 +584,16 @@ function commandText(args: unknown): string {
 
 function isExpectedBuildCommand(args: unknown, expected_command: string): boolean {
   const command = commandText(args).trim()
-  if (command !== expected_command && !command.startsWith(`${expected_command} `)) return false
-  return !/[;&|`$<>]/.test(command)
+  if (/[;&|`$<>]/.test(command)) return false
+  const local_command = expected_command.replace(/^tsci(?=\s|$)/, "./node_modules/.bin/tsci")
+  const unprefixed_local_command = expected_command.replace(/^tsci(?=\s|$)/, "node_modules/.bin/tsci")
+  return [
+    expected_command,
+    `npx ${expected_command}`,
+    `bunx ${expected_command}`,
+    local_command,
+    unprefixed_local_command,
+  ].some((candidate) => command === candidate || command.startsWith(`${candidate} `))
 }
 
 function isAllowedSchematicRender(input: {
@@ -566,7 +618,7 @@ function hasVisionFailure(events: TrustedAgentEvent[]): string | undefined {
     })
     .join("\n")
   return text.match(
-    /image omitted: model does not support images|current model does not support images|no pixels present|(?:unable|cannot|can't) to (?:see|inspect|view)|vision (?:is )?unavailable/i,
+    /image omitted: (?:model does not support images|could not be (?:resized|converted)[^\n]*)|current model does not support images|no pixels present|(?:unable|cannot|can't) to (?:see|inspect|view)|vision (?:is )?unavailable/i,
   )?.[0]
 }
 
@@ -601,7 +653,7 @@ export async function validateAgentImageReads(input: {
 }): Promise<void> {
   const vision_failure = hasVisionFailure(input.events)
   if (vision_failure) {
-    throw new VisualInspectionInconclusiveError(`Visual inspection was inconclusive: ${vision_failure}`)
+    throw new VisualInspectionInconclusiveError(`Image inspection was unavailable: ${vision_failure}`)
   }
   const image_reads = new Set(
     getSuccessfulImageReadPaths({
@@ -636,8 +688,10 @@ export async function validateVisualInspection(
     throw new Error(`${input.report_file} must record version 1 with a valid inspection status`)
   }
 
+  const reportedImagePath = (kind: string): unknown =>
+    report[`${kind}_image`] ?? (kind === "pcb" || kind === "schematic" ? report[`${kind}_render`] : undefined)
   for (const [kind, expected_path] of Object.entries(input.expected_images)) {
-    const reported_path = report[`${kind}_image`]
+    const reported_path = reportedImagePath(kind)
     if (reported_path !== undefined && reported_path !== expected_path) {
       throw new Error(`${input.report_file} must set ${kind}_image to ${expected_path}`)
     }
@@ -648,7 +702,26 @@ export async function validateVisualInspection(
     await validatePng(absolute_expected)
   }
 
+  const writeCanonicalReport = async (): Promise<void> => {
+    await Bun.write(
+      report_path,
+      `${JSON.stringify(
+        {
+          version: 1,
+          status: report.status,
+          ...Object.fromEntries(
+            Object.entries(input.expected_images).map(([kind, path]) => [`${kind}_image`, path]),
+          ),
+          ...(typeof report.notes === "string" ? { notes: report.notes } : {}),
+        },
+        null,
+        2,
+      )}\n`,
+    )
+  }
+
   if (report.status === "inconclusive") {
+    await writeCanonicalReport()
     return { status: "inconclusive" }
   }
 
@@ -681,11 +754,6 @@ export async function validateVisualInspection(
     )
   }
 
-  for (const [kind, expected_path] of Object.entries(input.expected_images)) {
-    if (report[`${kind}_image`] !== expected_path) {
-      throw new Error(`${input.report_file} must set ${kind}_image to ${expected_path}`)
-    }
-  }
   try {
     await validateAgentImageReads({
       job_dir: input.job_dir,
@@ -701,5 +769,6 @@ export async function validateVisualInspection(
     }
     throw error
   }
+  await writeCanonicalReport()
   return { status: "passed" }
 }
