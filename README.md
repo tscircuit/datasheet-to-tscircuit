@@ -66,9 +66,9 @@ or `TSCI_BIN` to override the discovered local executables.
 
 ## Source organization
 
-The server is organized by responsibility. Top-level server modules such as
-`job-runner.ts` and `model-runner.ts` are small compatibility barrels; the
-implementation lives in a matching directory of named modules.
+The server is organized by responsibility. Each feature directory exposes its
+public surface through `index.ts`, while its implementation lives in named
+operation modules alongside that index.
 
 ```text
 src/

@@ -1,4 +1,4 @@
-export type { BenchmarkLock } from "./model-benchmark-lock/types"
+export type { BenchmarkLock } from "./types"
 export {
   hasBenchmarkManifest,
   hasBenchmarkLock,
@@ -6,4 +6,4 @@ export {
   createOrVerifyBenchmarkLock,
   replaceBenchmarkLockAfterCircuitRepair,
   verifyBenchmarkLock,
-} from "./model-benchmark-lock/benchmark-lock"
+} from "./benchmark-lock"

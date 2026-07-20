@@ -19,7 +19,7 @@ export async function writeModelScaffold(input: { job_dir: string; model_dir: st
     Bun.write(
       join(input.model_dir, "score-benchmarks.ts"),
       `import { scoreModelBenchmarks } from ${JSON.stringify(
-        pathToFileURL(join(serverDirectory, "model-scorer.ts")).href,
+        pathToFileURL(join(serverDirectory, "model-scorer", "index.ts")).href,
       )}\n\nconst resultsDirectory = process.argv[2]\nconst outputFile = process.argv[3] ?? "validation-report.json"\nconst report = await scoreModelBenchmarks(process.cwd(), {\n  results_directory_override: resultsDirectory,\n})\nawait Bun.write(outputFile, \`${"${JSON.stringify(report, null, 2)}"}\\n\`)\nconsole.log(JSON.stringify(report, null, 2))\n`,
     ),
     Bun.write(
@@ -27,10 +27,10 @@ export async function writeModelScaffold(input: { job_dir: string; model_dir: st
       `import { mkdir, readFile } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 import { parseBenchmarkManifest, renderModelBenchmarkComparisonSvg, scoreSingleModelBenchmark } from ${JSON.stringify(
-        pathToFileURL(join(serverDirectory, "model-scorer.ts")).href,
+        pathToFileURL(join(serverDirectory, "model-scorer", "index.ts")).href,
       )}
 import { extractSimulationResultPoints, parseSimulationDefinition } from ${JSON.stringify(
-        pathToFileURL(join(serverDirectory, "model-simulation-validator.ts")).href,
+        pathToFileURL(join(serverDirectory, "model-simulation-validator", "index.ts")).href,
       )}
 
 const benchmarkId = process.argv[2]
