@@ -7,6 +7,7 @@ export type JobDisplayStatus =
   | "cancelling"
   | "cancelled"
   | "complete"
+  | "unsupported"
   | "failed"
 export type JobLogStream = "system" | "stdout" | "stderr"
 
@@ -22,7 +23,7 @@ export type JobValidationStatus =
   | "passed"
   | "failed"
   | "inconclusive"
-  | "human_review_required"
+  | "unresolved"
   | "not_applicable"
 
 export interface JobValidation {
@@ -68,6 +69,7 @@ export interface Job {
   typical_application_circuit_json?: AnyCircuitElement[]
   validation?: JobValidation
   provenance?: JobProvenance
+  evidence_available?: boolean
 }
 
 export type JobSummary = Pick<

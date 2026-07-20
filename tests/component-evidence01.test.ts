@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test"
 import type { AnyCircuitElement } from "circuit-json"
 import {
+  createFootprintPlanFromEvidence,
   getComponentEvidenceBlockingReasons,
   getFootprintEvidenceErrors,
   getIndependentComponentEvidenceErrors,
@@ -65,15 +66,38 @@ function evidence(overrides?: {
 
 test("resolved evidence is source-backed without assuming a package family", () => {
   const parsed = evidence()
+  const derived_plan = createFootprintPlanFromEvidence(parsed)
   expect(getComponentEvidenceBlockingReasons(parsed)).toEqual([])
-  expect(
-    getFootprintEvidenceErrors(parsed, {
-      version: 1,
-      view: "pcb_top",
-      source_references: [{ page: 12 }],
-      pads: parsed.footprint.pads.map(({ sources, ...pad }) => pad),
-    }),
-  ).toEqual([])
+  expect(derived_plan.source_references).toEqual([{ page: 12, figure: "Recommended land pattern" }])
+  expect(derived_plan.pads.every((pad) => !("sources" in pad))).toBe(true)
+  expect(getFootprintEvidenceErrors(parsed, derived_plan)).toEqual([])
+})
+
+test("resolved evidence can retain a non-blocking datasheet discrepancy", () => {
+  const resolved = evidence()
+  resolved.unresolved_ambiguities = [
+    "Marketing prose differs from the order-code-linked package drawing, which controls geometry.",
+  ]
+  expect(getComponentEvidenceBlockingReasons(resolved)).toEqual([])
+})
+
+test("supporting footprint citations do not invalidate matching pad evidence", () => {
+  const parsed = evidence()
+  const plan = createFootprintPlanFromEvidence(parsed)
+  plan.source_references.unshift({ page: 3, figure: "Package selection table" })
+
+  expect(getFootprintEvidenceErrors(parsed, plan)).toEqual([])
+})
+
+test("unresolved evidence can retain partial facts without inventing pad geometry", () => {
+  const partial = JSON.parse(JSON.stringify(evidence()))
+  partial.status = "unresolved"
+  partial.footprint.pads = []
+  partial.unresolved_ambiguities = ["Pad dimensions could not be resolved automatically"]
+  const parsed = parseComponentEvidence(partial)
+
+  expect(parsed.footprint.pads).toEqual([])
+  expect(getComponentEvidenceBlockingReasons(parsed)).toContain("evidence extraction is unresolved")
 })
 
 test("independent extraction catches coordinate and dimension reinterpretation", () => {
@@ -94,13 +118,22 @@ test("exact package codes allow independent human-readable package-name wording"
   ).toEqual([])
 })
 
-test("ordering-code disagreement blocks evidence approval", () => {
+test("packaging-only ordering-code differences do not block otherwise identical evidence", () => {
   expect(
     getIndependentComponentEvidenceErrors(
       evidence({ ordering_code: "GENERIC-2-A" }),
       evidence({ ordering_code: "GENERIC-2-B" }),
     ),
-  ).toContain('ordering code disagrees: "GENERIC-2-A" versus "GENERIC-2-B"')
+  ).toEqual([])
+})
+
+test("part-number disagreement still blocks evidence approval", () => {
+  expect(
+    getIndependentComponentEvidenceErrors(
+      evidence({ part_number: "GENERIC-2" }),
+      evidence({ part_number: "DIFFERENT-2" }),
+    ),
+  ).toContain('part number disagrees: "GENERIC-2" versus "DIFFERENT-2"')
 })
 
 test("independent electrical-role disagreement blocks schematic planning", () => {
@@ -110,6 +143,16 @@ test("independent electrical-role disagreement blocks schematic planning", () =>
   expect(getIndependentComponentEvidenceErrors(primary, independent)).toContain(
     "pin 1 schematic role disagrees: input versus output",
   )
+})
+
+test("passive and other are equivalent for documented switch-node pins", () => {
+  const primary = evidence()
+  const independent = evidence()
+  primary.pinout.pins[0]!.labels = ["L1"]
+  primary.pinout.pins[0]!.role = "passive"
+  independent.pinout.pins[0]!.labels = ["L1"]
+  independent.pinout.pins[0]!.role = "other"
+  expect(getIndependentComponentEvidenceErrors(primary, independent)).toEqual([])
 })
 
 test("pin-table validation checks both physical number and semantic label", () => {
@@ -134,6 +177,33 @@ test("pin-table validation checks both physical number and semantic label", () =
   expect(getPinoutEvidenceErrors(evidence(), circuit)).toEqual([
     "pin 2 labels RETURN are absent from its Circuit JSON port",
   ])
+})
+
+test("pin-table validation preserves every documented alias", () => {
+  const aliased = evidence()
+  aliased.pinout.pins[0]!.labels = ["INPUT", "ENABLE"]
+  const circuit = [
+    {
+      type: "source_port",
+      source_port_id: "p1",
+      source_component_id: "u1",
+      pin_number: 1,
+      name: "INPUT",
+      port_hints: ["1", "INPUT"],
+    },
+    {
+      type: "source_port",
+      source_port_id: "p2",
+      source_component_id: "u1",
+      pin_number: 2,
+      name: "RETURN",
+      port_hints: ["2", "RETURN"],
+    },
+  ] as unknown as AnyCircuitElement[]
+
+  expect(getPinoutEvidenceErrors(aliased, circuit)).toContain(
+    "pin 1 labels INPUT/ENABLE are absent from its Circuit JSON port",
+  )
 })
 
 test("visual evidence must use the deterministic renderer settings", () => {

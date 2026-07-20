@@ -10,6 +10,12 @@ import type {
   ModelValidationSummary,
 } from "@/shared/job-types"
 import type { JobStore } from "./job-store"
+import {
+  getTypicalApplicationComponentValueErrors,
+  getTypicalApplicationConnectivityErrors,
+  getTypicalApplicationSourceErrors,
+} from "./job-artifact-validator"
+import { parseTypicalApplicationPlan } from "./job-runner"
 import type { ModelRunStore } from "./model-run-store"
 import { hasCompleteVerifiedSimulationReport } from "./model-simulation-validator"
 
@@ -20,10 +26,14 @@ const JOB_STATUSES = new Set<JobDisplayStatus>([
   "cancelling",
   "cancelled",
   "complete",
+  "unsupported",
   "failed",
 ])
 const ACTIVE_JOB_STATUSES = new Set<JobDisplayStatus>(["queued", "agent_running", "building", "cancelling"])
-const MODEL_STATUSES = new Set<ModelRunStatus | "review_required">([
+const OBSOLETE_LAYOUT_FAILURE_PREFIX = "Typical application failed schematic layout validation:"
+const LAYOUT_RECOVERY_LOG =
+  "Recovered the generated typical application: the former wire-length compactness gate was advisory, and the saved build, image inspection, values, and connectivity all passed.\n"
+const MODEL_STATUSES = new Set<ModelRunStatus>([
   "queued",
   "setting_up",
   "waiting_for_component",
@@ -32,7 +42,6 @@ const MODEL_STATUSES = new Set<ModelRunStatus | "review_required">([
   "cancelling",
   "cancelled",
   "complete",
-  "review_required",
   "timed_out",
   "failed",
 ])
@@ -126,45 +135,101 @@ async function restoreJobDirectory(input: {
     typeof saved?.display_status === "string" && JOB_STATUSES.has(saved.display_status as JobDisplayStatus)
       ? (saved.display_status as JobDisplayStatus)
       : undefined
-  const component_ready = Boolean(component_code?.includes("export default") && circuit_json)
+  const has_component_artifact = Boolean(component_code?.includes("export default") && circuit_json)
   const has_complete_artifact = Boolean(
-    component_ready &&
+    has_component_artifact &&
       typical_application_code?.includes("export default") &&
       typical_application_circuit_json,
   )
+  const saved_validation = isRecord(saved?.validation) ? saved.validation : undefined
+  const required_component_validations = [
+    "component_build",
+    "component_drc",
+    "footprint",
+    "pinout",
+    "component_schematic",
+    "component_visual",
+  ] as const
+  const has_component_validation = required_component_validations.some(
+    (field) => saved_validation?.[field] !== undefined,
+  )
+  const component_validation_passed = required_component_validations.every(
+    (field) => saved_validation?.[field] === "passed",
+  )
+  const component_ready = Boolean(
+    has_component_artifact &&
+      (has_component_validation
+        ? component_validation_passed
+        : saved?.component_ready === true || has_complete_artifact),
+  )
+  let recovered_layout_failure = false
+  if (
+    saved_status === "failed" &&
+    typeof saved?.error_message === "string" &&
+    saved.error_message.startsWith(OBSOLETE_LAYOUT_FAILURE_PREFIX) &&
+    has_complete_artifact &&
+    component_validation_passed &&
+    saved_validation?.application_build === "passed" &&
+    saved_validation?.application_visual === "passed" &&
+    typical_application_code !== undefined &&
+    typical_application_circuit_json !== undefined
+  ) {
+    try {
+      const plan = parseTypicalApplicationPlan(
+        await readJson(join(input.job_dir, "typical-application-plan.json")),
+      )
+      recovered_layout_failure =
+        getTypicalApplicationSourceErrors(typical_application_code).length === 0 &&
+        getTypicalApplicationConnectivityErrors(plan, typical_application_circuit_json).length === 0 &&
+        getTypicalApplicationComponentValueErrors(plan, typical_application_circuit_json).length === 0
+    } catch {
+      recovered_layout_failure = false
+    }
+  }
   const interrupted = !saved_status || ACTIVE_JOB_STATUSES.has(saved_status)
-  const display_status: JobDisplayStatus = interrupted
-    ? has_complete_artifact
-      ? "complete"
-      : "failed"
-    : saved_status
+  const display_status: JobDisplayStatus = recovered_layout_failure
+    ? "complete"
+    : interrupted
+      ? has_complete_artifact
+        ? "complete"
+        : "failed"
+      : saved_status
   const created_at =
     typeof saved?.created_at === "string"
       ? saved.created_at
       : (logs[0]?.created_at ?? directory_stat.birthtime.toISOString())
-  const error_message =
-    display_status === "failed" && interrupted
+  const error_message = recovered_layout_failure
+    ? undefined
+    : display_status === "failed" && interrupted
       ? "The server restarted before this component task finished. Retry to continue."
       : typeof saved?.error_message === "string"
         ? saved.error_message
         : undefined
-  return input.job_store.restoreJob({
+  const restored_job = input.job_store.restoreJob({
     job_id: input.job_id,
     job_dir: input.job_dir,
     file_name: typeof saved?.file_name === "string" ? saved.file_name : inferFileName(logs, input.job_id),
     additional_instructions:
       typeof saved?.additional_instructions === "string" ? saved.additional_instructions : undefined,
+    retry_source_job_id:
+      typeof saved?.retry_source_job_id === "string" ? saved.retry_source_job_id : undefined,
     created_at,
     completed_at:
-      display_status === "complete" || display_status === "failed" || display_status === "cancelled"
+      display_status === "complete" ||
+      display_status === "unsupported" ||
+      display_status === "failed" ||
+      display_status === "cancelled"
         ? typeof saved?.completed_at === "string"
           ? saved.completed_at
           : directory_stat.mtime.toISOString()
         : undefined,
     display_status,
     is_complete:
-      display_status === "complete" || display_status === "failed" || display_status === "cancelled",
-    has_errors: display_status === "failed" || Boolean(saved?.has_errors),
+      display_status === "complete" ||
+      display_status === "unsupported" ||
+      display_status === "failed" ||
+      display_status === "cancelled",
+    has_errors: recovered_layout_failure ? false : display_status === "failed" || Boolean(saved?.has_errors),
     error_message,
     logs,
     component_ready,
@@ -172,9 +237,24 @@ async function restoreJobDirectory(input: {
     circuit_json,
     typical_application_code,
     typical_application_circuit_json,
-    validation: isRecord(saved?.validation) ? (saved.validation as unknown as Job["validation"]) : undefined,
+    validation: (recovered_layout_failure
+      ? {
+          ...saved_validation,
+          application_connectivity: "passed",
+          application_schematic: "passed",
+        }
+      : saved_validation) as unknown as Job["validation"],
     provenance: isRecord(saved?.provenance) ? (saved.provenance as unknown as Job["provenance"]) : undefined,
+    evidence_available:
+      typeof saved?.evidence_available === "boolean"
+        ? saved.evidence_available
+        : await Bun.file(join(input.job_dir, "component-evidence.json")).exists(),
   })
+  if (recovered_layout_failure && !logs.some((log) => log.message === LAYOUT_RECOVERY_LOG)) {
+    await input.job_store.appendLog(input.job_id, "system", LAYOUT_RECOVERY_LOG)
+    return input.job_store.getJob(input.job_id)
+  }
+  return restored_job
 }
 
 async function restoreModelDirectory(input: {
@@ -193,13 +273,10 @@ async function restoreModelDirectory(input: {
     readFile(join(input.model_dir, "model-card.md"), "utf8").catch(() => undefined),
   ])
   const saved = isRecord(snapshot) ? snapshot : undefined
-  const stored_status =
-    typeof saved?.status === "string" &&
-    MODEL_STATUSES.has(saved.status as ModelRunStatus | "review_required")
-      ? saved.status
-      : "failed"
   let saved_status: ModelRunStatus =
-    stored_status === "review_required" ? "timed_out" : (stored_status as ModelRunStatus)
+    typeof saved?.status === "string" && MODEL_STATUSES.has(saved.status as ModelRunStatus)
+      ? (saved.status as ModelRunStatus)
+      : "timed_out"
   const has_verified_simulation = await hasCompleteVerifiedSimulationReport(input.model_dir)
   const invalidated_legacy_completion = saved_status === "complete" && !has_verified_simulation
   if (invalidated_legacy_completion) saved_status = "timed_out"

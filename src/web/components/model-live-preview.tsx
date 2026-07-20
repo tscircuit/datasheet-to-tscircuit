@@ -173,6 +173,27 @@ function formatAxisValue(value: number): string {
   return Number(value.toPrecision(4)).toString()
 }
 
+export function getComparisonScaleDisparity(
+  reference_points: ModelCurvePoint[],
+  result_points: ModelCurvePoint[] | undefined,
+): { reference_min: number; reference_max: number; result_min: number; result_max: number } | undefined {
+  if (!result_points?.length || reference_points.length === 0) return undefined
+  const reference_values = reference_points.map((point) => point.y)
+  const result_values = result_points.map((point) => point.y)
+  const reference_min = Math.min(...reference_values)
+  const reference_max = Math.max(...reference_values)
+  const result_min = Math.min(...result_values)
+  const result_max = Math.max(...result_values)
+  const reference_magnitude = Math.max(Math.abs(reference_min), Math.abs(reference_max))
+  const result_magnitude = Math.max(Math.abs(result_min), Math.abs(result_max))
+  const smaller_magnitude = Math.min(reference_magnitude, result_magnitude)
+  const larger_magnitude = Math.max(reference_magnitude, result_magnitude)
+  if (larger_magnitude === 0 || (smaller_magnitude > 0 && larger_magnitude / smaller_magnitude < 100)) {
+    return undefined
+  }
+  return { reference_min, reference_max, result_min, result_max }
+}
+
 function ReferenceGraph({ preview }: { preview?: ModelReferencePreview }) {
   if (!preview) {
     return (
@@ -225,6 +246,7 @@ function ReferenceGraph({ preview }: { preview?: ModelReferencePreview }) {
   const displayed_y_max = preview.y_scale === "log" ? 10 ** y_max : y_max
   const comparison_is_deprecated = preview.result_status === "deprecated" || preview.is_stale
   const comparison_is_unverified = preview.result_status === "unverified"
+  const scale_disparity = getComparisonScaleDisparity(preview.reference_points, preview.result_points)
   const result_label = comparison_is_deprecated
     ? "Previous model result · deprecated"
     : comparison_is_unverified
@@ -244,6 +266,18 @@ function ReferenceGraph({ preview }: { preview?: ModelReferencePreview }) {
             <span>
               <strong>Deprecated comparison</strong>
               This curve was built from an earlier source; the automatic run will replace it.
+            </span>
+          </div>
+        )}
+        {scale_disparity && (
+          <div className="model-scale-note" role="status">
+            <AlertTriangle size={13} />
+            <span>
+              <strong>Different vertical scales</strong>
+              The Analog Simulation tab auto-scales the model-only waveform. This comparison uses one shared
+              y-axis: reference {formatAxisValue(scale_disparity.reference_min)}–
+              {formatAxisValue(scale_disparity.reference_max)} V, model{" "}
+              {formatAxisValue(scale_disparity.result_min)}–{formatAxisValue(scale_disparity.result_max)} V.
             </span>
           </div>
         )}

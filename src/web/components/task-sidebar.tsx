@@ -19,6 +19,7 @@ const STATUS_COPY: Record<JobDisplayStatus, string> = {
   cancelling: "Stopping",
   cancelled: "Cancelled",
   complete: "Ready",
+  unsupported: "Not convertible",
   failed: "Failed",
 }
 
@@ -53,6 +54,7 @@ function getModelStatusCopy(status: ModelRunStatus, error_message?: string): str
 
 function getStatusTone(status: string): string {
   if (["Ready", "Complete", "Validated"].includes(status)) return "ready"
+  if (status === "Not convertible") return "unsupported"
   if (["Failed", "Cancelled", "Stopped", "Timed out"].includes(status)) return "failed"
   return "working"
 }
@@ -204,7 +206,9 @@ export function TaskSidebar({
                     </span>
                   </button>
                   <span className="task-entry-actions">
-                    {(task.display_status === "cancelled" || task.display_status === "failed") && (
+                    {(task.display_status === "cancelled" ||
+                      task.display_status === "unsupported" ||
+                      task.display_status === "failed") && (
                       <button
                         className="task-retry"
                         type="button"

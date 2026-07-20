@@ -6,13 +6,18 @@ import {
   buildAgentPrompt,
   buildComponentPrompt,
   buildTypicalApplicationPrompt,
+  buildTypicalApplicationEvidenceVerificationPrompt,
   getForbiddenDatasheetAccesses,
+  getTypicalApplicationPlanAgreementErrors,
   parseTypicalApplicationPlan,
   runJob,
 } from "@/server/job-runner"
 import { JobStore } from "@/server/job-store"
 
 const fakeVisualInspectionHelpers = `
+if (!(await Bun.file(dir + "/photon_rs_bg.wasm").exists())) {
+  throw new Error("agent image runtime canary is missing")
+}
 let eventSequence = 0
 function emitAgentEvent(event) {
   console.log(JSON.stringify({ protocol: "tsci-agent-event-v1", sequence: ++eventSequence, ...event }))
@@ -68,7 +73,7 @@ async function recordEvidence(plan, options = {}) {
       view: "pcb_top",
       units: "mm",
       drawing_orientation: { value: "pcb_top", sources: [source] },
-      pads: [{ pin: "1", kind: "smt", x: 0, y: 0, width: options.padWidth ?? 0.6, height: 0.25, sources: [source] }],
+      pads: options.emptyPads ? [] : [{ pin: "1", kind: "smt", x: 0, y: 0, width: options.padWidth ?? 0.6, height: 0.25, sources: [source] }],
     },
     unresolved_ambiguities: options.ambiguities ?? [],
   }
@@ -77,11 +82,10 @@ async function recordEvidence(plan, options = {}) {
   await Bun.write(dir + "/" + landReference, png)
   await Bun.write(dir + "/component-evidence.json", JSON.stringify(componentEvidence))
   await Bun.write(dir + "/typical-application-plan.json", JSON.stringify(plan))
-  await Bun.write(dir + "/footprint-plan.json", JSON.stringify({ version: 1, view: "pcb_top", source_references: [{ page: 9, figure: "Land pattern" }], pads: componentEvidence.footprint.pads.map(({ sources, ...pad }) => pad) }))
   for (const [index, path] of [landReference, reference].entries()) {
     const tool_call_id = "reference-read-" + index
     emitAgentEvent({ type: "tool_start", tool_call_id, tool_name: "read", args: { path } })
-    emitAgentEvent({ type: "tool_end", tool_call_id, tool_name: "read", is_error: false, result_has_image: true })
+    emitAgentEvent({ type: "tool_end", tool_call_id, tool_name: "read", is_error: false, result_has_image: options.resultHasImage ?? true, result_text: options.resultHasImage === false ? "Read image file [image/png]\\n[Image omitted: could not be resized below the inline image size limit.]" : undefined })
   }
 }
 `
@@ -92,20 +96,32 @@ test("prompts separate evidence extraction from build-verified TSX generation", 
   expect(prompt).toContain("Do not create or modify any")
   expect(prompt).toContain("component-evidence.json")
   expect(prompt).toContain("exactly 200 DPI")
-  expect(prompt).toContain("human_review_required")
+  expect(prompt).toContain('status": "resolved" | "unresolved"')
   expect(prompt).toContain("typical-application-plan.json")
+  expect(prompt).toContain("Do not write footprint-plan.json")
+  expect(prompt).toContain("Always include the target IC as component U1")
+  expect(prompt).toContain("unresolved_ambiguities must be empty")
   expect(prompt).toContain("Use the QFN package")
+  expect(buildAgentPrompt(undefined, "footprint schema mismatch")).toContain("footprint schema mismatch")
   const component_prompt = buildComponentPrompt("Use the QFN package")
   expect(component_prompt).toContain("approved evidence")
   expect(component_prompt).toContain("Do not open, extract, render, search")
   expect(component_prompt).toContain("tsci build")
   expect(component_prompt).toContain("placementDrcChecksDisabled")
+  expect(component_prompt).toContain('"pcb_image": "dist/index/pcb.png"')
   const application_prompt = buildTypicalApplicationPrompt("Use the QFN package")
   expect(application_prompt).toContain("server has independently")
   expect(application_prompt).toContain('"./index.circuit"')
   expect(application_prompt).toContain("PCB and schematic")
   expect(application_prompt).toContain("do not suppress placement DRC")
+  expect(application_prompt).toContain("Do not modify `visual-reference/typical-application.png`")
   expect(application_prompt).toContain("Use the QFN package")
+  expect(buildTypicalApplicationEvidenceVerificationPrompt("Use the QFN package")).toContain(
+    "Use the QFN package",
+  )
+  expect(buildTypicalApplicationEvidenceVerificationPrompt()).toContain(
+    "distinguish junction dots from bridge arcs",
+  )
   expect(
     parseTypicalApplicationPlan({
       version: 2,
@@ -119,6 +135,148 @@ test("prompts separate evidence extraction from build-verified TSX generation", 
       connections: [{ net: "VCC", pins: ["U1.VCC", "C1.pin1"] }],
     }).source_references[0]?.page,
   ).toBe(8)
+})
+
+test("application agreement compares electrical semantics instead of agent-authored wording", () => {
+  const primary = parseTypicalApplicationPlan({
+    version: 3,
+    availability: "documented",
+    title: "Converter application",
+    description: "Reference circuit",
+    source_references: [{ page: 8 }],
+    components: [
+      {
+        reference: "U1",
+        kind: "buck-boost converter",
+        value: "TPS63802DLAR",
+        purpose: "Regulates the input to 3.3 V",
+      },
+      { reference: "C1", kind: "capacitor", value: "10uF", purpose: "input bypass" },
+    ],
+    connections: [{ net: "VIN", pins: ["U1.VIN", "C1.pin1"] }],
+  })
+  const independently_cited = parseTypicalApplicationPlan({
+    ...primary,
+    source_references: [{ page: 9 }],
+    components: [
+      {
+        reference: "U1",
+        kind: "integrated_circuit",
+        value: "TPS63802",
+        purpose: "Non-inverting buck-boost converter",
+      },
+      { reference: "C1", kind: "capacitor", value: "10 µF", purpose: "VIN bypass capacitor" },
+    ],
+    connections: [{ net: "VIN_1V3_TO_5V5", pins: ["C1.1", "U1.VIN"] }],
+  })
+  expect(getTypicalApplicationPlanAgreementErrors(primary, independently_cited, "TPS63802")).toEqual([])
+  expect(
+    getTypicalApplicationPlanAgreementErrors(
+      primary,
+      {
+        ...independently_cited,
+        components: independently_cited.components.map((component) =>
+          component.reference === "C1" ? { ...component, kind: "resistor" } : component,
+        ),
+      },
+      "TPS63802",
+    ),
+  ).toContain('typical-application component C1 kind disagrees: "capacitor" versus "resistor"')
+  expect(
+    getTypicalApplicationPlanAgreementErrors(
+      primary,
+      {
+        ...independently_cited,
+        components: independently_cited.components.map((component) =>
+          component.reference === "C1" ? { ...component, value: "22 µF" } : component,
+        ),
+      },
+      "TPS63802",
+    ),
+  ).toContain('typical-application component C1 value disagrees: "10uF" versus "22 µF"')
+  expect(
+    getTypicalApplicationPlanAgreementErrors(
+      primary,
+      {
+        ...independently_cited,
+        connections: [{ net: "VIN", pins: ["U1.VIN", "C1.2"] }],
+      },
+      "TPS63802",
+    ),
+  ).toContain('independent typical application is missing the endpoint group from net "VIN": c1.1, u1.vin')
+
+  const unrelated_ic_variant = {
+    ...independently_cited,
+    components: independently_cited.components.map((component) =>
+      component.reference === "U1" ? { ...component, value: "TPS63803" } : component,
+    ),
+  }
+  expect(getTypicalApplicationPlanAgreementErrors(primary, unrelated_ic_variant, "TPS63802")).toContain(
+    'typical-application component U1 value disagrees: "TPS63802DLAR" versus "TPS63803"',
+  )
+
+  const part_number_designator = parseTypicalApplicationPlan({
+    ...independently_cited,
+    components: independently_cited.components.map((component) =>
+      component.reference === "U1" ? { ...component, reference: "TPS63802" } : component,
+    ),
+    connections: independently_cited.connections.map((connection) => ({
+      ...connection,
+      pins: connection.pins.map((endpoint) => endpoint.replace(/^U1\./, "TPS63802.")),
+    })),
+  })
+  expect(getTypicalApplicationPlanAgreementErrors(primary, part_number_designator, "TPS63802")).toEqual([])
+})
+
+test("application plans discard invented interface-terminal pseudo-components", () => {
+  const plan = parseTypicalApplicationPlan({
+    version: 3,
+    availability: "documented",
+    title: "Converter application",
+    description: "Reference circuit",
+    source_references: [{ page: 8 }],
+    components: [
+      { reference: "U1", kind: "converter", value: "TPS63802" },
+      { reference: "C1", kind: "capacitor", value: "10uF" },
+      { reference: "VIN_IN", kind: "power_port", value: "1.3 V to 5.5 V" },
+    ],
+    connections: [
+      { net: "VIN", pins: ["VIN_IN.positive", "U1.VIN", "C1.1"] },
+      { net: "GND", pins: ["VIN_IN.ground", "U1.GND", "C1.2"] },
+    ],
+  })
+  expect(plan.components.map((component) => component.reference)).toEqual(["U1", "C1"])
+  expect(plan.connections).toEqual([
+    { net: "VIN", pins: ["U1.VIN", "C1.1"] },
+    { net: "GND", pins: ["U1.GND", "C1.2"] },
+  ])
+})
+
+test("application plans normalize bare interfaces and reconstruct the known target component", () => {
+  const plan = parseTypicalApplicationPlan(
+    {
+      version: 3,
+      availability: "documented",
+      title: "Converter application",
+      description: "Reference circuit",
+      source_references: [{ page: 8 }],
+      components: [{ reference: "C1", kind: "capacitor", value: "10uF" }],
+      connections: [
+        { net: "VIN", pins: ["VIN", "U1.VIN", "C1.1"] },
+        { net: "VOUT", pins: ["U1.VOUT", "C1.2", "VOUT"] },
+      ],
+    },
+    "TPS63802",
+  )
+  expect(plan.components[0]).toMatchObject({
+    reference: "U1",
+    kind: "integrated_circuit",
+    value: "TPS63802",
+  })
+  expect(plan.connections).toEqual([
+    { net: "VIN", pins: ["U1.VIN", "C1.1"] },
+    { net: "VOUT", pins: ["U1.VOUT", "C1.2"] },
+  ])
 })
 
 test("generation-phase audit detects direct and shell-based datasheet rereads", () => {
@@ -142,6 +300,20 @@ test("generation-phase audit detects direct and shell-based datasheet rereads", 
       },
     ]),
   ).toHaveLength(2)
+  expect(
+    getForbiddenDatasheetAccesses([
+      {
+        protocol: "tsci-agent-event-v1",
+        sequence: 1,
+        type: "tool_start",
+        tool_call_id: "safe-inventory",
+        tool_name: "bash",
+        args: {
+          command: "find . -maxdepth 2 -type f ! -name 'datasheet.pdf' ! -name 'datasheet.txt' | sort",
+        },
+      },
+    ]),
+  ).toEqual([])
 })
 
 test("component readiness releases before the typical application completes", async () => {
@@ -164,10 +336,14 @@ if (prompt.includes("Independently extract")) {
   await recordEvidence(plan)
   emitText("evidence phase complete")
 } else if (prompt.includes("Generate the reusable")) {
+  if (await Bun.file(dir + "/datasheet.pdf").exists()) throw new Error("raw datasheet leaked into component generation")
+  if (await Bun.file(dir + "/visual-reference/pages/page-009.png").exists()) throw new Error("raw page render leaked into component generation")
   await Bun.write(dir + "/index.circuit.tsx", 'export default function Part() { return <chip name="U1" footprint="soic8" /> }\\n')
   await recordVisualInspection("component")
   emitText("component phase complete")
 } else {
+  if (await Bun.file(dir + "/datasheet.pdf").exists()) throw new Error("raw datasheet leaked into application generation")
+  if (await Bun.file(dir + "/visual-reference/land-pattern.png").exists()) throw new Error("component evidence image leaked into application generation")
   if (!(await Bun.file(dir + "/dist/index/circuit.json").exists())) throw new Error("component was not built before application phase")
   if (!(await Bun.file(dir + "/component.circuit.tsx").exists())) throw new Error("component snapshot was not published")
   await Bun.write(dir + "/typical-application.circuit.tsx", 'import Part from "./index.circuit"\\nexport default function TypicalApplication() { return <board><Part name="U1" /><capacitor name="C1" capacitance="1uF" /></board> }\\n')
@@ -194,7 +370,12 @@ const circuit = target === "index.circuit.tsx" || target === "component-validati
       { type: "source_component", source_component_id: "cap", name: "C1", ftype: "simple_capacitor", capacitance: 0.000001 },
       { type: "source_port", source_port_id: "c1_1", source_component_id: "cap", name: "pin1", pin_number: 1, subcircuit_connectivity_map_key: "vcc" },
       { type: "source_port", source_port_id: "c1_2", source_component_id: "cap", name: "pin2", pin_number: 2, subcircuit_connectivity_map_key: "gnd" },
+      ...Array.from({ length: 7 }, (_, index) => ({ type: "schematic_component", schematic_component_id: "application-sch-" + index, center: { x: index, y: 0 } })),
+      { type: "schematic_trace", schematic_trace_id: "long-but-valid", edges: [{ from: { x: 0, y: 0 }, to: { x: 7.13, y: 0 } }] },
     ]
+if (target === "component-validation.circuit.tsx") {
+  circuit.push({ type: "source_pin_must_be_connected_error", message: "Port VCC on U1 must be connected but is floating" })
+}
 await Bun.write(process.cwd() + "/dist/" + stem + "/circuit.json", JSON.stringify(circuit))
 `,
     ),
@@ -233,16 +414,25 @@ await Bun.write(process.cwd() + "/dist/" + stem + "/circuit.json", JSON.stringif
   }
   expect(await Bun.file(join(job_dir, "typical-application-plan.json")).text()).toContain('"VCC"')
   expect(await Bun.file(join(job_dir, "component-evidence.independent.json")).exists()).toBe(true)
+  expect(
+    await Bun.file(join(job_dir, "evidence-attempts/independent-1/component-evidence.json")).exists(),
+  ).toBe(true)
   expect(job?.validation?.evidence).toBe("passed")
   expect(job?.validation?.pinout).toBe("passed")
   expect(await Bun.file(join(job_dir, "agent-events.jsonl")).text()).toContain('"result_has_image":true')
+  const agent_log = await Bun.file(join(job_dir, "agent.log")).text()
+  expect(agent_log).toContain("[tool] read")
+  expect(agent_log).toContain("Agent phase completed with")
+  expect(agent_log).toContain("Schematic layout advisory")
   const persisted_job = JSON.parse(await Bun.file(join(job_dir, "job.json")).text())
   expect(persisted_job.version).toBe(2)
+  expect(persisted_job.provenance.source_commit).toHaveLength(40)
   expect(persisted_job.provenance.datasheet_sha256).toHaveLength(64)
   expect(persisted_job.provenance.prompt_sha256.component_generation).toHaveLength(64)
   expect(await Bun.file(join(job_dir, "build-targets.log")).text()).toBe(
     "index.circuit.tsx\ncomponent-validation.circuit.tsx\ntypical-application.circuit.tsx\n",
   )
+  expect(await Bun.file(join(job_dir, "photon_rs_bg.wasm")).exists()).toBe(false)
 
   await rm(job_dir, { recursive: true, force: true })
 })
@@ -380,7 +570,7 @@ const prompt = args[args.indexOf("--prompt") + 1]
 ${fakeVisualInspectionHelpers}
 const plan = { version: 2, title: "Typical application", description: "Datasheet circuit", source_references: [{ page: 8 }], components: [{ reference: "U1", kind: "device" }, { reference: "C1", kind: "capacitor", value: "1uF" }], connections: [{ net: "VCC", pins: ["U1.VCC", "C1.pin1"] }] }
 if (prompt.includes("Independently extract")) {
-  await recordEvidence(plan, { padWidth: 0.9 })
+  await recordEvidence({ ...plan, title: prompt.includes("pin 1 width") ? "comparison leaked" : "fresh verification" }, { padWidth: 0.9 })
 } else if (prompt.includes("evidence-extraction phase")) {
   await recordEvidence(plan, { padWidth: 0.6 })
 } else {
@@ -396,12 +586,123 @@ finishAgent()
   await runJob({ job_id: "job_disagreement" }, { job_store, agent_bin: agent_path, tsci_bin: "unused-tsci" })
 
   const job = job_store.getJob("job_disagreement")
-  expect(job?.display_status).toBe("failed")
-  expect(job?.validation?.evidence).toBe("human_review_required")
-  expect(job?.error_message).toContain("Independent datasheet evidence disagrees")
+  expect(job?.display_status).toBe("unsupported")
+  expect(job?.validation?.evidence).toBe("unresolved")
+  expect(job?.error_message).toContain("did not converge automatically")
   expect(job?.error_message).toContain("pin 1 width")
   expect(await Bun.file(join(job_dir, "tsx-generation-reached")).exists()).toBe(false)
   expect(await Bun.file(join(job_dir, "component-evidence.independent.json")).exists()).toBe(true)
+  expect(
+    await Bun.file(join(job_dir, "evidence-attempts/independent-1/component-evidence.json")).exists(),
+  ).toBe(true)
+  expect(
+    await Bun.file(join(job_dir, "evidence-attempts/independent-2/component-evidence.json")).exists(),
+  ).toBe(true)
+  expect(
+    await Bun.file(join(job_dir, "evidence-attempts/independent-2/typical-application-plan.json")).text(),
+  ).toContain('"title": "fresh verification"')
+
+  await rm(job_dir, { recursive: true, force: true })
+})
+
+test("invalid independent attempts retain their raw artifacts and parser errors", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-job-runner-invalid-independent-"))
+  await Bun.write(join(job_dir, "datasheet.pdf"), "fake datasheet")
+  const agent_path = join(job_dir, "invalid-independent-agent")
+  await Bun.write(
+    agent_path,
+    `#!/usr/bin/env bun
+const args = process.argv.slice(2)
+const dir = args[args.indexOf("--dir") + 1]
+const prompt = args[args.indexOf("--prompt") + 1]
+${fakeVisualInspectionHelpers}
+const validPlan = { version: 3, availability: "documented", title: "Application", description: "Reference circuit", source_references: [{ page: 8 }], components: [{ reference: "U1", kind: "device" }, { reference: "C1", kind: "capacitor", value: "1uF" }], connections: [{ net: "VCC", pins: ["U1.VCC", "C1.1"] }] }
+const invalidPlan = { ...validPlan, connections: [{ net: "VCC", pins: ["U1.VCC", "VIN_IN.positive"] }] }
+if (prompt.includes("Independently extract")) await recordEvidence(invalidPlan)
+else if (prompt.includes("evidence-extraction phase")) await recordEvidence(validPlan)
+finishAgent()
+`,
+  )
+  await chmod(agent_path, 0o755)
+
+  const job_store = new JobStore()
+  job_store.createJob({ job_id: "job_invalid_independent", job_dir, file_name: "device.pdf" })
+  await runJob(
+    { job_id: "job_invalid_independent" },
+    { job_store, agent_bin: agent_path, tsci_bin: "unused-tsci" },
+  )
+
+  const job = job_store.getJob("job_invalid_independent")
+  expect(job?.display_status).toBe("unsupported")
+  expect(job?.error_message).toContain("references an unlisted component")
+  for (const attempt of [1, 2]) {
+    const attempt_dir = join(job_dir, `evidence-attempts/independent-${attempt}`)
+    expect(await Bun.file(join(attempt_dir, "typical-application-plan.json")).exists()).toBe(true)
+    expect(await Bun.file(join(attempt_dir, "error.json")).text()).toContain(
+      "references an unlisted component",
+    )
+  }
+
+  await rm(job_dir, { recursive: true, force: true })
+})
+
+test("unresolved primary evidence retries automatically and stops without crashing", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-job-runner-unresolved-evidence-"))
+  await Bun.write(join(job_dir, "datasheet.pdf"), "fake datasheet")
+  const agent_path = join(job_dir, "unresolved-agent")
+  await Bun.write(
+    agent_path,
+    `#!/usr/bin/env bun
+const args = process.argv.slice(2)
+const dir = args[args.indexOf("--dir") + 1]
+const prompt = args[args.indexOf("--prompt") + 1]
+${fakeVisualInspectionHelpers}
+const plan = { version: 3, availability: "documented", title: "Typical application", description: "Datasheet circuit", source_references: [{ page: 8 }], components: [{ reference: "U1", kind: "device" }, { reference: "C1", kind: "capacitor", value: "1uF" }], connections: [{ net: "VCC", pins: ["U1.VCC", "C1.pin1"] }] }
+if (prompt.includes("evidence-extraction phase")) {
+  const promptLog = dir + "/retry-prompts.log"
+  const previous = await Bun.file(promptLog).exists() ? await Bun.file(promptLog).text() : ""
+  await Bun.write(promptLog, previous + prompt + "\\n--- attempt ---\\n")
+  if (prompt.includes("Server validation feedback from the previous attempt")) {
+    await (await import("node:fs/promises")).rm(dir + "/agent-events.jsonl", { force: true })
+  }
+  await recordEvidence(plan, { status: "unresolved", emptyPads: true, ambiguities: ["Pad dimensions could not be resolved automatically"] })
+} else {
+  await Bun.write(dir + "/tsx-generation-reached", "unexpected")
+}
+finishAgent()
+`,
+  )
+  await chmod(agent_path, 0o755)
+
+  const job_store = new JobStore()
+  job_store.createJob({ job_id: "job_unresolved", job_dir, file_name: "device.pdf" })
+  await runJob({ job_id: "job_unresolved" }, { job_store, agent_bin: agent_path, tsci_bin: "unused-tsci" })
+
+  const job = job_store.getJob("job_unresolved")
+  expect(job?.display_status).toBe("unsupported")
+  expect(job?.has_errors).toBe(false)
+  expect(job?.validation?.evidence).toBe("unresolved")
+  expect(job?.evidence_available).toBe(true)
+  expect(job?.error_message).toContain("Evidence extraction remained unresolved")
+  expect(job?.logs.map((log) => log.message).join("\n")).toContain("Retrying automatically")
+  expect(job?.logs.map((log) => log.message).join("\n")).toContain("stopped safely")
+  const retry_prompts = await Bun.file(join(job_dir, "retry-prompts.log")).text()
+  expect(retry_prompts).toContain("Server validation feedback from the previous attempt")
+  expect(retry_prompts).toContain("Pad dimensions could not be resolved automatically")
+  const agent_events = await Bun.file(join(job_dir, "agent-events.jsonl")).text()
+  expect(agent_events).toContain('"phase":"primary_evidence_attempt_1"')
+  expect(agent_events).toContain('"phase":"primary_evidence_attempt_2"')
+  expect(await Bun.file(join(job_dir, "evidence-attempts/primary-1/component-evidence.json")).exists()).toBe(
+    true,
+  )
+  expect(await Bun.file(join(job_dir, "evidence-attempts/primary-1/error.json")).text()).toContain(
+    "Evidence extraction remained unresolved",
+  )
+  expect(await Bun.file(join(job_dir, "evidence-attempts/primary-2/component-evidence.json")).exists()).toBe(
+    true,
+  )
+  expect(await Bun.file(join(job_dir, "tsx-generation-reached")).exists()).toBe(false)
+  expect(await Bun.file(join(job_dir, "photon_rs_bg.wasm")).exists()).toBe(false)
 
   await rm(job_dir, { recursive: true, force: true })
 })
@@ -434,10 +735,10 @@ finishAgent()
   await runJob({ job_id: "job_inconclusive" }, { job_store, agent_bin: agent_path, tsci_bin: "unused-tsci" })
 
   const job = job_store.getJob("job_inconclusive")
-  expect(job?.display_status).toBe("failed")
+  expect(job?.display_status).toBe("unsupported")
   expect(job?.component_ready).not.toBe(true)
   expect(job?.validation?.component_visual).toBe("inconclusive")
-  expect(job?.error_message).toContain("visual inspection is inconclusive")
+  expect(job?.error_message).toContain("image inspection could not be completed automatically")
 
   await rm(job_dir, { recursive: true, force: true })
 })
@@ -459,7 +760,7 @@ if (prompt.includes("Independently extract") || prompt.includes("evidence-extrac
 } else if (prompt.includes("Generate the reusable")) {
   await Bun.write(dir + "/index.circuit.tsx", 'export default function Part() { return <chip name="U1" /> }\\n')
   await recordVisualInspection("component")
-  await Bun.write(dir + "/visual-reference/land-pattern.png", "tampered")
+  await Bun.write(dir + "/visual-reference/pages/page-009.png", "tampered")
 }
 finishAgent()
 `,
@@ -476,7 +777,7 @@ finishAgent()
   const job = job_store.getJob("job_reference_lock")
   expect(job?.display_status).toBe("failed")
   expect(job?.error_message).toContain("modified locked evidence")
-  expect(await Bun.file(join(job_dir, "visual-reference/land-pattern.png")).text()).not.toBe("tampered")
+  expect(await Bun.file(join(job_dir, "visual-reference/pages/page-009.png")).exists()).toBe(false)
 
   await rm(job_dir, { recursive: true, force: true })
 })

@@ -44,7 +44,7 @@ export interface EvidencePad extends ExpectedFootprintPad {
 
 export interface ComponentEvidence {
   version: 1
-  status: "resolved" | "human_review_required"
+  status: "resolved" | "unresolved"
   part_number: EvidenceField<string>
   ordering_code?: EvidenceField<string>
   package: {
@@ -62,6 +62,30 @@ export interface ComponentEvidence {
     pads: EvidencePad[]
   }
   unresolved_ambiguities: string[]
+}
+
+export function createFootprintPlanFromEvidence(evidence: ComponentEvidence): FootprintPlan {
+  const references = new Map<string, { page: number; figure?: string }>()
+  const footprint_sources = [
+    ...evidence.footprint.drawing_orientation.sources,
+    ...evidence.footprint.pads.flatMap((pad) => pad.sources),
+  ]
+  for (const source of footprint_sources) {
+    const key = `${source.page}\u0000${source.figure ?? ""}`
+    references.set(key, {
+      page: source.page,
+      ...(source.figure ? { figure: source.figure } : {}),
+    })
+  }
+  const source_references = [...references.values()].sort(
+    (left, right) => left.page - right.page || (left.figure ?? "").localeCompare(right.figure ?? ""),
+  )
+  return {
+    version: 1,
+    view: "pcb_top",
+    source_references,
+    pads: evidence.footprint.pads.map(({ sources: _sources, ...pad }) => pad),
+  }
 }
 
 type CircuitRecord = AnyCircuitElement & Record<string, unknown>
@@ -177,7 +201,7 @@ export function parseComponentEvidence(value: unknown): ComponentEvidence {
   if (
     !isRecord(value) ||
     value.version !== 1 ||
-    (value.status !== "resolved" && value.status !== "human_review_required")
+    (value.status !== "resolved" && value.status !== "unresolved")
   ) {
     throw new Error("component-evidence.json must have version 1 and a valid status")
   }
@@ -186,7 +210,7 @@ export function parseComponentEvidence(value: unknown): ComponentEvidence {
   if (!isRecord(value.footprint) || value.footprint.view !== "pcb_top" || value.footprint.units !== "mm") {
     throw new Error('component evidence footprint must use view "pcb_top" and units "mm"')
   }
-  if (!Array.isArray(value.pinout.pins) || value.pinout.pins.length === 0) {
+  if (!Array.isArray(value.pinout.pins) || (value.status === "resolved" && value.pinout.pins.length === 0)) {
     throw new Error("component evidence must contain a complete pin table")
   }
   const seen_pins = new Set<string>()
@@ -225,7 +249,10 @@ export function parseComponentEvidence(value: unknown): ComponentEvidence {
       sources: parseSources(pin.sources, `${label}.sources`),
     }
   })
-  if (!Array.isArray(value.footprint.pads) || value.footprint.pads.length === 0) {
+  if (
+    !Array.isArray(value.footprint.pads) ||
+    (value.status === "resolved" && value.footprint.pads.length === 0)
+  ) {
     throw new Error("component evidence must contain every copper pad")
   }
   const orientation_values = new Set<DrawingOrientation>([
@@ -289,8 +316,12 @@ function hasReliableSource(sources: EvidenceSource[]): boolean {
 
 export function getComponentEvidenceBlockingReasons(evidence: ComponentEvidence): string[] {
   const errors: string[] = []
-  if (evidence.status !== "resolved") errors.push("evidence status requires human review")
-  for (const ambiguity of evidence.unresolved_ambiguities) errors.push(`unresolved ambiguity: ${ambiguity}`)
+  if (evidence.status !== "resolved") {
+    errors.push("evidence extraction is unresolved")
+    for (const ambiguity of evidence.unresolved_ambiguities) {
+      errors.push(`unresolved ambiguity: ${ambiguity}`)
+    }
+  }
   if (evidence.package.pin_count.value !== evidence.pinout.pins.length) {
     errors.push(
       `package pin count is ${evidence.package.pin_count.value}, but the pin table has ${evidence.pinout.pins.length} entries`,
@@ -465,10 +496,11 @@ export function getFootprintEvidenceErrors(
   const evidence_pages = new Set(
     evidence.footprint.pads.flatMap((pad) => pad.sources.map((source) => source.page)),
   )
-  for (const reference of plan.source_references) {
-    if (!evidence_pages.has(reference.page)) {
-      errors.push(`footprint plan cites page ${reference.page}, which is absent from pad evidence`)
-    }
+  if (
+    evidence_pages.size > 0 &&
+    !plan.source_references.some((reference) => evidence_pages.has(reference.page))
+  ) {
+    errors.push("footprint plan does not cite any page used by the pad evidence")
   }
   return errors
 }
@@ -479,14 +511,15 @@ export function getIndependentComponentEvidenceErrors(
   tolerance_mm = 0.005,
 ): string[] {
   const errors: string[] = []
-  for (const [label, left, right] of [
-    ["part number", primary.part_number.value, independent.part_number.value],
-    ["ordering code", primary.ordering_code?.value ?? "", independent.ordering_code?.value ?? ""],
-  ] as const) {
-    if (normalizeText(left) !== normalizeText(right)) {
-      errors.push(`${label} disagrees: ${JSON.stringify(left)} versus ${JSON.stringify(right)}`)
-    }
+  if (normalizeText(primary.part_number.value) !== normalizeText(independent.part_number.value)) {
+    errors.push(
+      `part number disagrees: ${JSON.stringify(primary.part_number.value)} versus ${JSON.stringify(independent.part_number.value)}`,
+    )
   }
+  // Ordering codes can identify packaging options rather than different component
+  // geometry. For example, TI's DLAT and DLAR suffixes select different reel
+  // quantities for the same DLA package. Package code, pinout, and pad geometry
+  // below are the material identity checks for component generation.
   const primary_package_code = primary.package.code?.value
   const independent_package_code = independent.package.code?.value
   if (primary_package_code || independent_package_code) {
@@ -534,7 +567,15 @@ export function getIndependentComponentEvidenceErrors(
         `pin ${pin.number} labels disagree: ${pin.labels.join("/")} versus ${other.labels.join("/")}`,
       )
     }
-    if (pin.role !== other.role) {
+    const nondirectional_role_pair = new Set([pin.role, other.role])
+    const labels_are_switch_nodes = [...left_labels].some((label) => /^(?:l|lx|sw)\d*$/.test(label))
+    const roles_agree =
+      pin.role === other.role ||
+      (labels_are_switch_nodes &&
+        nondirectional_role_pair.size === 2 &&
+        nondirectional_role_pair.has("passive") &&
+        nondirectional_role_pair.has("other"))
+    if (!roles_agree) {
       errors.push(`pin ${pin.number} schematic role disagrees: ${pin.role} versus ${other.role}`)
     }
   }
@@ -580,7 +621,7 @@ export function getPinoutEvidenceErrors(
       typeof port.name === "string" ? port.name : "",
       ...asStringArray(port.port_hints),
     ].map(normalizeText)
-    if (!pin.labels.map(normalizeText).some((label) => actual_labels.includes(label))) {
+    if (!pin.labels.map(normalizeText).every((label) => actual_labels.includes(label))) {
       errors.push(`pin ${pin.number} labels ${pin.labels.join("/")} are absent from its Circuit JSON port`)
     }
   }

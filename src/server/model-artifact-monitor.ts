@@ -221,6 +221,16 @@ function isCircuitJson(value: unknown): value is NonNullable<ModelCircuitPreview
   )
 }
 
+function containsServerBenchmarkStub(
+  circuit_json: NonNullable<ModelCircuitPreview["circuit_json"]>,
+): boolean {
+  return circuit_json.some((element) => {
+    if (element.type !== "simulation_spice_subcircuit") return false
+    const source = (element as { subcircuit_source?: unknown }).subcircuit_source
+    return typeof source === "string" && /\bSERVER_BENCHMARK_STUB\b/.test(source)
+  })
+}
+
 async function readWorkspaceCircuitJson(input: {
   model_dir: string
   benchmark_id: string
@@ -245,7 +255,7 @@ async function readWorkspaceCircuitJson(input: {
     const value = await readFile(candidate.file, "utf8")
       .then((text) => JSON.parse(text) as unknown)
       .catch(() => undefined)
-    if (isCircuitJson(value)) {
+    if (isCircuitJson(value) && !containsServerBenchmarkStub(value)) {
       return { circuit_json: value, updated_at: candidate.file_stat.mtime.toISOString() }
     }
   }

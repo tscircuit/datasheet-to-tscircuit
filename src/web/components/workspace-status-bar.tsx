@@ -10,6 +10,7 @@ const COMPONENT_STATUS_COPY: Record<JobDisplayStatus, string> = {
   cancelling: "Stopping",
   cancelled: "Cancelled",
   complete: "Ready",
+  unsupported: "Not convertible",
   failed: "Failed",
 }
 
@@ -26,10 +27,11 @@ const MODEL_STATUS_COPY: Record<ModelRunStatus, string> = {
   failed: "Failed",
 }
 
-type StatusTone = "idle" | "working" | "ready" | "failed"
+type StatusTone = "idle" | "working" | "ready" | "unsupported" | "failed"
 
 function getStatusTone(status: string): StatusTone {
   if (status === "Ready") return "ready"
+  if (status === "Not convertible") return "unsupported"
   if (["Failed", "Cancelled", "Timed out"].includes(status)) return "failed"
   if (status === "Not started") return "idle"
   return "working"
@@ -58,7 +60,9 @@ export function WorkspaceStatusBar({
       ? "Ready"
       : COMPONENT_STATUS_COPY[job.display_status]
   const model_status = getModelStatus(model_run, is_model_loading)
-  const has_downloads = Boolean(job.component_code || job.typical_application_code || model_run?.model_source)
+  const has_downloads = Boolean(
+    job.component_code || job.typical_application_code || model_run?.model_source || job.evidence_available,
+  )
 
   return (
     <div className="workspace-status-bar" aria-label="Artifact status and downloads">
@@ -110,6 +114,14 @@ export function WorkspaceStatusBar({
               <a href={getModelRunFileUrl(job.job_id, "model")}>
                 <FlaskConical size={14} /> SPICE model
               </a>
+            )}
+            {job.evidence_available && (
+              <>
+                <a href={getJobFileUrl(job.job_id, "component_evidence")}>Evidence JSON</a>
+                <a href={getJobFileUrl(job.job_id, "footprint_plan")}>Footprint plan</a>
+                <a href={getJobFileUrl(job.job_id, "land_pattern")}>Land-pattern reference</a>
+                <a href={getJobFileUrl(job.job_id, "events")}>Structured diagnostics</a>
+              </>
             )}
             <Popover.Arrow className="workspace-download-arrow" />
           </Popover.Content>

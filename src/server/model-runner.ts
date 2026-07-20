@@ -691,6 +691,10 @@ async function preflightBenchmarkHarnesses(input: {
 }): Promise<void> {
   const temporary_component = join(input.model_dir, "component-with-model.circuit.tsx")
   const saved_root = join(input.model_dir, ".benchmark-harness-preflight")
+  const benchmark_files = await listModelBenchFiles(input.model_dir)
+  const generated_directories = benchmark_files.map((benchmark_file) =>
+    join(input.job_dir, "dist", "spice", "benchmarks", benchmark_file.replace(/\.circuit\.tsx$/i, "")),
+  )
   if (await Bun.file(temporary_component).exists()) {
     throw new Error("A model wrapper exists before benchmark simulation preflight")
   }
@@ -724,7 +728,6 @@ async function preflightBenchmarkHarnesses(input: {
       parsed_application_plan?.availability === "documented"
         ? getBenchmarkApplicationPlan(parsed_application_plan)
         : undefined
-    const benchmark_files = await listModelBenchFiles(input.model_dir)
     await input.append(
       "system",
       `Running one server-owned stub-model simulation for each of ${benchmark_files.length} provisional benchmark harness(es) before locking…\n`,
@@ -795,6 +798,7 @@ async function preflightBenchmarkHarnesses(input: {
     await Promise.all([
       rm(temporary_component, { force: true }),
       rm(saved_root, { recursive: true, force: true }),
+      ...generated_directories.map((directory) => rm(directory, { recursive: true, force: true })),
     ])
   }
 }

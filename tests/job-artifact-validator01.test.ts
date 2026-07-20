@@ -5,11 +5,12 @@ import { join } from "node:path"
 import type { AnyCircuitElement } from "circuit-json"
 import { AGENT_EVENT_PROTOCOL, type TrustedAgentEvent } from "@/server/agent-event-protocol"
 import {
-  getApplicationSchematicErrors,
+  getApplicationSchematicLayoutAdvisories,
   getFootprintPlanErrors,
   getTypicalApplicationComponentValueErrors,
   getTypicalApplicationConnectivityErrors,
   getTypicalApplicationSourceErrors,
+  validateAgentImageReads,
   validateVisualInspection,
 } from "@/server/job-artifact-validator"
 
@@ -27,7 +28,7 @@ test("application source gate rejects only standalone netlabel JSX elements", ()
   expect(getTypicalApplicationSourceErrors('<trace from=".U1 > .VIN" to={sel.net.VIN} />')).toEqual([])
 })
 
-test("compiled application schematic gate allows labels but rejects complexity-scaled long wires", () => {
+test("compiled application schematic reports long-wire compactness as an advisory", () => {
   const circuit = [
     ...Array.from({ length: 7 }, (_, index) => ({
       type: "schematic_component",
@@ -42,12 +43,13 @@ test("compiled application schematic gate allows labels but rejects complexity-s
       edges: [{ from: { x: -5, y: 0 }, to: { x: 4.5, y: 0 } }],
     },
   ] as unknown as AnyCircuitElement[]
-  const errors = getApplicationSchematicErrors(circuit)
-  expect(errors).toHaveLength(1)
-  expect(errors[0]).toContain("is 9.50 units long")
+  const advisories = getApplicationSchematicLayoutAdvisories(circuit)
+  expect(advisories).toHaveLength(1)
+  expect(advisories[0]).toContain("is 9.50 units long")
+  expect(advisories[0]).toContain("compact-layout target")
 
   expect(
-    getApplicationSchematicErrors([
+    getApplicationSchematicLayoutAdvisories([
       { type: "schematic_component", center: { x: 0, y: 0 } },
       {
         type: "schematic_trace",
@@ -55,6 +57,21 @@ test("compiled application schematic gate allows labels but rejects complexity-s
       },
     ] as unknown as AnyCircuitElement[]),
   ).toEqual([])
+
+  const observed_runs = [6.9, 7.13].map((length) =>
+    getApplicationSchematicLayoutAdvisories([
+      ...Array.from({ length: 7 }, (_, index) => ({
+        type: "schematic_component",
+        center: { x: index, y: 0 },
+      })),
+      {
+        type: "schematic_trace",
+        edges: [{ from: { x: 0, y: 0 }, to: { x: length, y: 0 } }],
+      },
+    ] as unknown as AnyCircuitElement[]),
+  )
+  expect(observed_runs[0]?.[0]).toContain("is 6.90 units long")
+  expect(observed_runs[1]?.[0]).toContain("is 7.13 units long")
 })
 
 const connectivityPlan = {
@@ -106,6 +123,62 @@ test("datasheet connectivity gate catches a cleanly-built pull-up on the wrong n
   expect(getTypicalApplicationConnectivityErrors(connectivityPlan, applicationCircuit("vin"))).toEqual([])
   expect(getTypicalApplicationConnectivityErrors(connectivityPlan, applicationCircuit("vout"))).toEqual([
     "VIN: expected pins are not electrically connected: U1.VIN, R3.pin1",
+  ])
+})
+
+test("datasheet connectivity accepts swapped pins only for interchangeable passives", () => {
+  const plan = {
+    components: [{ reference: "U1" }, { reference: "L1" }],
+    connections: [
+      { net: "SW_L1", pins: ["U1.L1", "L1.1"] },
+      { net: "SW_L2", pins: ["U1.L2", "L1.2"] },
+    ],
+  }
+  const circuit = (interchangeable: boolean) =>
+    [
+      { type: "source_component", source_component_id: "u1", name: "U1" },
+      {
+        type: "source_component",
+        source_component_id: "l1",
+        name: "L1",
+        are_pins_interchangeable: interchangeable,
+      },
+      {
+        type: "source_port",
+        source_port_id: "u1_l1",
+        source_component_id: "u1",
+        name: "L1",
+        subcircuit_connectivity_map_key: "switch-a",
+      },
+      {
+        type: "source_port",
+        source_port_id: "u1_l2",
+        source_component_id: "u1",
+        name: "L2",
+        subcircuit_connectivity_map_key: "switch-b",
+      },
+      {
+        type: "source_port",
+        source_port_id: "l1_pin1",
+        source_component_id: "l1",
+        name: "pin1",
+        pin_number: 1,
+        subcircuit_connectivity_map_key: "switch-b",
+      },
+      {
+        type: "source_port",
+        source_port_id: "l1_pin2",
+        source_component_id: "l1",
+        name: "pin2",
+        pin_number: 2,
+        subcircuit_connectivity_map_key: "switch-a",
+      },
+    ] as unknown as AnyCircuitElement[]
+
+  expect(getTypicalApplicationConnectivityErrors(plan, circuit(true))).toEqual([])
+  expect(getTypicalApplicationConnectivityErrors(plan, circuit(false))).toEqual([
+    "SW_L1: expected pins are not electrically connected: U1.L1, L1.1",
+    "SW_L2: expected pins are not electrically connected: U1.L2, L1.2",
   ])
 })
 
@@ -231,6 +304,51 @@ test("visual gate accepts honest inconclusive reports but rejects unsupported pa
     expected_images,
   }
   await expect(validateVisualInspection(input)).resolves.toEqual({ status: "passed" })
+  for (const executable of ["npx tsci", "bunx tsci", "./node_modules/.bin/tsci", "node_modules/.bin/tsci"]) {
+    const wrapped_events: TrustedAgentEvent[] = events.map((event) =>
+      event.type === "tool_start" && event.tool_call_id === "build"
+        ? {
+            ...event,
+            args: {
+              command: `${executable} build index.circuit.tsx --ignore-warnings --pcb-png --schematic-svgs`,
+            },
+          }
+        : event,
+    )
+    await expect(validateVisualInspection({ ...input, events: wrapped_events })).resolves.toEqual({
+      status: "passed",
+    })
+  }
+  await expect(
+    validateVisualInspection({
+      ...input,
+      events: events.map((event) =>
+        event.type === "tool_start" && event.tool_call_id === "build"
+          ? {
+              ...event,
+              args: { command: "npx tsci build index.circuit.tsx && touch unexpected" },
+            }
+          : event,
+      ),
+    }),
+  ).rejects.toThrow("missing final build command")
+  await Bun.write(
+    join(job_dir, "component-visual-inspection.json"),
+    JSON.stringify({
+      version: 1,
+      status: "passed",
+      reference_image: expected_images.reference,
+      pcb_render: expected_images.pcb,
+      schematic_render: expected_images.schematic,
+    }),
+  )
+  await expect(validateVisualInspection(input)).resolves.toEqual({ status: "passed" })
+  const canonical_report = JSON.parse(
+    await Bun.file(join(job_dir, "component-visual-inspection.json")).text(),
+  )
+  expect(canonical_report.pcb_image).toBe(expected_images.pcb)
+  expect(canonical_report.schematic_image).toBe(expected_images.schematic)
+  expect(canonical_report.pcb_render).toBeUndefined()
   await expect(
     validateVisualInspection({
       ...input,
@@ -244,7 +362,7 @@ test("visual gate accepts honest inconclusive reports but rejects unsupported pa
         },
       ],
     }),
-  ).rejects.toThrow("Visual inspection was inconclusive")
+  ).rejects.toThrow("Image inspection was unavailable")
   await expect(
     validateVisualInspection({
       ...input,
@@ -270,6 +388,34 @@ test("visual gate accepts honest inconclusive reports but rejects unsupported pa
       ),
     }),
   ).resolves.toEqual({ status: "inconclusive" })
+
+  await expect(
+    validateAgentImageReads({
+      job_dir,
+      expected_images: [expected_images.reference],
+      events: [
+        {
+          protocol: AGENT_EVENT_PROTOCOL,
+          sequence: 1,
+          type: "tool_start",
+          tool_call_id: "read-resize-failure",
+          tool_name: "read",
+          args: { path: expected_images.reference },
+        },
+        {
+          protocol: AGENT_EVENT_PROTOCOL,
+          sequence: 2,
+          type: "tool_end",
+          tool_call_id: "read-resize-failure",
+          tool_name: "read",
+          is_error: false,
+          result_has_image: false,
+          result_text:
+            "Read image file [image/png]\n[Image omitted: could not be resized below the inline image size limit.]",
+        },
+      ],
+    }),
+  ).rejects.toThrow("Image inspection was unavailable")
 
   await rm(job_dir, { recursive: true, force: true })
 })
