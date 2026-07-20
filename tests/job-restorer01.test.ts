@@ -67,7 +67,10 @@ test("persisted component and model jobs survive a server restart and deletion r
     file_name: "original-sensor.pdf",
     additional_instructions: "Keep the exposed pad",
   })
-  await original_jobs.appendLog("job_restore", "system", "Original component log\n")
+  await original_jobs.appendLog("job_restore", {
+    stream: "system",
+    message: "Original component log\n",
+  })
   original_jobs.updateJob("job_restore", { display_status: "building" })
 
   const original_models = new ModelRunStore()
@@ -79,7 +82,10 @@ test("persisted component and model jobs survive a server restart and deletion r
     base_effort_ms: 1_000,
   })
   await Bun.write(join(model_dir, "model.lib"), ".SUBCKT RESTORED IN OUT\n.ENDS RESTORED\n")
-  await original_models.appendLog("model_restore", "system", "Original model log\n")
+  await original_models.appendLog("model_restore", {
+    stream: "system",
+    message: "Original model log\n",
+  })
   original_models.startSegment("model_restore")
 
   const restored_jobs = new JobStore()

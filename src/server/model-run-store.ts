@@ -80,11 +80,7 @@ function computeElapsedTime(record: ModelRunRecord, now = Date.now()): number {
   return record.elapsed_time_ms + Math.max(0, now - segment_start)
 }
 
-function computeValidationReserve(
-  _record: ModelRunRecord,
-  _simulation_run_count = _record.validation_run_count,
-  _observed_canary_ms = _record.validation_canary_ms,
-): number {
+function computeValidationReserve(): number {
   // Evidence setup, benchmark repair, and independent validation are server-owned
   // work. They pause the refinement segment instead of consuming user effort.
   return 0
@@ -233,9 +229,7 @@ export class ModelRunStore {
 
   getFinalizationReserveMs(model_run_id: string, simulation_run_count = 0): number | undefined {
     const record = this.run_map.get(model_run_id)
-    return record
-      ? computeValidationReserve(record, simulation_run_count || record.validation_run_count)
-      : undefined
+    return record ? computeValidationReserve() : undefined
   }
 
   setValidationProfile(
@@ -390,19 +384,19 @@ export class ModelRunStore {
     return "requested"
   }
 
-  async appendLog(model_run_id: string, stream: JobLogStream, message: string): Promise<JobLog> {
+  async appendLog(model_run_id: string, input: { stream: JobLogStream; message: string }): Promise<JobLog> {
     const record = this.requireRecord(model_run_id)
     const log: JobLog = {
       log_id: crypto.randomUUID(),
       created_at: new Date().toISOString(),
-      stream,
-      message,
+      stream: input.stream,
+      message: input.message,
     }
     record.logs.push(log)
     record.updated_at = log.created_at
     await appendFile(
       join(record.model_dir, "model-agent.log"),
-      `[${log.created_at}] [${stream}] ${message}`,
+      `[${log.created_at}] [${input.stream}] ${input.message}`,
       "utf8",
     )
     this.persist(record)
@@ -457,7 +451,7 @@ export class ModelRunStore {
           elapsed_time_ms: computeElapsedTime(record),
           remaining_time_ms,
           deadline_at,
-          finalization_reserve_ms: computeValidationReserve(record),
+          finalization_reserve_ms: computeValidationReserve(),
           instruction:
             "Re-read this file before every refinement iteration; only agent refinement consumes effort, while server validation is untimed.",
         },

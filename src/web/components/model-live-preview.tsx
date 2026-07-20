@@ -77,11 +77,12 @@ function CircuitPlaceholder({ preview }: { preview?: ModelCircuitPreviewData }) 
   )
 }
 
-export function getRunframeCircuitJson(
-  active_tab: TabId,
-  live_circuit_json: ModelCircuitPreviewData["circuit_json"],
-  code_tab_circuit_json: ModelCircuitPreviewData["circuit_json"],
-): ModelCircuitPreviewData["circuit_json"] {
+export function getRunframeCircuitJson(input: {
+  active_tab: TabId
+  live_circuit_json: ModelCircuitPreviewData["circuit_json"]
+  code_tab_circuit_json: ModelCircuitPreviewData["circuit_json"]
+}): ModelCircuitPreviewData["circuit_json"] {
+  const { active_tab, live_circuit_json, code_tab_circuit_json } = input
   return active_tab === "code" && code_tab_circuit_json !== undefined
     ? code_tab_circuit_json
     : live_circuit_json
@@ -92,11 +93,11 @@ function ModelCircuitPreview({ preview }: { preview?: ModelCircuitPreviewData })
   // Runframe leaves Code whenever the Circuit JSON prop changes. Keep the snapshot
   // that was visible on entry, then reveal the newest live data on a visual tab.
   const [code_tab_circuit_json, setCodeTabCircuitJson] = useState(preview?.circuit_json)
-  const runframe_circuit_json = getRunframeCircuitJson(
+  const runframe_circuit_json = getRunframeCircuitJson({
     active_tab,
-    preview?.circuit_json,
+    live_circuit_json: preview?.circuit_json,
     code_tab_circuit_json,
-  )
+  })
 
   const handleActiveTabChange = (tab: TabId) => {
     if (tab === "code") setCodeTabCircuitJson(preview?.circuit_json)

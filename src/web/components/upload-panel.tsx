@@ -77,9 +77,13 @@ export function UploadPanel({ on_job_created }: UploadPanelProps) {
     setErrorMessage(undefined)
     try {
       on_job_created(
-        await createJob(file, additional_instructions, {
-          create_pspice_model,
-          model_effort_multiplier: model_effort,
+        await createJob({
+          file,
+          additional_instructions,
+          model_options: {
+            create_pspice_model,
+            model_effort_multiplier: model_effort,
+          },
         }),
       )
     } catch (error) {

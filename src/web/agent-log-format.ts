@@ -102,12 +102,13 @@ function getToolMetadata(
   }
 }
 
-function appendTextEntry(
-  entries: AgentLogEntry[],
-  kind: AgentLogTextKind,
-  text: string,
-  entry_id: string,
-): void {
+function appendTextEntry(input: {
+  entries: AgentLogEntry[]
+  kind: AgentLogTextKind
+  text: string
+  entry_id: string
+}): void {
+  const { entries, kind, text, entry_id } = input
   const previous_entry = entries.at(-1)
   if (previous_entry?.kind === kind) {
     previous_entry.text += text
@@ -117,12 +118,13 @@ function appendTextEntry(
   entries.push({ entry_id, kind, text })
 }
 
-function completeToolEntry(
-  entries: AgentLogEntry[],
-  tool_name: string,
-  status: AgentLogToolEntry["status"],
-  entry_id: string,
-): void {
+function completeToolEntry(input: {
+  entries: AgentLogEntry[]
+  tool_name: string
+  status: AgentLogToolEntry["status"]
+  entry_id: string
+}): void {
+  const { entries, tool_name, status, entry_id } = input
   const matching_entry = entries
     .slice()
     .reverse()
@@ -171,7 +173,7 @@ export function formatAgentLogs(logs: JobLog[]): AgentLogEntry[] {
         const tool_name = tool_marker[1] ?? "tool"
         const tool_payload = tool_marker[2]?.trim() ?? ""
         if (tool_payload === "ok" || tool_payload === "failed") {
-          completeToolEntry(entries, tool_name, tool_payload, entry_id)
+          completeToolEntry({ entries, tool_name, status: tool_payload, entry_id })
         } else {
           entries.push({
             entry_id,
@@ -187,12 +189,12 @@ export function formatAgentLogs(logs: JobLog[]): AgentLogEntry[] {
 
       const operational_marker = marker.match(/^\[(compaction|retry)\]\s+(.+)$/)
       if (operational_marker) {
-        appendTextEntry(
+        appendTextEntry({
           entries,
-          "notice",
-          `${titleCase(operational_marker[1] ?? "")}: ${operational_marker[2]}\n`,
+          kind: "notice",
+          text: `${titleCase(operational_marker[1] ?? "")}: ${operational_marker[2]}\n`,
           entry_id,
-        )
+        })
         continue
       }
 
@@ -206,7 +208,7 @@ export function formatAgentLogs(logs: JobLog[]): AgentLogEntry[] {
             : is_agent_active
               ? "message"
               : "output"
-      appendTextEntry(entries, kind, line, entry_id)
+      appendTextEntry({ entries, kind, text: line, entry_id })
     }
   }
 

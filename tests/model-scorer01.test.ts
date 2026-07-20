@@ -73,8 +73,11 @@ test("model scorer evaluates every locked benchmark from numeric CSV data", asyn
   expect(report.benchmarks[0]?.normalized_rmse).toBe(0)
   expect(report.benchmarks[1]?.passed).toBe(false)
 
-  const transfer = await scoreSingleModelBenchmark(model_dir, "transfer")
-  const comparison_svg = await renderModelBenchmarkComparisonSvg(model_dir, "transfer")
+  const transfer = await scoreSingleModelBenchmark({ model_dir, benchmark_id: "transfer" })
+  const comparison_svg = await renderModelBenchmarkComparisonSvg({
+    model_dir,
+    benchmark_id: "transfer",
+  })
   expect(transfer.passed).toBe(true)
   expect(comparison_svg).toContain("Transfer curve")
   expect(comparison_svg).toContain("Datasheet reference")

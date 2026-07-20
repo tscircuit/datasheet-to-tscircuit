@@ -6,18 +6,36 @@ const previous_circuit_json: NonNullable<ModelCircuitPreview["circuit_json"]> = 
 const live_circuit_json: NonNullable<ModelCircuitPreview["circuit_json"]> = []
 
 test("the code tab keeps a stable Circuit JSON reference while live previews update", () => {
-  expect(getRunframeCircuitJson("code", live_circuit_json, previous_circuit_json)).toBe(previous_circuit_json)
-  expect(getRunframeCircuitJson("analog_simulation", live_circuit_json, previous_circuit_json)).toBe(
-    live_circuit_json,
-  )
-  expect(getRunframeCircuitJson("schematic", live_circuit_json, previous_circuit_json)).toBe(
-    live_circuit_json,
-  )
+  expect(
+    getRunframeCircuitJson({
+      active_tab: "code",
+      live_circuit_json,
+      code_tab_circuit_json: previous_circuit_json,
+    }),
+  ).toBe(previous_circuit_json)
+  expect(
+    getRunframeCircuitJson({
+      active_tab: "analog_simulation",
+      live_circuit_json,
+      code_tab_circuit_json: previous_circuit_json,
+    }),
+  ).toBe(live_circuit_json)
+  expect(
+    getRunframeCircuitJson({
+      active_tab: "schematic",
+      live_circuit_json,
+      code_tab_circuit_json: previous_circuit_json,
+    }),
+  ).toBe(live_circuit_json)
 })
 
 test("the code tab uses live Circuit JSON until it has captured a snapshot", () => {
   expect(
-    getRunframeCircuitJson("code", live_circuit_json as ModelCircuitPreview["circuit_json"], undefined),
+    getRunframeCircuitJson({
+      active_tab: "code",
+      live_circuit_json: live_circuit_json as ModelCircuitPreview["circuit_json"],
+      code_tab_circuit_json: undefined,
+    }),
   ).toBe(live_circuit_json)
 })
 

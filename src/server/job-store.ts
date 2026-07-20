@@ -206,20 +206,20 @@ export class JobStore {
     return job
   }
 
-  async appendLog(job_id: string, stream: JobLogStream, message: string): Promise<JobLog> {
+  async appendLog(job_id: string, input: { stream: JobLogStream; message: string }): Promise<JobLog> {
     const job_record = this.job_map.get(job_id)
     if (!job_record) throw new Error(`Job ${job_id} was not found`)
 
     const log: JobLog = {
       log_id: crypto.randomUUID(),
       created_at: new Date().toISOString(),
-      stream,
-      message,
+      stream: input.stream,
+      message: input.message,
     }
     job_record.logs.push(log)
     await appendFile(
       join(job_record.job_dir, "agent.log"),
-      `[${log.created_at}] [${stream}] ${message}`,
+      `[${log.created_at}] [${input.stream}] ${input.message}`,
       "utf8",
     )
     this.publish(job_record, { event_type: "log", log })

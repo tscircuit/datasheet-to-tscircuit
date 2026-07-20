@@ -214,7 +214,7 @@ test("feedback integrity helper perturbs only the named divider resistor", () =>
   <resistor name="R1" resistance="511k" />
   <resistor name="R2" resistance="91k" />
 </board>`
-  const shifted = shiftNamedResistorResistance(source, "R1", 1.05)
+  const shifted = shiftNamedResistorResistance({ source, reference: "R1", ratio: 1.05 })
   expect(shifted?.original_ohms).toBe(511_000)
   expect(shifted?.shifted_ohms).toBe(536_550)
   expect(shifted?.source).toContain('name="R1" resistance="536550ohm"')

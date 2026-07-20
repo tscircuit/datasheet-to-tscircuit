@@ -169,40 +169,46 @@ test("application agreement compares electrical semantics instead of agent-autho
     ],
     connections: [{ net: "VIN_1V3_TO_5V5", pins: ["C1.1", "U1.VIN"] }],
   })
-  expect(getTypicalApplicationPlanAgreementErrors(primary, independently_cited, "TPS63802")).toEqual([])
   expect(
-    getTypicalApplicationPlanAgreementErrors(
+    getTypicalApplicationPlanAgreementErrors({
       primary,
-      {
+      independent: independently_cited,
+      target_part_number: "TPS63802",
+    }),
+  ).toEqual([])
+  expect(
+    getTypicalApplicationPlanAgreementErrors({
+      primary,
+      independent: {
         ...independently_cited,
         components: independently_cited.components.map((component) =>
           component.reference === "C1" ? { ...component, kind: "resistor" } : component,
         ),
       },
-      "TPS63802",
-    ),
+      target_part_number: "TPS63802",
+    }),
   ).toContain('typical-application component C1 kind disagrees: "capacitor" versus "resistor"')
   expect(
-    getTypicalApplicationPlanAgreementErrors(
+    getTypicalApplicationPlanAgreementErrors({
       primary,
-      {
+      independent: {
         ...independently_cited,
         components: independently_cited.components.map((component) =>
           component.reference === "C1" ? { ...component, value: "22 µF" } : component,
         ),
       },
-      "TPS63802",
-    ),
+      target_part_number: "TPS63802",
+    }),
   ).toContain('typical-application component C1 value disagrees: "10uF" versus "22 µF"')
   expect(
-    getTypicalApplicationPlanAgreementErrors(
+    getTypicalApplicationPlanAgreementErrors({
       primary,
-      {
+      independent: {
         ...independently_cited,
         connections: [{ net: "VIN", pins: ["U1.VIN", "C1.2"] }],
       },
-      "TPS63802",
-    ),
+      target_part_number: "TPS63802",
+    }),
   ).toContain('independent typical application is missing the endpoint group from net "VIN": c1.1, u1.vin')
 
   const unrelated_ic_variant = {
@@ -211,9 +217,13 @@ test("application agreement compares electrical semantics instead of agent-autho
       component.reference === "U1" ? { ...component, value: "TPS63803" } : component,
     ),
   }
-  expect(getTypicalApplicationPlanAgreementErrors(primary, unrelated_ic_variant, "TPS63802")).toContain(
-    'typical-application component U1 value disagrees: "TPS63802DLAR" versus "TPS63803"',
-  )
+  expect(
+    getTypicalApplicationPlanAgreementErrors({
+      primary,
+      independent: unrelated_ic_variant,
+      target_part_number: "TPS63802",
+    }),
+  ).toContain('typical-application component U1 value disagrees: "TPS63802DLAR" versus "TPS63803"')
 
   const part_number_designator = parseTypicalApplicationPlan({
     ...independently_cited,
@@ -225,7 +235,13 @@ test("application agreement compares electrical semantics instead of agent-autho
       pins: connection.pins.map((endpoint) => endpoint.replace(/^U1\./, "TPS63802.")),
     })),
   })
-  expect(getTypicalApplicationPlanAgreementErrors(primary, part_number_designator, "TPS63802")).toEqual([])
+  expect(
+    getTypicalApplicationPlanAgreementErrors({
+      primary,
+      independent: part_number_designator,
+      target_part_number: "TPS63802",
+    }),
+  ).toEqual([])
 })
 
 test("application plans discard invented interface-terminal pseudo-components", () => {

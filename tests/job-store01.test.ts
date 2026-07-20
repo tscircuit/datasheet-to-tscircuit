@@ -12,7 +12,10 @@ test("JobStore streams updates and persists every log chunk", async () => {
   job_store.createJob({ job_id: "job_1", job_dir, file_name: "sensor.pdf" })
   const unsubscribe = job_store.subscribe("job_1", (job_event) => event_types.push(job_event.event_type))
 
-  await job_store.appendLog("job_1", "stderr", "[tool] read datasheet.pdf\n")
+  await job_store.appendLog("job_1", {
+    stream: "stderr",
+    message: "[tool] read datasheet.pdf\n",
+  })
   job_store.updateJob("job_1", {
     display_status: "agent_running",
     component_ready: true,

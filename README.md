@@ -64,6 +64,41 @@ proxied by Vite. Direct server execution binds to `127.0.0.1` by default. Set
 `HOST` or `PORT` to override the bind address or port, and set `TSCI_AGENT_BIN`
 or `TSCI_BIN` to override the discovered local executables.
 
+## Source organization
+
+The server is organized by responsibility. Top-level server modules such as
+`job-runner.ts` and `model-runner.ts` are small compatibility barrels; the
+implementation lives in a matching directory of named modules.
+
+```text
+src/
+├── server/
+│   ├── agent-tools/                 structured AI-agent CLI tools
+│   ├── component-evidence/          evidence parsing and validation
+│   ├── component-schematic-plan/    schematic-plan parsing and validation
+│   ├── instructions/                agent workspace instruction strings
+│   ├── job-api/                     component-job HTTP operations
+│   ├── job-artifact-validator/      generated component/application checks
+│   ├── job-restorer/                persisted job recovery
+│   ├── job-runner/                  component conversion phases and prompts
+│   ├── job-scaffold/                generated component workspace files
+│   ├── model-artifact-monitor/      saved model preview readers
+│   ├── model-benchmark-lock/        immutable benchmark lock handling
+│   ├── model-progress/              model progress parsing and monitoring
+│   ├── model-run-api/               SPICE model-run HTTP operations
+│   ├── model-runner/                model setup, refinement, and validation
+│   ├── model-scaffold/              generated model workspace files and prompts
+│   ├── model-scorer/                benchmark scoring and comparison output
+│   ├── model-simulation-validator/  independent simulation validation
+│   └── paths/                       repository path definitions
+├── shared/                          browser/server data contracts
+└── web/                             React UI and browser API client
+```
+
+Files are named for their exported operation. Orchestrators compose those
+operations while stateful stores retain related class methods. Internal
+functions follow the [tscircuit code handbook](https://github.com/tscircuit/handbook/blob/main/guides/code.md): input data is grouped into a named object and a store or execution context is passed separately.
+
 ## How jobs work
 
 Each upload gets its own directory under `.runtime/jobs`. The server writes the

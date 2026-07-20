@@ -28,11 +28,12 @@ async function readApiError(response: Response): Promise<string> {
   return `Request failed with status ${response.status}`
 }
 
-export async function createJob(
-  file: File,
-  additional_instructions: string,
-  model_options?: { create_pspice_model: boolean; model_effort_multiplier: number },
-): Promise<Job> {
+export async function createJob(input: {
+  file: File
+  additional_instructions: string
+  model_options?: { create_pspice_model: boolean; model_effort_multiplier: number }
+}): Promise<Job> {
+  const { file, additional_instructions, model_options } = input
   const form = new FormData()
   form.set("datasheet", file)
   if (additional_instructions.trim()) form.set("additional_instructions", additional_instructions.trim())
