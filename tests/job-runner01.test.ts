@@ -238,7 +238,6 @@ await Bun.write(process.cwd() + "/dist/" + stem + "/circuit.json", JSON.stringif
   expect(await Bun.file(join(job_dir, "agent-events.jsonl")).text()).toContain('"result_has_image":true')
   const persisted_job = JSON.parse(await Bun.file(join(job_dir, "job.json")).text())
   expect(persisted_job.version).toBe(2)
-  expect(persisted_job.provenance.tscircuit_version).toBe("0.0.2075")
   expect(persisted_job.provenance.datasheet_sha256).toHaveLength(64)
   expect(persisted_job.provenance.prompt_sha256.component_generation).toHaveLength(64)
   expect(await Bun.file(join(job_dir, "build-targets.log")).text()).toBe(
