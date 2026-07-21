@@ -92,10 +92,13 @@ The server controls three strictly separated phases:
   \`footprint-plan.json\`, and \`typical-application-plan.json\` as read-only.
 - Create a default-exported \`typical-application.circuit.tsx\` importing
   \`./index.circuit\`. Implement every planned component, value, and structured net.
-- For \`pcb_implementation: "verified"\`, use every approved manufacturer part number exactly. For
-  each external component, set literal \`manufacturerPartNumber\` and \`footprint\` JSX props to the
-  approved values. For \`schematic_only\`, omit all application footprint and PCB placement props and build with
-  \`--disable-pcb --schematic-svgs\`; inspect and report only the reference and schematic images.
+- For every external component with a recorded manufacturer part number, set the exact literal
+  \`manufacturerPartNumber\` JSX prop in both verified and schematic-only modes. For
+  \`pcb_implementation: "verified"\`, also set each external component's literal \`footprint\` JSX
+  prop to the approved value. For \`schematic_only\`, omit all application footprint and PCB
+  placement props and build with \`--disable-pcb --schematic-svgs\`; inspect and report only the
+  reference and schematic images. Schematic-only mode omits PCB implementation, not recorded
+  component identity.
 - Also treat component-schematic-plan.json as read-only.
 - Do not instantiate a standalone netlabel element. Net selectors such as net.* and sel.net.*,
   net-connected traces, trace schDisplayLabel props, and compiled schematic net-label records are allowed.

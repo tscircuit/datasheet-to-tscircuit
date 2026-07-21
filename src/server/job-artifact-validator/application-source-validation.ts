@@ -33,14 +33,18 @@ export function getTypicalApplicationSourceErrors(
   if (pcb_implementation === "schematic_only" && /\bpcb(?:X|Y|Rotation|Layer)\s*=/.test(source)) {
     errors.push("Schematic-only typical application source must not assign PCB placement props")
   }
-  if (pcb_implementation === "verified" && plan) {
+  if (plan) {
     const component_props = getLiteralJsxComponentProps(source)
     for (const component of plan.components) {
       if (component.reference.trim().toLowerCase() === "u1") continue
+      const requires_part_number = Boolean(component.manufacturer_part_number)
+      if (pcb_implementation !== "verified" && !requires_part_number) continue
       const props = component_props.get(component.reference.trim().toLowerCase())
       if (!props) {
         errors.push(
-          `Verified PCB component ${component.reference} must be instantiated with a literal name prop`,
+          pcb_implementation === "verified"
+            ? `Verified PCB component ${component.reference} must be instantiated with a literal name prop`
+            : `Application component ${component.reference} with a recorded manufacturer part number must be instantiated with a literal name prop`,
         )
         continue
       }
@@ -49,10 +53,16 @@ export function getTypicalApplicationSourceErrors(
         props.manufacturerPartNumber !== component.manufacturer_part_number
       ) {
         errors.push(
-          `Verified PCB component ${component.reference} must set literal manufacturerPartNumber=${JSON.stringify(component.manufacturer_part_number)}`,
+          pcb_implementation === "verified"
+            ? `Verified PCB component ${component.reference} must set literal manufacturerPartNumber=${JSON.stringify(component.manufacturer_part_number)}`
+            : `Application component ${component.reference} must set literal manufacturerPartNumber=${JSON.stringify(component.manufacturer_part_number)}`,
         )
       }
-      if (component.footprint && props.footprint !== component.footprint) {
+      if (
+        pcb_implementation === "verified" &&
+        component.footprint &&
+        props.footprint !== component.footprint
+      ) {
         errors.push(
           `Verified PCB component ${component.reference} must set literal footprint=${JSON.stringify(component.footprint)}`,
         )

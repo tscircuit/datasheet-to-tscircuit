@@ -150,8 +150,11 @@ test("prompts separate evidence extraction from build-verified TSX generation", 
   expect(application_prompt).toContain("JSX manufacturerPartNumber prop")
   expect(application_prompt).toContain("Do not modify `visual-reference/typical-application.png`")
   expect(application_prompt).toContain("Use the QFN package")
-  expect(buildTypicalApplicationPrompt(undefined, "schematic_only")).toContain("--disable-pcb")
-  expect(buildTypicalApplicationPrompt(undefined, "schematic_only")).toContain("omit pcb_image")
+  const schematic_only_application_prompt = buildTypicalApplicationPrompt(undefined, "schematic_only")
+  expect(schematic_only_application_prompt).toContain("--disable-pcb")
+  expect(schematic_only_application_prompt).toContain("omit pcb_image")
+  expect(schematic_only_application_prompt).toContain("literal JSX manufacturerPartNumber prop")
+  expect(schematic_only_application_prompt).toContain("required in both verified and schematic_only modes")
   expect(buildTypicalApplicationEvidenceVerificationPrompt("Use the QFN package")).toContain(
     "Use the QFN package",
   )
@@ -689,7 +692,7 @@ const args = process.argv.slice(2)
 const dir = args[args.indexOf("--dir") + 1]
 const prompt = args[args.indexOf("--prompt") + 1]
 ${fakeVisualInspectionHelpers}
-const plan = { version: 4, availability: "documented", pcb_implementation: "schematic_only", title: "Typical sensor application", description: "No sourced capacitor package", source_references: [{ page: 8 }], components: [{ reference: "U1", kind: "sensor" }, { reference: "C1", kind: "capacitor", value: "1uF" }], connections: [{ net: "VCC", pins: ["U1.VCC", "C1.pin1"] }] }
+const plan = { version: 4, availability: "documented", pcb_implementation: "schematic_only", title: "Typical sensor application", description: "No sourced capacitor package", source_references: [{ page: 8 }], components: [{ reference: "U1", kind: "sensor" }, { reference: "C1", kind: "capacitor", value: "1uF", manufacturer_part_number: "TEST-C1", source_references: [{ page: 8 }] }], connections: [{ net: "VCC", pins: ["U1.VCC", "C1.pin1"] }] }
 if (prompt.includes("Independently extract") || prompt.includes("evidence-extraction phase")) {
   await recordEvidence(plan)
 } else if (prompt.includes("Generate the reusable")) {
@@ -697,7 +700,8 @@ if (prompt.includes("Independently extract") || prompt.includes("evidence-extrac
   await recordVisualInspection("component")
 } else {
   if (!prompt.includes("--disable-pcb")) throw new Error("schematic-only build instruction missing")
-  await Bun.write(dir + "/typical-application.circuit.tsx", 'import Part from "./index.circuit"\\nexport default function Application() { return <board><Part name="U1" /><capacitor name="C1" capacitance="1uF" /></board> }\\n')
+  if (!prompt.includes("required in both verified and schematic_only modes")) throw new Error("schematic-only part identity instruction missing")
+  await Bun.write(dir + "/typical-application.circuit.tsx", 'import Part from "./index.circuit"\\nexport default function Application() { return <board><Part name="U1" /><capacitor name="C1" capacitance="1uF" manufacturerPartNumber="TEST-C1" /></board> }\\n')
   await recordVisualInspection("application", "passed", true, " --disable-pcb --schematic-svgs")
 }
 finishAgent()
@@ -718,7 +722,7 @@ if (!pcbDisabled) await Bun.write(process.cwd() + "/dist/" + stem + "/pcb.png", 
 await Bun.write(process.cwd() + "/dist/" + stem + "/schematic.png", renderPng)
 const circuit = target === "index.circuit.tsx" || target === "component-validation.circuit.tsx"
   ? [{ type: "source_component", source_component_id: "part", name: "U1", manufacturer_part_number: "SENSOR-1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"], requires_power: true }, { type: "schematic_component", schematic_component_id: "sch1", source_component_id: "part", center: { x: 0, y: 0 } }, { type: "schematic_port", schematic_port_id: "sp1", schematic_component_id: "sch1", source_port_id: "u1_vcc", side_of_component: "top", center: { x: 0, y: 1 } }, { type: "pcb_smtpad", pcb_smtpad_id: "pad1", pcb_component_id: "pcb1", pcb_port_id: "port1", port_hints: ["1"], x: 0, y: 0, width: 0.6, height: 0.25 }]
-  : [{ type: "source_component", source_component_id: "part", name: "U1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", subcircuit_connectivity_map_key: "vcc" }, { type: "source_component", source_component_id: "cap", name: "C1", capacitance: 0.000001 }, { type: "source_port", source_port_id: "c1_1", source_component_id: "cap", name: "pin1", pin_number: 1, subcircuit_connectivity_map_key: "vcc" }, { type: "source_port", source_port_id: "c1_2", source_component_id: "cap", name: "pin2", pin_number: 2 }]
+  : [{ type: "source_component", source_component_id: "part", name: "U1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", subcircuit_connectivity_map_key: "vcc" }, { type: "source_component", source_component_id: "cap", name: "C1", capacitance: 0.000001, manufacturer_part_number: "TEST-C1" }, { type: "source_port", source_port_id: "c1_1", source_component_id: "cap", name: "pin1", pin_number: 1, subcircuit_connectivity_map_key: "vcc" }, { type: "source_port", source_port_id: "c1_2", source_component_id: "cap", name: "pin2", pin_number: 2 }]
 await Bun.write(process.cwd() + "/dist/" + stem + "/circuit.json", JSON.stringify(circuit))
 `,
     ),

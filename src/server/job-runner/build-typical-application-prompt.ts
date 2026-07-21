@@ -14,10 +14,8 @@ with \`tsci build typical-application.circuit.tsx --disable-pcb --schematic-svgs
 locked reference and \`dist/typical-application/schematic.png\`, then omit pcb_image from the visual
 inspection report. Placement and routing-difficulty checks are not applicable; run the netlist check
 before the final schematic-only build.`
-      : `The approved plan is verified for PCB implementation. Use each recorded
-manufacturer_part_number exactly as the component's JSX manufacturerPartNumber prop, and do not
-substitute a different passive. Set the component's literal footprint JSX prop to the separately
-sourced footprint value exactly; do not substitute a generic footprint.
+      : `The approved plan is verified for PCB implementation. Set each component's literal footprint
+JSX prop to the separately sourced footprint value exactly; do not substitute a generic footprint.
 Run the netlist, placement, and routing-difficulty checks separately before the final PCB build.`
 
   return `Complete phase 2 of the datasheet conversion. The server has independently
@@ -35,6 +33,11 @@ as a default-exported tscircuit circuit that imports the generated component fro
 the recorded external component values, connections, and operating context. Do
 not replace the generated component with a generic chip or duplicate its
 definition.
+
+For every external component with a recorded manufacturer_part_number, set that exact value as a
+literal JSX manufacturerPartNumber prop and do not substitute a different passive. This identity
+metadata is required in both verified and schematic_only modes; schematic_only omits PCB
+implementation props, not recorded component identity.
 
 Never instantiate a standalone <netlabel> element. Net selectors such as "net.*" and "sel.net.*",
 net-connected traces, trace schDisplayLabel props, and compiled schematic net-label records are

@@ -63,6 +63,31 @@ test("application source gate rejects only standalone netlabel JSX elements", ()
       verified_plan,
     ),
   ).toContain('Verified PCB component L1 must set literal footprint="0805"')
+
+  const schematic_only_plan = {
+    components: [
+      { reference: "U1" },
+      {
+        reference: "C1",
+        manufacturer_part_number: "GRM188R60J106ME84",
+      },
+    ],
+    connections: [{ net: "VIN", pins: ["U1.VIN", "C1.pin1"] }],
+  }
+  expect(
+    getTypicalApplicationSourceErrors(
+      '<group><capacitor name="C1" capacitance="10uF" /></group>',
+      "schematic_only",
+      schematic_only_plan,
+    ),
+  ).toEqual(['Application component C1 must set literal manufacturerPartNumber="GRM188R60J106ME84"'])
+  expect(
+    getTypicalApplicationSourceErrors(
+      '<group><capacitor name="C1" capacitance="10uF" manufacturerPartNumber="GRM188R60J106ME84" /></group>',
+      "schematic_only",
+      schematic_only_plan,
+    ),
+  ).toEqual([])
 })
 
 test("compiled application schematic reports long-wire compactness as an advisory", () => {
