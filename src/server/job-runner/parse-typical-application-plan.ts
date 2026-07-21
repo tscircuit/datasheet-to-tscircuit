@@ -10,13 +10,23 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export interface TypicalApplicationPlan {
-  version: 3
+  version: 3 | 4
   availability: "documented" | "not_present"
+  pcb_implementation?: "verified" | "schematic_only"
   title: string
   description: string
   source_references: Array<{ page: number; figure?: string }>
   searched_sections?: string[]
-  components: Array<{ reference: string; kind: string; value?: string; purpose?: string }>
+  components: Array<{
+    reference: string
+    kind: string
+    value?: string
+    purpose?: string
+    manufacturer_part_number?: string
+    footprint?: string
+    source_references?: Array<{ page: number; figure?: string }>
+    footprint_source_references?: Array<{ page: number; figure?: string }>
+  }>
   connections: ExpectedApplicationConnection[]
 }
 
@@ -184,13 +194,37 @@ export function parseTypicalApplicationPlan(
   value: unknown,
   target_part_number?: string,
 ): TypicalApplicationPlan {
-  if (!isRecord(value) || (value.version !== 1 && value.version !== 2 && value.version !== 3)) {
-    throw new Error("typical-application-plan.json must have version 3")
+  if (
+    !isRecord(value) ||
+    (value.version !== 1 && value.version !== 2 && value.version !== 3 && value.version !== 4)
+  ) {
+    throw new Error("typical-application-plan.json must have version 4")
   }
-  const availability = value.version === 3 ? value.availability : "documented"
+  const availability = value.version === 3 || value.version === 4 ? value.availability : "documented"
   if (availability !== "documented" && availability !== "not_present") {
     throw new Error("typical-application-plan.json must declare documented or not_present")
   }
+  const raw_pcb_implementation =
+    value.version === 4 ? value.pcb_implementation : availability === "documented" ? "verified" : undefined
+  if (
+    raw_pcb_implementation !== undefined &&
+    raw_pcb_implementation !== "verified" &&
+    raw_pcb_implementation !== "schematic_only"
+  ) {
+    throw new Error("pcb_implementation must be verified or schematic_only")
+  }
+  if (
+    availability === "documented" &&
+    raw_pcb_implementation !== "verified" &&
+    raw_pcb_implementation !== "schematic_only"
+  ) {
+    throw new Error(
+      "documented typical-application evidence must declare pcb_implementation verified or schematic_only",
+    )
+  }
+  const pcb_implementation = raw_pcb_implementation as
+    | TypicalApplicationPlan["pcb_implementation"]
+    | undefined
   if (!Array.isArray(value.source_references) || value.source_references.length === 0) {
     throw new Error("typical-application-plan.json must cite at least one datasheet page")
   }
@@ -218,6 +252,59 @@ export function parseTypicalApplicationPlan(
       throw new Error(`typical application component ${reference} is listed more than once`)
     }
     seen_components.add(reference.toLowerCase())
+    let component_source_references: Array<{ page: number; figure?: string }> | undefined
+    if (component.source_references !== undefined) {
+      if (!Array.isArray(component.source_references) || component.source_references.length === 0) {
+        throw new Error(`components[${index}].source_references must cite at least one datasheet page`)
+      }
+      component_source_references = component.source_references.map((source, source_index) => {
+        if (!isRecord(source) || !Number.isInteger(source.page) || (source.page as number) < 1) {
+          throw new Error(
+            `components[${index}].source_references[${source_index}].page must be a positive integer`,
+          )
+        }
+        return {
+          page: source.page as number,
+          ...(source.figure === undefined
+            ? {}
+            : {
+                figure: requiredText(
+                  source.figure,
+                  `components[${index}].source_references[${source_index}].figure`,
+                ),
+              }),
+        }
+      })
+    }
+    let footprint_source_references: Array<{ page: number; figure?: string }> | undefined
+    if (component.footprint_source_references !== undefined) {
+      if (
+        !Array.isArray(component.footprint_source_references) ||
+        component.footprint_source_references.length === 0
+      ) {
+        throw new Error(
+          `components[${index}].footprint_source_references must cite at least one datasheet page`,
+        )
+      }
+      footprint_source_references = component.footprint_source_references.map((source, source_index) => {
+        if (!isRecord(source) || !Number.isInteger(source.page) || (source.page as number) < 1) {
+          throw new Error(
+            `components[${index}].footprint_source_references[${source_index}].page must be a positive integer`,
+          )
+        }
+        return {
+          page: source.page as number,
+          ...(source.figure === undefined
+            ? {}
+            : {
+                figure: requiredText(
+                  source.figure,
+                  `components[${index}].footprint_source_references[${source_index}].figure`,
+                ),
+              }),
+        }
+      })
+    }
     return {
       reference,
       kind: requiredText(component.kind, `components[${index}].kind`),
@@ -227,6 +314,19 @@ export function parseTypicalApplicationPlan(
       ...(component.purpose === undefined
         ? {}
         : { purpose: requiredText(component.purpose, `components[${index}].purpose`) }),
+      ...(component.manufacturer_part_number === undefined
+        ? {}
+        : {
+            manufacturer_part_number: requiredText(
+              component.manufacturer_part_number,
+              `components[${index}].manufacturer_part_number`,
+            ),
+          }),
+      ...(component.footprint === undefined
+        ? {}
+        : { footprint: requiredText(component.footprint, `components[${index}].footprint`) }),
+      ...(component_source_references ? { source_references: component_source_references } : {}),
+      ...(footprint_source_references ? { footprint_source_references } : {}),
     }
   })
   if (
@@ -276,8 +376,9 @@ export function parseTypicalApplicationPlan(
   })
   const canonical_plan = canonicalizeTypicalApplicationPlan(
     {
-      version: 3,
+      version: value.version === 4 ? 4 : 3,
       availability,
+      ...(pcb_implementation ? { pcb_implementation } : {}),
       title: requiredText(value.title, "typical application title"),
       description: requiredText(value.description, "typical application description"),
       source_references,
@@ -294,6 +395,21 @@ export function parseTypicalApplicationPlan(
       const component_name = endpoint.slice(0, endpoint.indexOf(".")).toLowerCase()
       if (!component_names.has(component_name)) {
         throw new Error(`typical application endpoint ${endpoint} references an unlisted component`)
+      }
+    }
+  }
+  if (value.version === 4 && pcb_implementation === "verified") {
+    for (const component of canonical_plan.components) {
+      if (normalizedIdentifier(component.reference) === "u1") continue
+      if (
+        !component.manufacturer_part_number ||
+        !component.source_references?.length ||
+        !component.footprint ||
+        !component.footprint_source_references?.length
+      ) {
+        throw new Error(
+          `verified PCB component ${component.reference} must include a datasheet-sourced manufacturer_part_number, source_references, footprint, and footprint_source_references`,
+        )
       }
     }
   }

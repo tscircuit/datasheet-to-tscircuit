@@ -1,14 +1,14 @@
 import { appendFile, cp, readFile, rm } from "node:fs/promises"
 import { join, resolve } from "node:path"
-import { type TrustedAgentEvent, parseTrustedAgentEvent } from "../agent-event-protocol"
+import { parseTrustedAgentEvent, type TrustedAgentEvent } from "../agent-event-protocol"
 import { repositoryRoot } from "../paths/repository-paths"
+import { renderTrustedAgentEvent } from "./render-trusted-agent-event"
 import {
   AutomatedConversionUnavailableError,
-  JobRunnerContext,
-  StreamProcessInput,
+  type JobRunnerContext,
+  type StreamProcessInput,
   streamProcess,
 } from "./stream-job-process"
-import { renderTrustedAgentEvent } from "./render-trusted-agent-event"
 
 export async function runStructuredAgentPhase(input: {
   context: JobRunnerContext
@@ -24,6 +24,14 @@ export async function runStructuredAgentPhase(input: {
   let stdout_buffer = ""
   let invalid_stdout = false
   let last_sequence = 0
+  let thinking_buffer = ""
+
+  const flushThinking = async (): Promise<void> => {
+    if (!thinking_buffer) return
+    const buffered = thinking_buffer
+    thinking_buffer = ""
+    await input.append("stderr", buffered)
+  }
 
   const consume_line = async (line: string): Promise<void> => {
     if (!line.trim()) return
@@ -46,6 +54,11 @@ export async function runStructuredAgentPhase(input: {
         "utf8",
       )
     }
+    if (event.type === "thinking_delta") {
+      thinking_buffer += event.text
+      return
+    }
+    await flushThinking()
     await renderTrustedAgentEvent(event, input.append)
   }
 
@@ -70,6 +83,7 @@ export async function runStructuredAgentPhase(input: {
       },
     })
     if (stdout_buffer) await consume_line(stdout_buffer)
+    await flushThinking()
     if (exit_code !== 0) throw new Error(`tsci-agent exited with code ${exit_code}`)
     if (invalid_stdout || events.length === 0) {
       throw new Error("tsci-agent did not provide a valid structured event stream")

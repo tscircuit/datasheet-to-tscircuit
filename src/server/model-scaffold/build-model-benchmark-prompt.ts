@@ -41,13 +41,22 @@ divider, input/output capacitors, inductor, power-good pull-up, or their datashe
 
 Accept only drafts whose reference x-axis is time. Every accepted benchmark
 must use simulation.kind \`"transient_voltage"\`, simulation.x_axis \`"time_ms"\`,
-and one analog transient run that emits the complete comparison waveform.
+and one analog transient run that emits the complete comparison waveform. Set the
+analogsimulation duration to at least one timePerStep beyond the final reference
+x value so the simulator cannot end one sample before the locked reference.
 
 Omit the analogsimulation \`simulationType\` prop or set it exactly to
 \`"spice_transient_analysis"\`. Before committing the lock, the server performs
 static contract validation, source compilation, and one simulation of every
 harness using a simple server-owned stub model. Fix every shorted source, unresolved
-node, simulator abort, and source/simulation error found by that preflight. The
+node, simulator abort, and source/simulation error found by that preflight. The server
+also probes every DUT pin marked requiresPower and rejects a harness whose supply
+remains effectively at 0 V. For every such pin, include a direct voltage probe named
+\`SERVER_PREFLIGHT_POWER_<PIN>\` connected to \`.DUT > .<PIN>\` and referenced to
+\`net.GND\`; for example VIN uses \`SERVER_PREFLIGHT_POWER_VIN\`. These diagnostic
+probes are not scoring outputs. Do not compensate for a broken stimulus in the DUT model.
+For a stepped supply, drive the DUT rail with one ground-referenced waveform source;
+do not stack ideal voltage sources into a shorted or floating source loop. The
 actual candidate model simulations run only during refinement and independent
 validation, when a canonical model exists.
 

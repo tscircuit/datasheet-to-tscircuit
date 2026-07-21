@@ -91,6 +91,9 @@ export async function extractPrimaryEvidenceAttempt(input: {
     JSON.parse(typical_application_plan_raw_text),
     component_evidence.part_number.value,
   )
+  if (typical_application_plan.version !== 4) {
+    throw new Error("New evidence extraction must use typical-application plan schema version 4")
+  }
   const typical_application_plan_text = `${JSON.stringify(typical_application_plan, null, 2)}\n`
   if (typical_application_plan_text !== typical_application_plan_raw_text) {
     await Bun.write(join(input.job_dir, "typical-application-plan.json"), typical_application_plan_text)

@@ -5,8 +5,17 @@ export {
   classifyFatalSimulationFailure,
 } from "./model-process-output"
 export { parseModelManifest, validateManifestAgainstModel } from "./parse-model-manifest"
-export { restoreLastPromotedModelCheckpoint } from "./model-checkpoint"
-export { getBenchmarkApplicationPlan } from "./get-benchmark-application-plan"
+export {
+  isReportedCheckpointBetter,
+  restoreBestReportedModelCheckpoint,
+  restoreLastPromotedModelCheckpoint,
+} from "./model-checkpoint"
+export { getBenchmarkApplicationPlan, getRequiredPowerPinLabels } from "./get-benchmark-application-plan"
+export {
+  getRequiredPowerPreflightProbeName,
+  getRequiredPowerProbeContractErrors,
+  getUnpoweredRequiredPinErrors,
+} from "./preflight-benchmark-harnesses"
 export { stripAnalogSimulationForStructuralCheck } from "./strip-analog-simulation-for-structural-check"
 export { preflightNgspice } from "./preflight-ngspice"
 export type {

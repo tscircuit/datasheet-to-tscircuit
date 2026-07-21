@@ -1,19 +1,22 @@
+import { createHash } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { dirname, relative, resolve } from "node:path"
 import type { TrustedAgentEvent } from "../agent-event-protocol"
 
 const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10]
 
+export interface VisualInspectionImages {
+  reference: string
+  pcb?: string
+  schematic: string
+}
+
 interface VisualInspectionInput {
   job_dir: string
   events: TrustedAgentEvent[]
   report_file: string
   build_command: string
-  expected_images: {
-    reference: string
-    pcb: string
-    schematic: string
-  }
+  expected_images: VisualInspectionImages
 }
 
 export interface VisualInspectionResult {
@@ -24,6 +27,52 @@ export class VisualInspectionInconclusiveError extends Error {
   constructor(message: string) {
     super(message)
     this.name = "VisualInspectionInconclusiveError"
+  }
+}
+
+export interface VisualInspectionSnapshot {
+  images: Array<{ kind: string; path: string; sha256: string }>
+}
+
+function imageEntries(images: VisualInspectionImages): Array<[string, string]> {
+  return Object.entries(images).flatMap(([kind, path]) =>
+    typeof path === "string" ? [[kind, path] as [string, string]] : [],
+  )
+}
+
+export async function captureVisualInspectionSnapshot(input: {
+  job_dir: string
+  expected_images: VisualInspectionImages
+}): Promise<VisualInspectionSnapshot> {
+  return {
+    images: await Promise.all(
+      imageEntries(input.expected_images).map(async ([kind, path]) => {
+        const absolute_path = resolveInsideJob(input.job_dir, path)
+        if (!absolute_path) {
+          throw new Error(`Visual inspection image path escapes the job directory: ${path}`)
+        }
+        const bytes = await readFile(absolute_path)
+        return { kind, path, sha256: createHash("sha256").update(bytes).digest("hex") }
+      }),
+    ),
+  }
+}
+
+export async function assertVisualInspectionSnapshotMatches(input: {
+  job_dir: string
+  snapshot: VisualInspectionSnapshot
+}): Promise<void> {
+  const changed: string[] = []
+  for (const image of input.snapshot.images) {
+    const absolute_path = resolveInsideJob(input.job_dir, image.path)
+    const bytes = absolute_path ? await readFile(absolute_path).catch(() => undefined) : undefined
+    const digest = bytes ? createHash("sha256").update(bytes).digest("hex") : undefined
+    if (digest !== image.sha256) changed.push(image.path)
+  }
+  if (changed.length > 0) {
+    throw new VisualInspectionInconclusiveError(
+      `Authoritative server build did not reproduce the agent-inspected image(s): ${changed.join(", ")}`,
+    )
   }
 }
 
@@ -191,8 +240,14 @@ export async function validateVisualInspection(
 
   const reportedImagePath = (kind: string): unknown =>
     report[`${kind}_image`] ?? (kind === "pcb" || kind === "schematic" ? report[`${kind}_render`] : undefined)
-  for (const [kind, expected_path] of Object.entries(input.expected_images)) {
+  if (!input.expected_images.pcb && reportedImagePath("pcb") !== undefined) {
+    throw new Error(`${input.report_file} must omit pcb_image when no PCB output is authorized`)
+  }
+  for (const [kind, expected_path] of imageEntries(input.expected_images)) {
     const reported_path = reportedImagePath(kind)
+    if (report.status === "passed" && reported_path !== expected_path) {
+      throw new Error(`${input.report_file} must set ${kind}_image to ${expected_path}`)
+    }
     if (reported_path !== undefined && reported_path !== expected_path) {
       throw new Error(`${input.report_file} must set ${kind}_image to ${expected_path}`)
     }
@@ -210,8 +265,9 @@ export async function validateVisualInspection(
         {
           version: 1,
           status: report.status,
+          basis: "agent_visual_attestation",
           ...Object.fromEntries(
-            Object.entries(input.expected_images).map(([kind, path]) => [`${kind}_image`, path]),
+            imageEntries(input.expected_images).map(([kind, path]) => [`${kind}_image`, path]),
           ),
           ...(typeof report.notes === "string" ? { notes: report.notes } : {}),
         },
@@ -259,7 +315,7 @@ export async function validateVisualInspection(
     await validateAgentImageReads({
       job_dir: input.job_dir,
       events: input.events,
-      expected_images: Object.values(input.expected_images),
+      expected_images: imageEntries(input.expected_images).map(([, path]) => path),
       after_sequence: final_build_sequence,
     })
   } catch (error) {

@@ -30,7 +30,8 @@ Write component-evidence.json with this schema:
     "pin_count": evidenceField<number> },
   "pinout": { "pins": [{ "number": string, "labels": string[],
       "role": "power_input" | "power_output" | "ground" | "input" | "output" |
-        "bidirectional" | "passive" | "no_connect" | "other", "description": string?,
+        "bidirectional" | "passive" | "no_connect" | "other",
+      "electrical_attributes": { "open_drain": boolean? }?, "description": string?,
       "sources": evidenceSource[] }] },
   "footprint": { "view": "pcb_top", "units": "mm",
     "drawing_orientation": evidenceField<"pcb_top" | "package_top" |
@@ -57,14 +58,19 @@ conflict cannot be resolved automatically, set status to unresolved and describe
 When status is resolved, unresolved_ambiguities must be empty; record resolved or non-material
 datasheet discrepancies in the relevant source note instead.
 Classify each pin role from its cited electrical function. The role describes the pin, not a desired
-schematic side; use other only when none of the explicit electrical roles applies.
+schematic side; use other only when none of the explicit electrical roles applies. Set
+electrical_attributes.open_drain only when the cited pin documentation explicitly identifies an
+open-drain output; never infer it from the generic output role.
 
 Do not write footprint-plan.json. The server derives it deterministically from the sourced
 component-evidence footprint pads and drawing orientation. Write typical-application-plan.json:
-{ "version": 3, "availability": "documented" | "not_present", "title": string,
+{ "version": 4, "availability": "documented" | "not_present",
+  "pcb_implementation": "verified" | "schematic_only", "title": string,
   "description": string, "source_references": [{ "page": number, "figure": string? }],
   "searched_sections": string[]?, "components": [{ "reference": string, "kind": string,
-  "value": string?, "purpose": string? }],
+  "value": string?, "purpose": string?, "manufacturer_part_number": string?,
+  "footprint": string?, "source_references": [{ "page": number, "figure": string? }]?,
+  "footprint_source_references": [{ "page": number, "figure": string? }]? }],
   "connections": [{ "net": string, "pins": [string, string, ...] }] }.
 Set availability to documented and include cited sources, components, values, and complete
 structured nets using exact component.port endpoints when the PDF contains an application. If a
@@ -75,6 +81,16 @@ visual-reference/land-pattern.png. For a
 documented application, save and read visual-reference/typical-application.png. For not_present,
 only the land-pattern image is required. Do not create component-visual-inspection.json or run tsci
 in this phase.
+
+Search the application, design-requirements, inductor-selection, capacitor-selection, and
+recommended-components sections for source-backed passive selections. Set pcb_implementation to
+verified only when every non-U1 component has an exact datasheet-listed manufacturer part number,
+component-level source_references, an exact tscircuit footprint string, and separate
+footprint_source_references that explicitly support that package or land pattern. Body dimensions
+alone do not support a generic footprint name. Do not invent a purchasable part or footprint. If
+even one external component lacks both a sourced exact part and a sourced exact footprint, set
+pcb_implementation to schematic_only; the application phase will then omit PCB footprints and
+publish only the schematic implementation.
 
 List only actual referenced electrical parts in components. Unlabeled rail arrows, open-circle
 input/output terminals, and schematic wire endpoints are interfaces, not components; do not invent

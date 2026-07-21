@@ -82,6 +82,10 @@ function ArtifactRunframe({
   const code = is_application ? job.typical_application_code : job.component_code
 
   if (!circuit_json) return <EmptyPreview job={job} artifact={artifact} />
+  const has_pcb_artifact = circuit_json.some((element) => element.type.startsWith("pcb_"))
+  const available_tabs: ComponentPreviewTab[] = has_pcb_artifact
+    ? ["code", "pcb", "schematic"]
+    : ["code", "schematic"]
 
   return (
     <Suspense fallback={<EmptyPreview job={job} artifact={artifact} />}>
@@ -91,7 +95,7 @@ function ArtifactRunframe({
         code={code}
         showCodeTab={Boolean(code)}
         codeTabContent={<CodePanel job={job} artifact={artifact} />}
-        availableTabs={["code", "pcb", "schematic"]}
+        availableTabs={available_tabs}
         defaultActiveTab={active_tab}
         defaultTab={active_tab}
         onActiveTabChange={(tab) => {

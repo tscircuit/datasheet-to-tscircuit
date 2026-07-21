@@ -5,6 +5,8 @@ import { join } from "node:path"
 import type { AnyCircuitElement } from "circuit-json"
 import { AGENT_EVENT_PROTOCOL, type TrustedAgentEvent } from "@/server/agent-event-protocol"
 import {
+  assertVisualInspectionSnapshotMatches,
+  captureVisualInspectionSnapshot,
   getApplicationSchematicLayoutAdvisories,
   getFootprintPlanErrors,
   getTypicalApplicationComponentValueErrors,
@@ -26,6 +28,41 @@ test("application source gate rejects only standalone netlabel JSX elements", ()
     ),
   ).toEqual([])
   expect(getTypicalApplicationSourceErrors('<trace from=".U1 > .VIN" to={sel.net.VIN} />')).toEqual([])
+  expect(
+    getTypicalApplicationSourceErrors(
+      '<board><inductor name="L1" footprint="0805" pcbX={1} /></board>',
+      "schematic_only",
+    ),
+  ).toEqual([
+    "Schematic-only typical application source must not assign PCB footprints",
+    "Schematic-only typical application source must not assign PCB placement props",
+  ])
+
+  const verified_plan = {
+    components: [
+      { reference: "U1" },
+      {
+        reference: "L1",
+        manufacturer_part_number: "DFE201612E-R47M",
+        footprint: "0805",
+      },
+    ],
+    connections: [{ net: "SW", pins: ["U1.SW", "L1.pin1"] }],
+  }
+  expect(
+    getTypicalApplicationSourceErrors(
+      '<board><inductor name="L1" inductance="0.47uH" manufacturerPartNumber="DFE201612E-R47M" footprint="0805" /></board>',
+      "verified",
+      verified_plan,
+    ),
+  ).toEqual([])
+  expect(
+    getTypicalApplicationSourceErrors(
+      '<board><inductor name="L1" inductance="0.47uH" manufacturerPartNumber="DFE201612E-R47M" footprint="0402" /></board>',
+      "verified",
+      verified_plan,
+    ),
+  ).toContain('Verified PCB component L1 must set literal footprint="0805"')
 })
 
 test("compiled application schematic reports long-wire compactness as an advisory", () => {
@@ -232,6 +269,46 @@ test("application value gate catches a changed feedback-divider value", () => {
   ])
 })
 
+test("application component gate enforces sourced manufacturer part numbers", () => {
+  const plan = {
+    components: [
+      {
+        reference: "L1",
+        kind: "inductor",
+        value: "0.47uH",
+        manufacturer_part_number: "DFE201612E-R47M",
+        footprint: "0805",
+      },
+    ],
+    connections: [{ net: "SW", pins: ["L1.pin1", "L1.pin2"] }],
+  }
+  const circuit = [
+    {
+      type: "source_component",
+      source_component_id: "l1",
+      name: "L1",
+      inductance: "0.47uH",
+      manufacturer_part_number: "UNSOURCED-0805",
+    },
+    {
+      type: "cad_component",
+      cad_component_id: "l1-cad",
+      pcb_component_id: "l1-pcb",
+      source_component_id: "l1",
+      footprinter_string: "0402",
+      position: { x: 0, y: 0, z: 0 },
+      model_object_fit: "contain_within_bounds",
+    },
+  ] as unknown as AnyCircuitElement[]
+
+  expect(getTypicalApplicationComponentValueErrors(plan, circuit)).toContain(
+    'Application component L1 has manufacturer part number "UNSOURCED-0805", expected "DFE201612E-R47M"',
+  )
+  expect(getTypicalApplicationComponentValueErrors(plan, circuit)).toContain(
+    'Application component L1 has footprint "0402", expected "0805"',
+  )
+})
+
 test("visual gate accepts honest inconclusive reports but rejects unsupported pass claims", async () => {
   const job_dir = await mkdtemp(join(tmpdir(), "datasheet-visual-gate-"))
   const png = Uint8Array.from(
@@ -304,6 +381,46 @@ test("visual gate accepts honest inconclusive reports but rejects unsupported pa
     expected_images,
   }
   await expect(validateVisualInspection(input)).resolves.toEqual({ status: "passed" })
+  await Bun.write(
+    join(job_dir, "component-visual-inspection.json"),
+    JSON.stringify({
+      version: 1,
+      status: "passed",
+      reference_image: expected_images.reference,
+      schematic_image: expected_images.schematic,
+    }),
+  )
+  await expect(validateVisualInspection(input)).rejects.toThrow(
+    `must set pcb_image to ${expected_images.pcb}`,
+  )
+  await expect(
+    validateVisualInspection({
+      ...input,
+      expected_images: {
+        reference: expected_images.reference,
+        schematic: expected_images.schematic,
+      },
+    }),
+  ).resolves.toEqual({ status: "passed" })
+  await Bun.write(
+    join(job_dir, "component-visual-inspection.json"),
+    JSON.stringify({
+      version: 1,
+      status: "passed",
+      reference_image: expected_images.reference,
+      pcb_image: expected_images.pcb,
+      schematic_image: expected_images.schematic,
+    }),
+  )
+  await expect(
+    validateVisualInspection({
+      ...input,
+      expected_images: {
+        reference: expected_images.reference,
+        schematic: expected_images.schematic,
+      },
+    }),
+  ).rejects.toThrow("must omit pcb_image")
   for (const executable of ["npx tsci", "bunx tsci", "./node_modules/.bin/tsci", "node_modules/.bin/tsci"]) {
     const wrapped_events: TrustedAgentEvent[] = events.map((event) =>
       event.type === "tool_start" && event.tool_call_id === "build"
@@ -348,6 +465,7 @@ test("visual gate accepts honest inconclusive reports but rejects unsupported pa
   )
   expect(canonical_report.pcb_image).toBe(expected_images.pcb)
   expect(canonical_report.schematic_image).toBe(expected_images.schematic)
+  expect(canonical_report.basis).toBe("agent_visual_attestation")
   expect(canonical_report.pcb_render).toBeUndefined()
   await expect(
     validateVisualInspection({
@@ -416,6 +534,12 @@ test("visual gate accepts honest inconclusive reports but rejects unsupported pa
       ],
     }),
   ).rejects.toThrow("Image inspection was unavailable")
+
+  const snapshot = await captureVisualInspectionSnapshot({ job_dir, expected_images })
+  await Bun.write(join(job_dir, expected_images.pcb), "different authoritative render")
+  await expect(assertVisualInspectionSnapshotMatches({ job_dir, snapshot })).rejects.toThrow(
+    "did not reproduce the agent-inspected image",
+  )
 
   await rm(job_dir, { recursive: true, force: true })
 })

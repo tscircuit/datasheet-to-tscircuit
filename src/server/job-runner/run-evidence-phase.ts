@@ -1,22 +1,26 @@
+import { cp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import type { ComponentEvidence } from "../component-evidence"
 import {
   getComponentEvidenceBlockingReasons,
   getFootprintEvidenceErrors,
+  getIndependentComponentEvidenceAcceptedDifferences,
   getIndependentComponentEvidenceErrors,
 } from "../component-evidence"
-import { createComponentSchematicPlan, type ComponentSchematicPlan } from "../component-schematic-plan"
+import { type ComponentSchematicPlan, createComponentSchematicPlan } from "../component-schematic-plan"
 import type { FootprintPlan } from "../job-artifact-validator"
-import { extractIndependentComponentEvidence } from "./extract-independent-component-evidence"
 import {
-  type PrimaryEvidenceExtraction,
+  extractIndependentComponentEvidence,
+  retainEvidenceAttemptArtifacts,
+} from "./extract-independent-component-evidence"
+import {
   canRetryEvidenceFailure,
   extractPrimaryEvidenceAttempt,
+  type PrimaryEvidenceExtraction,
 } from "./extract-primary-evidence-attempt"
-import { retainEvidenceAttemptArtifacts } from "./extract-independent-component-evidence"
-import { getTypicalApplicationPlanAgreementErrors } from "./get-typical-application-plan-agreement-errors"
 import { snapshotProtectedTree } from "./generation-workspace"
-import { JobExecution } from "./job-execution"
+import { getTypicalApplicationPlanAgreementErrors } from "./get-typical-application-plan-agreement-errors"
+import type { JobExecution } from "./job-execution"
 import type { TypicalApplicationPlan } from "./parse-typical-application-plan"
 import { AutomatedConversionUnavailableError, throwIfCancelled } from "./stream-job-process"
 
@@ -95,8 +99,9 @@ async function extractPrimaryEvidence(execution: JobExecution): Promise<PrimaryE
 async function verifyEvidenceIndependently(
   primary_evidence: PrimaryEvidenceExtraction,
   execution: JobExecution,
-): Promise<void> {
+): Promise<PrimaryEvidenceExtraction> {
   let independent_retry_feedback: string | undefined
+  let first_valid_disagreement: Awaited<ReturnType<typeof extractIndependentComponentEvidence>> | undefined
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       const independently_verified = await extractIndependentComponentEvidence({
@@ -129,17 +134,58 @@ async function verifyEvidenceIndependently(
         }),
       ]
       const agreement_errors = [...intrinsic_errors, ...comparison_errors]
-      if (agreement_errors.length === 0) return
+      if (agreement_errors.length === 0) {
+        const accepted_differences = getIndependentComponentEvidenceAcceptedDifferences(
+          primary_evidence.component_evidence,
+          independently_verified.component_evidence,
+        )
+        for (const difference of accepted_differences) {
+          await execution.append("system", `Accepted evidence difference: ${difference}.\n`)
+        }
+        return primary_evidence
+      }
       if (attempt < 2) {
-        independent_retry_feedback = intrinsic_errors.length > 0 ? intrinsic_errors.join("; ") : undefined
+        if (intrinsic_errors.length === 0) first_valid_disagreement = independently_verified
+        independent_retry_feedback =
+          intrinsic_errors.length > 0
+            ? intrinsic_errors.join("; ")
+            : "A prior independent extraction disagreed with the primary evidence. Perform a fresh extraction without assuming either result."
         await execution.append(
           "system",
-          `Independent evidence attempt ${attempt} did not converge (${agreement_errors.join("; ")}). Retrying with another independent verification…\n`,
+          `Independent evidence attempt ${attempt} disagreed with the primary extraction (${agreement_errors.join("; ")}). Retrying with another independent verification…\n`,
         )
         continue
       }
+
+      if (intrinsic_errors.length === 0 && first_valid_disagreement) {
+        const independent_consensus_errors = [
+          ...getIndependentComponentEvidenceErrors(
+            first_valid_disagreement.component_evidence,
+            independently_verified.component_evidence,
+          ),
+          ...getTypicalApplicationPlanAgreementErrors({
+            primary: first_valid_disagreement.application_plan,
+            independent: independently_verified.application_plan,
+            target_part_number: independently_verified.component_evidence.part_number.value,
+          }),
+        ]
+        if (independent_consensus_errors.length === 0) {
+          const promoted = await promoteIndependentConsensus({
+            execution,
+            independently_verified,
+          })
+          await execution.append(
+            "system",
+            `Independent evidence consensus overrode the primary extraction (${comparison_errors.join("; ")}). Both independent attempts agree; their canonical evidence is retained for generation.\n`,
+          )
+          return promoted
+        }
+        throw new AutomatedConversionUnavailableError(
+          `Evidence extracts did not reach consensus: primary versus independent-2: ${comparison_errors.join("; ")}; independent-1 versus independent-2: ${independent_consensus_errors.join("; ")}`,
+        )
+      }
       throw new AutomatedConversionUnavailableError(
-        `Independent datasheet evidence did not converge automatically: ${agreement_errors.join("; ")}`,
+        `Evidence extracts did not reach consensus: primary versus independent-2: ${agreement_errors.join("; ")}`,
       )
     } catch (error) {
       if (attempt < 2 && canRetryEvidenceFailure(error)) {
@@ -166,6 +212,39 @@ async function verifyEvidenceIndependently(
   )
 }
 
+async function promoteIndependentConsensus(input: {
+  execution: JobExecution
+  independently_verified: Awaited<ReturnType<typeof extractIndependentComponentEvidence>>
+}): Promise<PrimaryEvidenceExtraction> {
+  const { execution, independently_verified } = input
+  const component_evidence_text = `${JSON.stringify(independently_verified.component_evidence, null, 2)}\n`
+  const footprint_plan_text = `${JSON.stringify(independently_verified.footprint_plan, null, 2)}\n`
+  const typical_application_plan_text = `${JSON.stringify(independently_verified.application_plan, null, 2)}\n`
+  await Promise.all([
+    Bun.write(join(execution.job_dir, "component-evidence.json"), component_evidence_text),
+    Bun.write(join(execution.job_dir, "footprint-plan.json"), footprint_plan_text),
+    Bun.write(join(execution.job_dir, "typical-application-plan.json"), typical_application_plan_text),
+    cp(
+      join(execution.job_dir, "visual-reference", "land-pattern.independent.png"),
+      join(execution.job_dir, "visual-reference", "land-pattern.png"),
+    ),
+    independently_verified.application_plan.availability === "documented"
+      ? cp(
+          join(execution.job_dir, "visual-reference", "typical-application.independent.png"),
+          join(execution.job_dir, "visual-reference", "typical-application.png"),
+        )
+      : rm(join(execution.job_dir, "visual-reference", "typical-application.png"), { force: true }),
+  ])
+  return {
+    component_evidence: independently_verified.component_evidence,
+    component_evidence_text,
+    footprint_plan: independently_verified.footprint_plan,
+    footprint_plan_text,
+    typical_application_plan: independently_verified.application_plan,
+    typical_application_plan_text,
+  }
+}
+
 export async function runEvidencePhase(execution: JobExecution): Promise<ApprovedJobEvidence> {
   throwIfCancelled(execution.cancellation_signal)
   await execution.append(
@@ -180,26 +259,26 @@ export async function runEvidencePhase(execution: JobExecution): Promise<Approve
     "system",
     "\nRunning an independent extraction pass; critical evidence must agree before code generation…\n",
   )
-  await verifyEvidenceIndependently(primary_evidence, execution)
+  const approved_evidence = await verifyEvidenceIndependently(primary_evidence, execution)
 
-  const component_schematic_plan = createComponentSchematicPlan(primary_evidence.component_evidence)
+  const component_schematic_plan = createComponentSchematicPlan(approved_evidence.component_evidence)
   const component_schematic_plan_text = `${JSON.stringify(component_schematic_plan, null, 2)}\n`
   await Bun.write(join(execution.job_dir, "component-schematic-plan.json"), component_schematic_plan_text)
   const locked_visual_references = await snapshotProtectedTree(join(execution.job_dir, "visual-reference"))
   execution.updateValidation({ evidence: "passed" })
   await execution.append(
     "system",
-    "Evidence approved. The primary evidence is locked; the independent artifacts are retained for audit.\n",
+    "Evidence approved. The consensus-selected evidence is locked; all extraction artifacts are retained for audit.\n",
   )
   return {
-    component_evidence: primary_evidence.component_evidence,
-    component_evidence_text: primary_evidence.component_evidence_text,
+    component_evidence: approved_evidence.component_evidence,
+    component_evidence_text: approved_evidence.component_evidence_text,
     component_schematic_plan,
     component_schematic_plan_text,
-    footprint_plan: primary_evidence.footprint_plan,
-    footprint_plan_text: primary_evidence.footprint_plan_text,
-    typical_application_plan: primary_evidence.typical_application_plan,
-    typical_application_plan_text: primary_evidence.typical_application_plan_text,
+    footprint_plan: approved_evidence.footprint_plan,
+    footprint_plan_text: approved_evidence.footprint_plan_text,
+    typical_application_plan: approved_evidence.typical_application_plan,
+    typical_application_plan_text: approved_evidence.typical_application_plan_text,
     locked_visual_references,
   }
 }

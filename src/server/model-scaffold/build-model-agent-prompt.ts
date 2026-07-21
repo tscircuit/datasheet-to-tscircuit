@@ -12,6 +12,17 @@ every benchmark simulation, score, candidate decision, and champion promotion.
 Re-read run-control.json before every refinement iteration because the user may
 extend the time budget while you work. Use the available time to improve the
 same locked benchmark suite; do not reduce tests or loosen tolerances.
+Establish a numeric baseline for every critical benchmark as early as practical.
+Do not spend repeated iterations on one benchmark before each critical benchmark
+has at least one current result. Rank refinement work by critical failures first,
+then worst normalized error, and periodically rerun the complete critical suite.
+Before promoting any candidate, run and score the complete locked suite. Every promoted
+entry in iteration-history.json must record passing, total, score, and
+worst_normalized_error from that same complete-suite run. Promote only when the candidate
+is lexicographically better than the current champion: more passing benchmarks first,
+then lower weighted score, then lower worst normalized error. Never replace a better
+checkpoint with a worse candidate. The server re-evaluates this promotion record and
+selects the best eligible immutable candidate before independent validation.
 Run or refresh saved viewer output with
 \`tsci build benchmarks/<benchmark-id>.circuit.tsx --ignore-warnings
 --disable-pcb --routing-disabled --disable-parts-engine --simulation-svgs\`.
@@ -50,5 +61,7 @@ and validation-artifacts, fix every item, run only the affected local diagnostic
 and return the checkpoint to the server without repeating its exhaustive suite.
 Describe model-card.md regions as intended or agent-tested, not server-validated;
 the server owns the final validation claim.
-Do not stop at a prose report and do not exit knowingly below 100% validation.`
+Do not mark model-progress.json complete while any benchmark is failing. If effort expires,
+leave the best candidate as a non-complete checkpoint for server validation. Do not stop at
+a prose report and do not exit knowingly below 100% validation.`
 }

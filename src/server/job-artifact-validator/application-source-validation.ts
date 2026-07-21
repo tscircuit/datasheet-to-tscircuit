@@ -1,4 +1,5 @@
 import type { AnyCircuitElement } from "circuit-json"
+import ts from "typescript"
 import { CircuitRecord, finiteNumber } from "./footprint-plan-validation"
 
 export interface ExpectedApplicationConnection {
@@ -7,16 +8,97 @@ export interface ExpectedApplicationConnection {
 }
 
 export interface ApplicationConnectivityPlan {
-  components: Array<{ reference: string; kind?: string; value?: string }>
+  components: Array<{
+    reference: string
+    kind?: string
+    value?: string
+    manufacturer_part_number?: string
+    footprint?: string
+  }>
   connections: ExpectedApplicationConnection[]
 }
 
-export function getTypicalApplicationSourceErrors(source: string): string[] {
+export function getTypicalApplicationSourceErrors(
+  source: string,
+  pcb_implementation: "verified" | "schematic_only" = "verified",
+  plan?: ApplicationConnectivityPlan,
+): string[] {
   const errors: string[] = []
   if (/<\s*netlabel\b/i.test(source)) {
     errors.push("Typical application source must not instantiate <netlabel> elements")
   }
+  if (pcb_implementation === "schematic_only" && /\bfootprint\s*=/.test(source)) {
+    errors.push("Schematic-only typical application source must not assign PCB footprints")
+  }
+  if (pcb_implementation === "schematic_only" && /\bpcb(?:X|Y|Rotation|Layer)\s*=/.test(source)) {
+    errors.push("Schematic-only typical application source must not assign PCB placement props")
+  }
+  if (pcb_implementation === "verified" && plan) {
+    const component_props = getLiteralJsxComponentProps(source)
+    for (const component of plan.components) {
+      if (component.reference.trim().toLowerCase() === "u1") continue
+      const props = component_props.get(component.reference.trim().toLowerCase())
+      if (!props) {
+        errors.push(
+          `Verified PCB component ${component.reference} must be instantiated with a literal name prop`,
+        )
+        continue
+      }
+      if (
+        component.manufacturer_part_number &&
+        props.manufacturerPartNumber !== component.manufacturer_part_number
+      ) {
+        errors.push(
+          `Verified PCB component ${component.reference} must set literal manufacturerPartNumber=${JSON.stringify(component.manufacturer_part_number)}`,
+        )
+      }
+      if (component.footprint && props.footprint !== component.footprint) {
+        errors.push(
+          `Verified PCB component ${component.reference} must set literal footprint=${JSON.stringify(component.footprint)}`,
+        )
+      }
+    }
+  }
   return errors
+}
+
+function getLiteralJsxAttribute(node: ts.JsxOpeningLikeElement, attribute_name: string): string | undefined {
+  const attribute = node.attributes.properties.find(
+    (property): property is ts.JsxAttribute =>
+      ts.isJsxAttribute(property) && property.name.getText() === attribute_name,
+  )
+  const initializer = attribute?.initializer
+  if (!initializer) return undefined
+  if (ts.isStringLiteral(initializer)) return initializer.text
+  const expression = ts.isJsxExpression(initializer) ? initializer.expression : undefined
+  return expression && (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression))
+    ? expression.text
+    : undefined
+}
+
+function getLiteralJsxComponentProps(source: string): Map<string, Record<string, string | undefined>> {
+  const source_file = ts.createSourceFile(
+    "typical-application.circuit.tsx",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
+  )
+  const components = new Map<string, Record<string, string | undefined>>()
+  const visit = (node: ts.Node): void => {
+    if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+      const name = getLiteralJsxAttribute(node, "name")
+      if (name) {
+        components.set(name.trim().toLowerCase(), {
+          manufacturerPartNumber: getLiteralJsxAttribute(node, "manufacturerPartNumber"),
+          footprint: getLiteralJsxAttribute(node, "footprint"),
+        })
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(source_file)
+  return components
 }
 
 export function getApplicationSchematicLayoutAdvisories(circuit_json: AnyCircuitElement[]): string[] {

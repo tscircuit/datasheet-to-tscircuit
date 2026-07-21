@@ -10,9 +10,15 @@ export type { ExpectedFootprintPad, FootprintPlan } from "./footprint-plan-valid
 export { getFootprintPlanErrors } from "./footprint-plan-validation"
 export { getTypicalApplicationConnectivityErrors } from "./application-connectivity-validation"
 export { getTypicalApplicationComponentValueErrors } from "./application-component-value-validation"
-export type { VisualInspectionResult } from "./visual-inspection-validation"
+export type {
+  VisualInspectionImages,
+  VisualInspectionResult,
+  VisualInspectionSnapshot,
+} from "./visual-inspection-validation"
 export {
   VisualInspectionInconclusiveError,
+  assertVisualInspectionSnapshotMatches,
+  captureVisualInspectionSnapshot,
   getSuccessfulImageReadPaths,
   validateAgentImageReads,
   validateVisualInspection,

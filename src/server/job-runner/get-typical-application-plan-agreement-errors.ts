@@ -141,6 +141,11 @@ export function getTypicalApplicationPlanAgreementErrors(input: {
     return errors
   }
   if (primary.availability === "not_present") return errors
+  if (primary.pcb_implementation !== independent.pcb_implementation) {
+    errors.push(
+      `typical-application PCB implementation disagrees: ${primary.pcb_implementation ?? "missing"} versus ${independent.pcb_implementation ?? "missing"}`,
+    )
+  }
 
   const independent_components = new Map(
     independent.components.map(
@@ -174,6 +179,27 @@ export function getTypicalApplicationPlanAgreementErrors(input: {
       errors.push(
         `typical-application component ${primary_component.reference} value disagrees: ${JSON.stringify(primary_component.value ?? "missing")} versus ${JSON.stringify(independent_component.value ?? "missing")}`,
       )
+    }
+    // U1 identity and geometry are approved independently by component evidence,
+    // while a schematic-only application never claims external-part footprints.
+    // Only a verified application PCB needs exact agreement on external MPNs and
+    // footprints; comparing these optional fields in schematic-only plans makes
+    // harmless extraction-detail differences terminal.
+    const requires_exact_application_part = primary.pcb_implementation === "verified" && reference !== "u1"
+    if (requires_exact_application_part) {
+      if (
+        normalizedIdentifier(primary_component.manufacturer_part_number) !==
+        normalizedIdentifier(independent_component.manufacturer_part_number)
+      ) {
+        errors.push(
+          `typical-application component ${primary_component.reference} manufacturer part number disagrees: ${JSON.stringify(primary_component.manufacturer_part_number ?? "missing")} versus ${JSON.stringify(independent_component.manufacturer_part_number ?? "missing")}`,
+        )
+      }
+      if ((primary_component.footprint ?? "").trim() !== (independent_component.footprint ?? "").trim()) {
+        errors.push(
+          `typical-application component ${primary_component.reference} footprint disagrees: ${JSON.stringify(primary_component.footprint ?? "missing")} versus ${JSON.stringify(independent_component.footprint ?? "missing")}`,
+        )
+      }
     }
   }
   for (const independent_component of independent_components.values()) {

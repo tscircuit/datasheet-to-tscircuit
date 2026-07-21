@@ -36,6 +36,9 @@ export interface PinEvidence {
   number: string
   labels: string[]
   role: SchematicPinRole
+  electrical_attributes?: {
+    open_drain?: boolean
+  }
   description?: string
   sources: EvidenceSource[]
 }

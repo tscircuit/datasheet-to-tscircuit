@@ -11,12 +11,22 @@ or otherwise access datasheet.pdf or datasheet.txt;
 the approved JSON and reference PNG are the only allowed datasheet inputs in this phase.
 
 Replace index.circuit.tsx with a production-quality, default-exported component. Implement the exact
-part number, complete pin table, PCB-top pad geometry, and orientation from component-evidence.json.
+ordering_code when present (otherwise part_number), complete pin table, PCB-top pad geometry, and
+orientation from component-evidence.json. Set chip pinAttributes from the approved electrical roles:
+power_input requiresPower, power_output providesPower, and ground requiresGround. Do not assign any
+of those attributes to pins with other roles. When electrical_attributes.open_drain is true, set
+both canUseOpenDrain and isUsingOpenDrain; otherwise do not set either open-drain attribute.
 Implement component-schematic-plan.json.schPinArrangement exactly; it is a server-derived,
 deterministic layout contract based on independently agreed pin roles.
 Do not substitute a generic library footprint unless its generated pad geometry exactly matches the
 approved evidence. Keep schematic labels and aliases compact and readable. Do not use
 placementDrcChecksDisabled, routingDisabled, --ignore-placement-drc, or similar suppression.
+
+Before the final build, run \`tsci check netlist index.circuit.tsx\`,
+\`tsci check placement index.circuit.tsx\`, and
+\`tsci check routing-difficulty index.circuit.tsx\` as separate commands. Inspect and correct any
+nonzero result; never chain checks together or dismiss a failed command as warnings. Then run the
+final build below. The server independently rebuilds and validates the result.
 
 Run tsci build index.circuit.tsx --ignore-warnings --pcb-png --schematic-svgs, render the schematic
 SVG, and inspect visual-reference/land-pattern.png, dist/index/pcb.png, and

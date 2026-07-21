@@ -95,7 +95,7 @@ export function getPadAgreementErrors(input: {
     for (const [field, evidence_value, plan_value] of fields) {
       if (!closeEnough({ left: evidence_value, right: plan_value, tolerance_mm })) {
         errors.push(
-          `${evidence_pad.pin === null ? "unassigned mechanical pad" : `pin ${evidence_pad.pin}`} ${field} is ${plan_value} mm in plan, expected ${evidence_value} mm`,
+          `${evidence_pad.pin === null ? "unassigned mechanical pad" : `pin ${evidence_pad.pin}`} ${field} differs: evidence ${evidence_value} mm, comparison ${plan_value} mm`,
         )
       }
     }

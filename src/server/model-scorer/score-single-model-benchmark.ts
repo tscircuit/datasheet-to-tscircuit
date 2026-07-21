@@ -2,12 +2,12 @@ import { readFile } from "node:fs/promises"
 import { join } from "node:path"
 import type { ModelValidationBenchmark } from "@/shared/job-types"
 import {
-  BenchmarkDefinition,
-  BenchmarkManifest,
-  Point,
-  ScoreBenchmarkOptions,
+  type BenchmarkDefinition,
+  type BenchmarkManifest,
+  type Point,
   parseBenchmarkManifest,
   resolveWorkspaceFile,
+  type ScoreBenchmarkOptions,
 } from "./parse-benchmark-manifest"
 
 export async function readCsvPoints(file_path: string): Promise<Point[]> {
@@ -43,23 +43,72 @@ export function transform(input: { value: number; scale: "linear" | "log"; label
   return Math.log10(value)
 }
 
+function boundaryTolerance(first: number, second: number): number {
+  return Number.EPSILON * 64 * Math.max(1, Math.abs(first), Math.abs(second))
+}
+
+export function getBenchmarkRangeCoverageError(input: {
+  reference_points: Point[]
+  result_points: Point[]
+  x_scale?: "linear" | "log"
+}): string | undefined {
+  const { reference_points, result_points } = input
+  const x_scale = input.x_scale ?? "linear"
+  if (reference_points.length < 2 || result_points.length < 2) {
+    return "reference and simulated results must each contain at least two points"
+  }
+  const reference_first = Math.min(...reference_points.map((point) => point.x))
+  const reference_last = Math.max(...reference_points.map((point) => point.x))
+  const result_first = Math.min(...result_points.map((point) => point.x))
+  const result_last = Math.max(...result_points.map((point) => point.x))
+  const transformed_reference_first = transform({
+    value: reference_first,
+    scale: x_scale,
+    label: "reference x",
+  })
+  const transformed_reference_last = transform({
+    value: reference_last,
+    scale: x_scale,
+    label: "reference x",
+  })
+  const transformed_result_first = transform({ value: result_first, scale: x_scale, label: "result x" })
+  const transformed_result_last = transform({ value: result_last, scale: x_scale, label: "result x" })
+  if (
+    transformed_reference_first <
+    transformed_result_first - boundaryTolerance(transformed_reference_first, transformed_result_first)
+  ) {
+    return `simulation starts at x=${result_first} but the reference starts at x=${reference_first}`
+  }
+  if (
+    transformed_reference_last >
+    transformed_result_last + boundaryTolerance(transformed_reference_last, transformed_result_last)
+  ) {
+    return `simulation ends at x=${result_last} but the reference requires x=${reference_last}`
+  }
+  return undefined
+}
+
 function interpolate(input: { points: Point[]; x: number; x_scale: "linear" | "log" }): number {
   const { points, x, x_scale } = input
   const transformed_x = transform({ value: x, scale: x_scale, label: "x" })
   const first_x = transform({ value: points[0]!.x, scale: x_scale, label: "result x" })
   const last_x = transform({ value: points.at(-1)!.x, scale: x_scale, label: "result x" })
-  if (transformed_x < first_x || transformed_x > last_x) {
+  if (
+    transformed_x < first_x - boundaryTolerance(transformed_x, first_x) ||
+    transformed_x > last_x + boundaryTolerance(transformed_x, last_x)
+  ) {
     throw new Error(`Reference x=${x} is outside the simulated result range`)
   }
+  const bounded_x = Math.max(first_x, Math.min(last_x, transformed_x))
 
   for (let index = 1; index < points.length; index += 1) {
     const right = points[index]!
     const right_x = transform({ value: right.x, scale: x_scale, label: "result x" })
-    if (right_x < transformed_x) continue
+    if (right_x < bounded_x) continue
     const left = points[index - 1]!
     const left_x = transform({ value: left.x, scale: x_scale, label: "result x" })
     if (right_x === left_x) return right.y
-    const ratio = (transformed_x - left_x) / (right_x - left_x)
+    const ratio = (bounded_x - left_x) / (right_x - left_x)
     return left.y + ratio * (right.y - left.y)
   }
   return points.at(-1)!.y
@@ -82,6 +131,12 @@ export async function scoreBenchmark(input: {
     const result_points = await readCsvPoints(result_file)
     const x_scale = benchmark.x_scale ?? "linear"
     const y_scale = benchmark.y_scale ?? "linear"
+    const range_coverage_error = getBenchmarkRangeCoverageError({
+      reference_points,
+      result_points,
+      x_scale,
+    })
+    if (range_coverage_error) throw new Error(range_coverage_error)
     const target_values = reference_points.map((point) =>
       transform({ value: point.y, scale: y_scale, label: "reference y" }),
     )

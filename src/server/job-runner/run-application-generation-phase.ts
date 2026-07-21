@@ -2,16 +2,17 @@ import { readFile, rm } from "node:fs/promises"
 import { join } from "node:path"
 import type { TrustedAgentEvent } from "../agent-event-protocol"
 import {
+  assertVisualInspectionSnapshotMatches,
+  captureVisualInspectionSnapshot,
   getApplicationSchematicLayoutAdvisories,
   getTypicalApplicationComponentValueErrors,
   getTypicalApplicationConnectivityErrors,
   getTypicalApplicationSourceErrors,
-  validateVisualInspection,
   VisualInspectionInconclusiveError,
+  validateVisualInspection,
 } from "../job-artifact-validator"
 import { buildCircuitArtifact } from "./build-circuit-artifact"
 import { buildTypicalApplicationPrompt } from "./build-typical-application-prompt"
-import { assertNoDatasheetAccess } from "./get-forbidden-datasheet-accesses"
 import {
   generationWorkspaceWasModified,
   importsGeneratedComponent,
@@ -19,7 +20,8 @@ import {
   publishGenerationWorkspace,
   restoreProtectedTree,
 } from "./generation-workspace"
-import { JobExecution } from "./job-execution"
+import { assertNoDatasheetAccess } from "./get-forbidden-datasheet-accesses"
+import type { JobExecution } from "./job-execution"
 import type { GeneratedComponent } from "./run-component-generation-phase"
 import type { ApprovedJobEvidence } from "./run-evidence-phase"
 import { runStructuredAgentPhase } from "./run-structured-agent-phase"
@@ -98,13 +100,14 @@ export async function runApplicationGenerationPhase(input: {
     "system",
     "\nStarting the typical-application phase after the component-ready milestone…\n",
   )
+  const pcb_implementation = evidence.typical_application_plan.pcb_implementation ?? "verified"
   const application_workspace = await prepareGenerationWorkspace(execution.job_dir, "application")
   let protected_files_modified = false
   let application_events: TrustedAgentEvent[] = []
   try {
     application_events = await runStructuredAgentPhase({
       context: execution.context,
-      prompt: buildTypicalApplicationPrompt(execution.additional_instructions),
+      prompt: buildTypicalApplicationPrompt(execution.additional_instructions, pcb_implementation),
       cwd: application_workspace.directory,
       signal: execution.cancellation_signal,
       append: execution.append.bind(execution),
@@ -143,7 +146,11 @@ export async function runApplicationGenerationPhase(input: {
       "The agent did not create a default-exported typical application importing ./index.circuit",
     )
   }
-  const source_schematic_errors = getTypicalApplicationSourceErrors(typical_application_code)
+  const source_schematic_errors = getTypicalApplicationSourceErrors(
+    typical_application_code,
+    pcb_implementation,
+    evidence.typical_application_plan,
+  )
   if (source_schematic_errors.length > 0) {
     execution.updateValidation({ application_schematic: "failed" })
     execution.context.job_store.updateJob(execution.job_id, { typical_application_code })
@@ -152,16 +159,20 @@ export async function runApplicationGenerationPhase(input: {
     )
   }
 
+  const application_expected_images = {
+    reference: "visual-reference/typical-application.png",
+    ...(pcb_implementation === "verified" ? { pcb: "dist/typical-application/pcb.png" } : {}),
+    schematic: "dist/typical-application/schematic.png",
+  }
   const application_visual_inspection = await validateVisualInspection({
     job_dir: execution.job_dir,
     events: application_events,
     report_file: "application-visual-inspection.json",
-    build_command: "tsci build typical-application.circuit.tsx",
-    expected_images: {
-      reference: "visual-reference/typical-application.png",
-      pcb: "dist/typical-application/pcb.png",
-      schematic: "dist/typical-application/schematic.png",
-    },
+    build_command:
+      pcb_implementation === "schematic_only"
+        ? "tsci build typical-application.circuit.tsx --disable-pcb --schematic-svgs"
+        : "tsci build typical-application.circuit.tsx",
+    expected_images: application_expected_images,
   })
   if (application_visual_inspection.status !== "passed") {
     execution.updateValidation({ application_visual: "inconclusive" })
@@ -169,7 +180,10 @@ export async function runApplicationGenerationPhase(input: {
       "Typical-application image inspection could not be completed automatically",
     )
   }
-  execution.updateValidation({ application_visual: "passed" })
+  const application_visual_snapshot = await captureVisualInspectionSnapshot({
+    job_dir: execution.job_dir,
+    expected_images: application_expected_images,
+  })
 
   execution.context.job_store.updateJob(execution.job_id, { display_status: "building" })
   await execution.append("system", "\nBuilding the typical application with tsci…\n")
@@ -181,6 +195,8 @@ export async function runApplicationGenerationPhase(input: {
     signal: execution.cancellation_signal,
     append: execution.append.bind(execution),
     render_outputs: true,
+    pcb_disabled: pcb_implementation === "schematic_only",
+    required_checks: ["netlist"],
   })
   if (typical_application_build.errors.length > 0) {
     execution.updateValidation({ application_build: "failed" })
@@ -193,6 +209,17 @@ export async function runApplicationGenerationPhase(input: {
     )
   }
   execution.updateValidation({ application_build: "passed" })
+  try {
+    await assertVisualInspectionSnapshotMatches({
+      job_dir: execution.job_dir,
+      snapshot: application_visual_snapshot,
+    })
+  } catch (error) {
+    execution.updateValidation({ application_visual: "inconclusive" })
+    throw error
+  }
+  execution.updateValidation({ application_visual: "passed" })
+  await execution.append("system", "Authoritative application build reproduced the agent-inspected images.\n")
   const typical_application_circuit_json = typical_application_build.circuit_json
   const application_schematic_advisories = getApplicationSchematicLayoutAdvisories(
     typical_application_circuit_json,
@@ -234,7 +261,9 @@ export async function runApplicationGenerationPhase(input: {
   }
   await execution.append(
     "system",
-    "Typical application ready. Component and application code, schematic, and PCB previews are available.\n",
+    pcb_implementation === "verified"
+      ? "Typical application ready. Component and application code, schematic, and PCB previews are available.\n"
+      : "Typical application ready in schematic-only mode. Component and application code plus the schematic preview are available; no application PCB is claimed.\n",
   )
   execution.context.job_store.updateJob(execution.job_id, {
     display_status: "complete",

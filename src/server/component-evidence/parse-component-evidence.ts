@@ -1,5 +1,6 @@
 import type { AnyCircuitElement } from "circuit-json"
-import {
+import { normalizePin } from "./get-pad-agreement-errors"
+import type {
   ComponentEvidence,
   DrawingOrientation,
   EvidenceField,
@@ -8,7 +9,6 @@ import {
   PinEvidence,
   SchematicPinRole,
 } from "./types"
-import { normalizePin } from "./get-pad-agreement-errors"
 
 export type CircuitRecord = AnyCircuitElement & Record<string, unknown>
 
@@ -160,12 +160,47 @@ export function parseComponentEvidence(value: unknown): ComponentEvidence {
     if (typeof pin.role !== "string" || !pin_roles.has(pin.role as SchematicPinRole)) {
       throw new Error(`${label}.role is invalid`)
     }
+    if (pin.electrical_attributes !== undefined) {
+      if (!isRecord(pin.electrical_attributes)) {
+        throw new Error(`${label}.electrical_attributes must be an object`)
+      }
+      const unexpected_attributes = Object.keys(pin.electrical_attributes).filter(
+        (attribute) => attribute !== "open_drain",
+      )
+      if (unexpected_attributes.length > 0) {
+        throw new Error(
+          `${label}.electrical_attributes contains unsupported fields: ${unexpected_attributes.join(", ")}`,
+        )
+      }
+      if (
+        pin.electrical_attributes.open_drain !== undefined &&
+        typeof pin.electrical_attributes.open_drain !== "boolean"
+      ) {
+        throw new Error(`${label}.electrical_attributes.open_drain must be boolean`)
+      }
+      if (
+        pin.electrical_attributes.open_drain === true &&
+        pin.role !== "output" &&
+        pin.role !== "bidirectional"
+      ) {
+        throw new Error(`${label}.electrical_attributes.open_drain requires an output or bidirectional role`)
+      }
+    }
     return {
       number,
       labels: pin.labels.map((pin_label, label_index) =>
         requiredText(pin_label, `${label}.labels[${label_index}]`),
       ),
       role: pin.role as SchematicPinRole,
+      ...(pin.electrical_attributes === undefined
+        ? {}
+        : {
+            electrical_attributes: {
+              ...(typeof pin.electrical_attributes.open_drain === "boolean"
+                ? { open_drain: pin.electrical_attributes.open_drain }
+                : {}),
+            },
+          }),
       ...(pin.description === undefined
         ? {}
         : { description: requiredText(pin.description, `${label}.description`) }),

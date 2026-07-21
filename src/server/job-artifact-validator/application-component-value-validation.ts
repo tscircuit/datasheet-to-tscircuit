@@ -48,11 +48,44 @@ export function getTypicalApplicationComponentValueErrors(
   }
   const errors: string[] = []
   for (const expected of plan.components) {
+    const component = components_by_name.get(expected.reference.toLowerCase())
+    if (!component) continue
+    if (expected.manufacturer_part_number) {
+      const actual_part_number =
+        typeof component.manufacturer_part_number === "string"
+          ? component.manufacturer_part_number.trim()
+          : undefined
+      // Current @tscircuit/core omits manufacturer_part_number from compiled inductors even when
+      // the validated TSX has the exact literal prop. Preserve mismatch checks whenever it emits one.
+      const runtime_omits_inductor_part_number =
+        actual_part_number === undefined && /inductor|ferrite/i.test(expected.kind ?? "")
+      if (
+        !runtime_omits_inductor_part_number &&
+        actual_part_number?.toLowerCase() !== expected.manufacturer_part_number.trim().toLowerCase()
+      ) {
+        errors.push(
+          `Application component ${expected.reference} has manufacturer part number ${JSON.stringify(actual_part_number ?? "missing")}, expected ${JSON.stringify(expected.manufacturer_part_number)}`,
+        )
+      }
+    }
+    if (expected.footprint) {
+      const cad_component = records.find(
+        (element) =>
+          element.type === "cad_component" && element.source_component_id === component.source_component_id,
+      )
+      const actual_footprint =
+        typeof cad_component?.footprinter_string === "string"
+          ? cad_component.footprinter_string.trim()
+          : undefined
+      if (actual_footprint !== expected.footprint.trim()) {
+        errors.push(
+          `Application component ${expected.reference} has footprint ${JSON.stringify(actual_footprint ?? "missing")}, expected ${JSON.stringify(expected.footprint)}`,
+        )
+      }
+    }
     if (!expected.kind || !expected.value) continue
     const field = componentValueField(expected.kind)
     if (!field) continue
-    const component = components_by_name.get(expected.reference.toLowerCase())
-    if (!component) continue
     const expected_value = parseEngineeringValue(expected.value)
     const actual_value = parseEngineeringValue(component[field])
     if (expected_value === undefined) {

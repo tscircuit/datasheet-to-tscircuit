@@ -2,23 +2,28 @@ import { expect, test } from "bun:test"
 import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { JobStore } from "@/server/job-store"
 import { getTypicalApplicationConnectivityErrors } from "@/server/job-artifact-validator"
+import { JobStore } from "@/server/job-store"
 import { ModelRunStore } from "@/server/model-run-store"
 import {
   classifyFatalSimulationFailure,
   compareTimeShiftedResults,
   findSuspiciousBenchmarkConditioning,
-  getFatalSimulationProcessFailure,
   getBenchmarkApplicationPlan,
+  getFatalSimulationProcessFailure,
+  getRequiredPowerPinLabels,
+  getRequiredPowerPreflightProbeName,
+  getRequiredPowerProbeContractErrors,
+  getUnpoweredRequiredPinErrors,
   isTransientAgentTransportFailure,
   modelUsesAbsoluteTime,
   parseModelManifest,
   preflightNgspice,
+  restoreBestReportedModelCheckpoint,
   restoreLastPromotedModelCheckpoint,
   runModel,
-  shiftNamedResistorResistance,
   shiftLiteralPulseDelays,
+  shiftNamedResistorResistance,
   stripAnalogSimulationForStructuralCheck,
   validateAbsoluteTimeShift,
   validateManifestAgainstModel,
@@ -28,6 +33,53 @@ import {
   buildModelBenchmarkPrompt,
   buildModelSetupPrompt,
 } from "@/server/model-scaffold"
+
+test("benchmark preflight requires and validates a power probe for every required DUT pin", () => {
+  const power_pins = getRequiredPowerPinLabels([
+    {
+      type: "source_port",
+      name: "VIN",
+      pin_number: 1,
+      requires_power: true,
+      port_hints: ["1", "VIN"],
+    },
+    { type: "source_port", name: "EN", pin_number: 2, port_hints: ["2", "EN"] },
+  ])
+  expect(power_pins).toEqual(["VIN"])
+
+  const probe_name = getRequiredPowerPreflightProbeName("VIN")
+  const source = `<board>\n  <voltageprobe name="${probe_name}" connectsTo=".DUT > .VIN" referenceTo="net.GND" />\n  <analogsimulation duration="1ms" timePerStep="0.1ms" />\n</board>`
+  expect(getRequiredPowerProbeContractErrors(source, power_pins)).toEqual([])
+  expect(getRequiredPowerProbeContractErrors(source.replace(".VIN", ".EN"), power_pins)).toContain(
+    "benchmark must probe required-power pin VIN with voltageprobe SERVER_PREFLIGHT_POWER_VIN connected directly to .DUT > .VIN",
+  )
+  expect(
+    getUnpoweredRequiredPinErrors(
+      [
+        {
+          type: "simulation_transient_voltage_graph",
+          name: probe_name,
+          timestamps_ms: [0, 1],
+          voltage_levels: [0, 0],
+        },
+      ],
+      [probe_name],
+    ),
+  ).toContain("required-power stimulus SERVER_PREFLIGHT_POWER_VIN remained effectively unpowered (peak 0 V)")
+  expect(
+    getUnpoweredRequiredPinErrors(
+      [
+        {
+          type: "simulation_transient_voltage_graph",
+          name: probe_name,
+          timestamps_ms: [0, 1],
+          voltage_levels: [0, 3.3],
+        },
+      ],
+      [probe_name],
+    ),
+  ).toEqual([])
+})
 
 const lockedBenchmarkSource = `import Component from "../component-with-model.circuit"
 
@@ -55,7 +107,7 @@ const benchmarkId = target.split("/").at(-1)?.replace(/\\.circuit\\.tsx$/, "")
 if (!benchmarkId) process.exit(2)
 const output = process.cwd() + "/../dist/spice/benchmarks/" + benchmarkId
 await mkdir(output, { recursive: true })
-await Bun.write(output + "/circuit.json", "[]")
+await Bun.write(output + "/circuit.json", JSON.stringify([{ type: "simulation_transient_voltage_graph", name: "VOUT_PROBE", timestamps_ms: [0, 1], voltage_levels: [0, 1] }]))
 `
 
 test("model prompt keeps benchmarks fixed while effort only extends iteration time", () => {
@@ -64,6 +116,10 @@ test("model prompt keeps benchmarks fixed while effort only extends iteration ti
   expect(prompt).toContain("refinement timer is running")
   expect(prompt).toContain("Re-read run-control.json")
   expect(prompt).toContain("do not reduce tests or loosen tolerances")
+  expect(prompt).toContain("numeric baseline for every critical benchmark")
+  expect(prompt).toContain("periodically rerun the complete critical suite")
+  expect(prompt).toContain("Promote only when the candidate")
+  expect(prompt).toContain("Do not mark model-progress.json complete")
   expect(prompt).toContain("100% validation")
   expect(prompt).toContain("tsci build benchmarks/<benchmark-id>.circuit.tsx --ignore-warnings")
   expect(prompt).toContain("--simulation-svgs")
@@ -91,9 +147,11 @@ test("model prompt keeps benchmarks fixed while effort only extends iteration ti
   const benchmark_prompt = buildModelBenchmarkPrompt()
   expect(benchmark_prompt).toContain("benchmark-only pass")
   expect(benchmark_prompt).toContain("dut_spice_node")
-  expect(benchmark_prompt).toContain('simulation.x_axis \`"time_ms"\`')
+  expect(benchmark_prompt).toContain('simulation.x_axis `"time_ms"`')
   expect(benchmark_prompt).toContain("Do not create or modify model.lib")
   expect(benchmark_prompt).toContain("server-owned stub model")
+  expect(benchmark_prompt).toContain("one timePerStep beyond the final reference")
+  expect(benchmark_prompt).toContain("probes every DUT pin marked requiresPower")
   expect(benchmark_prompt).toContain('source.image: "evidence/figures/<benchmark-id>.png"')
   const corrected_benchmark_prompt = buildModelBenchmarkPrompt(
     "Benchmark transfer voltage probe RESULT must connect directly to a DUT port",
@@ -150,6 +208,67 @@ test("cancellation restoration replaces an unpromoted candidate with the last pr
     const integrated_component = await Bun.file(join(model_dir, "component-with-model.circuit.tsx")).text()
     expect(integrated_component).toContain("R1 IN OUT 1k")
     expect(integrated_component).not.toContain("R1 IN OUT 2k")
+  } finally {
+    await rm(model_dir, { recursive: true, force: true })
+  }
+})
+
+test("server checkpoint guard restores the best scored promotion instead of the latest promotion", async () => {
+  const model_dir = await mkdtemp(join(tmpdir(), "datasheet-model-best-reported-"))
+  const better_source = ".subckt PART IN OUT\nR1 IN OUT 1k\n.ends PART\n"
+  const regressed_source = ".subckt PART IN OUT\nR1 IN OUT 20k\n.ends PART\n"
+  try {
+    await Promise.all([
+      mkdir(join(model_dir, "candidates", "r0002"), { recursive: true }),
+      mkdir(join(model_dir, "candidates", "r0003"), { recursive: true }),
+    ])
+    await Promise.all([
+      Bun.write(join(model_dir, "candidates", "r0002", "model.lib"), better_source),
+      Bun.write(join(model_dir, "candidates", "r0003", "model.lib"), regressed_source),
+      Bun.write(join(model_dir, "model.lib"), regressed_source),
+      Bun.write(
+        join(model_dir, "model-manifest.json"),
+        JSON.stringify({
+          version: 1,
+          part_number: "PART",
+          dialect: "portable",
+          entry_name: "PART",
+          model_file: "model.lib",
+          revision: "r0003",
+          simulator: "ngspice",
+          generated_at: new Date().toISOString(),
+          pins: [
+            { component_pin: "pin1", spice_node: "IN" },
+            { component_pin: "pin2", spice_node: "OUT" },
+          ],
+        }),
+      ),
+      Bun.write(
+        join(model_dir, "iteration-history.json"),
+        JSON.stringify([
+          {
+            revision: "r0002",
+            decision: "promoted",
+            passing: 0,
+            total: 11,
+            score: 0.0559,
+            worst_normalized_error: 0.5536,
+          },
+          {
+            revision: "r0003",
+            decision: "promoted",
+            passing: 0,
+            total: 11,
+            score: 4.784,
+            worst_normalized_error: 20.7862,
+          },
+        ]),
+      ),
+    ])
+
+    expect(await restoreBestReportedModelCheckpoint(model_dir)).toBe("r0002")
+    expect(await Bun.file(join(model_dir, "model.lib")).text()).toBe(better_source)
+    expect(JSON.parse(await Bun.file(join(model_dir, "model-manifest.json")).text()).revision).toBe("r0002")
   } finally {
     await rm(model_dir, { recursive: true, force: true })
   }
@@ -708,6 +827,9 @@ if (attempt === 3 && prompt.includes("Shorted voltage source V1")) {
   await Bun.write(dir + "/../benchmark-preflight-feedback-seen.txt", "yes")
   await Bun.write(dir + "/../benchmark-preflight-output-cleaned.txt", "yes")
 }
+if (attempt === 4 && prompt.includes("simulation ends at x=0.99 but the reference requires x=1")) {
+  await Bun.write(dir + "/../benchmark-range-feedback-seen.txt", "yes")
+}
 await mkdir(dir + "/benchmarks", { recursive: true })
 await mkdir(dir + "/evidence/curves", { recursive: true })
 const validSource = ${JSON.stringify(lockedBenchmarkSource)}
@@ -735,7 +857,9 @@ const wrapper = await Bun.file(process.cwd() + "/component-with-model.circuit.ts
 const attempt = Number(await Bun.file(process.cwd() + "/../benchmark-correction-attempt.txt").text().catch(() => "0"))
 const circuit = wrapper.includes("SERVER_BENCHMARK_STUB") && attempt === 2
   ? [{ type: "simulation_unknown_experiment_error", message: "Shorted voltage source V1" }]
-  : []
+  : wrapper.includes("SERVER_BENCHMARK_STUB") && attempt === 3
+    ? [{ type: "simulation_transient_voltage_graph", name: "VOUT_PROBE", timestamps_ms: [0, 0.99], voltage_levels: [0, 1] }]
+  : [{ type: "simulation_transient_voltage_graph", name: "VOUT_PROBE", timestamps_ms: [0, 1], voltage_levels: [0, 1] }]
 await Bun.write(output + "/circuit.json", JSON.stringify(circuit))
 `,
     ),
@@ -760,10 +884,11 @@ await Bun.write(output + "/circuit.json", JSON.stringify(circuit))
     { job_store, model_run_store, agent_bin: agent_path, tsci_bin: tsci_path },
   )
 
-  expect(await Bun.file(join(job_dir, "benchmark-correction-attempt.txt")).text()).toBe("3")
+  expect(await Bun.file(join(job_dir, "benchmark-correction-attempt.txt")).text()).toBe("4")
   expect(await Bun.file(join(job_dir, "benchmark-feedback-seen.txt")).text()).toBe("yes")
   expect(await Bun.file(join(job_dir, "benchmark-preflight-feedback-seen.txt")).text()).toBe("yes")
   expect(await Bun.file(join(job_dir, "benchmark-preflight-output-cleaned.txt")).text()).toBe("yes")
+  expect(await Bun.file(join(job_dir, "benchmark-range-feedback-seen.txt")).text()).toBe("yes")
   expect(await Bun.file(join(job_dir, ".model-benchmark-lock", "lock.json")).exists()).toBe(true)
   expect(
     model_run_store
@@ -835,7 +960,7 @@ console.log("champion checkpointed")
 	}
 		if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
 		  await mkdir(jobDir + "/dist/spice/benchmarks/transfer", { recursive: true })
-		  await Bun.write(jobDir + "/dist/spice/benchmarks/transfer/circuit.json", "[]")
+		  await Bun.write(jobDir + "/dist/spice/benchmarks/transfer/circuit.json", JSON.stringify([{ type: "simulation_transient_voltage_graph", name: "VOUT_PROBE", timestamps_ms: [0, 1], voltage_levels: [0, 1] }]))
 		  process.exit(0)
 		}
 		const modelSource = await Bun.file(jobDir + "/spice/model.lib").text()
@@ -1014,7 +1139,7 @@ await Bun.write(dir + "/model-card.md", "# LOOP model\\n")
 	}
 		if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
 		  await mkdir(jobDir + "/dist/spice/benchmarks/transfer", { recursive: true })
-		  await Bun.write(jobDir + "/dist/spice/benchmarks/transfer/circuit.json", "[]")
+		  await Bun.write(jobDir + "/dist/spice/benchmarks/transfer/circuit.json", JSON.stringify([{ type: "simulation_transient_voltage_graph", name: "VOUT", timestamps_ms: [0, 1], voltage_levels: [0, 1] }]))
 		  process.exit(0)
 		}
 		const attempt = Number(await Bun.file(jobDir + "/spice/agent-attempt.txt").text())
@@ -1124,7 +1249,7 @@ if (target === "server-ngspice-preflight.circuit.tsx") {
 const benchmarkOutput = jobDir + "/dist/spice/benchmarks/transfer"
 if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
   await mkdir(benchmarkOutput, { recursive: true })
-  await Bun.write(benchmarkOutput + "/circuit.json", "[]")
+  await Bun.write(benchmarkOutput + "/circuit.json", JSON.stringify([{ type: "simulation_transient_voltage_graph", name: "VOUT_PROBE", timestamps_ms: [0, 1], voltage_levels: [0, 1] }]))
   process.exit(0)
 }
 const modelSource = await Bun.file(jobDir + "/spice/model.lib").text()
@@ -1383,7 +1508,7 @@ if (!(await Bun.file(jobDir + "/spice/model.lib").exists())) {
   const match = target.match(/^benchmarks\\/(waveform-[ab])\\.circuit\\.tsx$/)
   if (!match) process.exit(9)
   await mkdir(jobDir + "/dist/spice/benchmarks/" + match[1], { recursive: true })
-  await Bun.write(jobDir + "/dist/spice/benchmarks/" + match[1] + "/circuit.json", "[]")
+  await Bun.write(jobDir + "/dist/spice/benchmarks/" + match[1] + "/circuit.json", JSON.stringify([{ type: "simulation_transient_voltage_graph", name: "VOUT", timestamps_ms: [0, 2], voltage_levels: [0, 4] }]))
   process.exit(0)
 }
 const modelSource = await Bun.file(jobDir + "/spice/model.lib").text()

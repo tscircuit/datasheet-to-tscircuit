@@ -50,6 +50,72 @@ function findLastPromotedRevision(value: unknown): string | undefined {
     .at(-1)
 }
 
+interface ReportedCheckpointMetrics {
+  revision: string
+  passing: number
+  total: number
+  score: number
+  worst_normalized_error: number
+}
+
+function getPromotedCheckpointMetrics(value: unknown): ReportedCheckpointMetrics[] {
+  const iterations = Array.isArray(value)
+    ? value
+    : isRecord(value) && Array.isArray(value.iterations)
+      ? value.iterations
+      : []
+  return iterations.flatMap((iteration) => {
+    if (!isRecord(iteration) || typeof iteration.revision !== "string") return []
+    const decision = typeof iteration.decision === "string" ? iteration.decision.toLowerCase() : ""
+    const status = typeof iteration.status === "string" ? iteration.status.toLowerCase() : ""
+    const promotion_signal = `${status} ${decision}`
+    if (promotion_signal.includes("not") || !/promot|accept|champion|retain/.test(promotion_signal)) {
+      return []
+    }
+    const { passing, total, score, worst_normalized_error } = iteration
+    if (
+      typeof passing !== "number" ||
+      !Number.isInteger(passing) ||
+      passing < 0 ||
+      typeof total !== "number" ||
+      !Number.isInteger(total) ||
+      total < 1 ||
+      passing > total ||
+      typeof score !== "number" ||
+      !Number.isFinite(score) ||
+      score < 0 ||
+      typeof worst_normalized_error !== "number" ||
+      !Number.isFinite(worst_normalized_error) ||
+      worst_normalized_error < 0
+    ) {
+      return []
+    }
+    return [
+      {
+        revision: iteration.revision,
+        passing,
+        total,
+        score,
+        worst_normalized_error,
+      },
+    ]
+  })
+}
+
+export function isReportedCheckpointBetter(
+  candidate: Omit<ReportedCheckpointMetrics, "revision">,
+  champion: Omit<ReportedCheckpointMetrics, "revision">,
+): boolean {
+  const candidate_all_passed = candidate.passing === candidate.total
+  const champion_all_passed = champion.passing === champion.total
+  if (candidate_all_passed !== champion_all_passed) return candidate_all_passed
+  const candidate_ratio = candidate.passing / candidate.total
+  const champion_ratio = champion.passing / champion.total
+  if (candidate_ratio !== champion_ratio) return candidate_ratio > champion_ratio
+  if (candidate.score !== champion.score) return candidate.score < champion.score
+  return candidate.worst_normalized_error < champion.worst_normalized_error
+}
+
 async function writeTextAtomically(file_path: string, text: string): Promise<void> {
   const temporary_path = `${file_path}.${randomInt(1_000_000_000)}.tmp`
   try {
@@ -106,6 +172,50 @@ export async function restoreLastPromotedModelCheckpoint(model_dir: string): Pro
     model_source: promoted_source,
   })
   return promoted_revision
+}
+
+export async function restoreBestReportedModelCheckpoint(model_dir: string): Promise<string | undefined> {
+  const history_value = await readFile(join(model_dir, "iteration-history.json"), "utf8")
+    .then((text) => JSON.parse(text) as unknown)
+    .catch(() => undefined)
+  const candidate_files = await listCandidateModelFiles(join(model_dir, "candidates"))
+  const files_by_revision = new Map(candidate_files.map((file) => [basename(dirname(file)), file] as const))
+  const eligible = getPromotedCheckpointMetrics(history_value).filter((candidate) =>
+    files_by_revision.has(candidate.revision),
+  )
+  const best = eligible.reduce<ReportedCheckpointMetrics | undefined>(
+    (champion, candidate) =>
+      !champion || isReportedCheckpointBetter(candidate, champion) ? candidate : champion,
+    undefined,
+  )
+  if (!best) return undefined
+
+  const manifest = await readFile(join(model_dir, "model-manifest.json"), "utf8")
+    .then((text) => parseModelManifest(JSON.parse(text)))
+    .catch(() => undefined)
+  if (!manifest) {
+    throw new Error(`Cannot restore reported champion ${best.revision}: model-manifest.json is unavailable`)
+  }
+  const best_file = files_by_revision.get(best.revision)
+  if (!best_file) return undefined
+  const best_source = await readFile(best_file, "utf8")
+  const restored_manifest: ModelManifest = {
+    ...manifest,
+    revision: best.revision,
+    generated_at: new Date().toISOString(),
+  }
+  validateManifestAgainstModel(restored_manifest, best_source)
+  await writeTextAtomically(join(model_dir, "model.lib"), best_source)
+  await writeTextAtomically(
+    join(model_dir, "model-manifest.json"),
+    `${JSON.stringify(restored_manifest, null, 2)}\n`,
+  )
+  await writeServerIntegratedComponent({
+    model_dir,
+    manifest: restored_manifest,
+    model_source: best_source,
+  })
+  return best.revision
 }
 
 async function recoverBestModelFile(model_dir: string): Promise<string | undefined> {

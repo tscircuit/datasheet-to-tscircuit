@@ -1,7 +1,24 @@
-export function buildTypicalApplicationPrompt(additional_instructions?: string): string {
+export function buildTypicalApplicationPrompt(
+  additional_instructions?: string,
+  pcb_implementation: "verified" | "schematic_only" = "verified",
+): string {
   const user_context = additional_instructions?.trim()
     ? `\nAdditional context from the user:\n${additional_instructions.trim()}\n`
     : ""
+
+  const pcb_instructions =
+    pcb_implementation === "schematic_only"
+      ? `The approved plan is schematic_only. Do not assign footprint, pcbX, pcbY, pcbRotation, or
+other PCB implementation props to application passives. Do not choose generic package sizes. Build
+with \`tsci build typical-application.circuit.tsx --disable-pcb --schematic-svgs\`. Inspect only the
+locked reference and \`dist/typical-application/schematic.png\`, then omit pcb_image from the visual
+inspection report. Placement and routing-difficulty checks are not applicable; run the netlist check
+before the final schematic-only build.`
+      : `The approved plan is verified for PCB implementation. Use each recorded
+manufacturer_part_number exactly as the component's JSX manufacturerPartNumber prop, and do not
+substitute a different passive. Set the component's literal footprint JSX prop to the separately
+sourced footprint value exactly; do not substitute a generic footprint.
+Run the netlist, placement, and routing-difficulty checks separately before the final PCB build.`
 
   return `Complete phase 2 of the datasheet conversion. The server has independently
 built index.circuit.tsx and published it as ready; SPICE generation may now use it.
@@ -24,21 +41,28 @@ net-connected traces, trace schDisplayLabel props, and compiled schematic net-la
 allowed. Arrange components compactly by signal flow, keep individual trace segments short, and
 avoid large empty schematic regions.
 
-Build the application with PCB and schematic visual outputs, render the schematic
+${pcb_instructions}
+
+When PCB implementation is verified, before the final build run \`tsci check netlist typical-application.circuit.tsx\`,
+\`tsci check placement typical-application.circuit.tsx\`, and
+\`tsci check routing-difficulty typical-application.circuit.tsx\` as separate commands in that
+order. Inspect and correct any nonzero result; never chain checks together or dismiss a failed
+command as warnings. The server independently rebuilds and validates the result.
+
+Build the application with the outputs authorized above, render the schematic
   SVG to PNG, and inspect the locked reference,
-PCB, and schematic PNGs with the built-in \`read\` tool. Compare the generated
+applicable PCB, and schematic PNGs with the built-in \`read\` tool. Compare the generated
 schematic against the datasheet topology and values, fix visual or connectivity
 defects, and do not suppress placement DRC, autorouting, or clearance failures with
 placementDrcChecksDisabled, routingDisabled, --ignore-placement-drc, or similar
 settings. Do not modify \`visual-reference/typical-application.png\`; it is the
 server-locked reference selected during evidence extraction. After the final application build,
-use \`read\` on that image, \`dist/typical-application/pcb.png\`, and
-\`dist/typical-application/schematic.png\`, then write
+use \`read\` on that image and \`dist/typical-application/schematic.png\`; when PCB implementation
+is verified, also read \`dist/typical-application/pcb.png\`. Then write
 \`application-visual-inspection.json\` with version 1, status passed, and those
-paths in \`reference_image\`, \`pcb_image\`, and \`schematic_image\`. Never record
-passed if any image was omitted or its pixels were unavailable; report
-inconclusive and stop. Finish with a successful
-\`tsci build typical-application.circuit.tsx\`. The importing application source,
+paths in \`reference_image\`, optional \`pcb_image\`, and \`schematic_image\`. Never record
+passed if any required image was omitted or its pixels were unavailable; report
+inconclusive and stop. Finish with the successful build command authorized above. The importing application source,
 inspected PCB and schematic renders, and successful build are the deliverables.
 Write the inspection JSON with the built-in write tool. After the final build, the
 only allowed shell command is the single render-svg-to-png command needed to create

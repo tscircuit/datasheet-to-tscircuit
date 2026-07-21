@@ -1,5 +1,23 @@
-import { ComponentEvidence } from "./types"
 import { getPadAgreementErrors, normalizePin, normalizeText } from "./get-pad-agreement-errors"
+import type { ComponentEvidence } from "./types"
+
+export function getIndependentComponentEvidenceAcceptedDifferences(
+  primary: ComponentEvidence,
+  independent: ComponentEvidence,
+): string[] {
+  const primary_ordering_code = primary.ordering_code?.value
+  const independent_ordering_code = independent.ordering_code?.value
+  if (
+    !primary_ordering_code ||
+    !independent_ordering_code ||
+    normalizeText(primary_ordering_code) === normalizeText(independent_ordering_code)
+  ) {
+    return []
+  }
+  return [
+    `ordering code differs by a non-material packaging option: ${JSON.stringify(primary_ordering_code)} versus ${JSON.stringify(independent_ordering_code)}; the primary ordering code is retained`,
+  ]
+}
 
 export function getIndependentComponentEvidenceErrors(
   primary: ComponentEvidence,
@@ -72,6 +90,11 @@ export function getIndependentComponentEvidenceErrors(
         nondirectional_role_pair.has("other"))
     if (!roles_agree) {
       errors.push(`pin ${pin.number} schematic role disagrees: ${pin.role} versus ${other.role}`)
+    }
+    if (Boolean(pin.electrical_attributes?.open_drain) !== Boolean(other.electrical_attributes?.open_drain)) {
+      errors.push(
+        `pin ${pin.number} open-drain behavior disagrees: ${Boolean(pin.electrical_attributes?.open_drain)} versus ${Boolean(other.electrical_attributes?.open_drain)}`,
+      )
     }
   }
   for (const pin of independent_pins.values())

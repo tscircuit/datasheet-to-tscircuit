@@ -2,20 +2,63 @@ import { readFile, rm } from "node:fs/promises"
 import { join } from "node:path"
 import type { JobLogStream } from "@/shared/job-types"
 import { parseTypicalApplicationPlan } from "../job-runner"
-import { ModelInfrastructureError, ModelRunnerContext } from "./stream-model-process"
-import { listModelBenchFiles } from "./list-model-bench-files"
+import { parseBenchmarkManifest, resolveWorkspaceFile } from "../model-scorer/parse-benchmark-manifest"
+import { getBenchmarkRangeCoverageError, readCsvPoints } from "../model-scorer/score-single-model-benchmark"
+import { extractSimulationResultPoints } from "../model-simulation-validator"
+import { parseSimulationOutput } from "../model-simulation-validator/extract-simulation-result-points"
+import { parseSimulationDefinition } from "../model-simulation-validator/parse-simulation-definition"
+import { writeServerIntegratedComponent } from "./attach-model-to-generated-component"
 import {
   getBenchmarkApplicationErrors,
   getBenchmarkApplicationPlan,
+  getRequiredPowerPinLabels,
   getStubComponentPins,
 } from "./get-benchmark-application-plan"
-import { writeServerIntegratedComponent } from "./attach-model-to-generated-component"
+import { listModelBenchFiles } from "./list-model-bench-files"
+import { ModelInfrastructureError, type ModelRunnerContext } from "./stream-model-process"
 import {
-  ValidationBuildResult,
   executeValidationBuild,
   getValidationConcurrency,
   runValidationTaskPool,
+  type ValidationBuildResult,
 } from "./validate-champion"
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+export function getRequiredPowerPreflightProbeName(power_pin_label: string): string {
+  return `SERVER_PREFLIGHT_POWER_${power_pin_label.toUpperCase()}`
+}
+
+export function getRequiredPowerProbeContractErrors(source: string, power_pin_labels: string[]): string[] {
+  return [...new Set(power_pin_labels)].flatMap((label) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(label)) return []
+    const probe_name = getRequiredPowerPreflightProbeName(label)
+    const tag_pattern = new RegExp(
+      `<voltageprobe\\b(?=[^>]*\\bname=["']${escapeRegExp(probe_name)}["'])(?=[^>]*\\bconnectsTo=["']\\.DUT\\s*>\\s*\\.${escapeRegExp(label)}["'])[^>]*>`,
+      "i",
+    )
+    return tag_pattern.test(source)
+      ? []
+      : [
+          `benchmark must probe required-power pin ${label} with voltageprobe ${probe_name} connected directly to .DUT > .${label}`,
+        ]
+  })
+}
+
+export function getUnpoweredRequiredPinErrors(circuit_json: unknown, probe_names: string[]): string[] {
+  if (probe_names.length === 0) return []
+  const { graphs } = parseSimulationOutput(circuit_json)
+  return probe_names.flatMap((probe_name) => {
+    const graph = graphs.find((candidate) => candidate.name === probe_name)
+    if (!graph) return [`required-power preflight produced no ${probe_name} waveform`]
+    const peak_magnitude = Math.max(...graph.voltage_levels.map(Math.abs))
+    return peak_magnitude < 0.05
+      ? [`required-power stimulus ${probe_name} remained effectively unpowered (peak ${peak_magnitude} V)`]
+      : []
+  })
+}
 
 export async function preflightBenchmarkHarnesses(input: {
   model_run_id: string
@@ -29,6 +72,12 @@ export async function preflightBenchmarkHarnesses(input: {
   const temporary_component = join(input.model_dir, "component-with-model.circuit.tsx")
   const saved_root = join(input.model_dir, ".benchmark-harness-preflight")
   const benchmark_files = await listModelBenchFiles(input.model_dir)
+  const benchmark_manifest = parseBenchmarkManifest(
+    JSON.parse(await readFile(join(input.model_dir, "benchmarks.json"), "utf8")),
+  )
+  const benchmarks_by_id = new Map(
+    benchmark_manifest.benchmarks.map((benchmark) => [benchmark.id, benchmark]),
+  )
   const generated_directories = benchmark_files.map((benchmark_file) =>
     join(input.job_dir, "dist", "spice", "benchmarks", benchmark_file.replace(/\.circuit\.tsx$/i, "")),
   )
@@ -37,6 +86,8 @@ export async function preflightBenchmarkHarnesses(input: {
   }
   const component_source = await readFile(join(input.model_dir, "component.circuit.tsx"), "utf8")
   const component_circuit_json = input.context.job_store.getJob(input.job_id)?.circuit_json
+  const power_pin_labels = getRequiredPowerPinLabels(component_circuit_json)
+  const power_probe_names = power_pin_labels.map(getRequiredPowerPreflightProbeName)
   const pins = getStubComponentPins({ component_circuit_json, component_source })
   const model_source = `.SUBCKT SERVER_BENCHMARK_STUB ${pins.map((pin) => pin.spice_node).join(" ")}\nRREF STUB_REF 0 1G\n${pins
     .map((pin, index) => `RSTUB${index + 1} ${pin.spice_node} STUB_REF 1G`)
@@ -76,11 +127,24 @@ export async function preflightBenchmarkHarnesses(input: {
       signal: input.signal,
       run: async (benchmark_file) => {
         const benchmark_id = benchmark_file.replace(/\.circuit\.tsx$/i, "")
+        const benchmark_source_path = join(input.model_dir, "benchmarks", benchmark_file)
+        const power_probe_contract_errors = getRequiredPowerProbeContractErrors(
+          await readFile(benchmark_source_path, "utf8"),
+          power_pin_labels,
+        )
+        if (power_probe_contract_errors.length > 0) {
+          results.set(benchmark_file, {
+            exit_code: 1,
+            failure_kind: "benchmark_structure",
+            error_message: power_probe_contract_errors.join("; "),
+          })
+          return
+        }
         let result = await executeValidationBuild({
           benchmark_file,
           run: {
             run_id: "preflight",
-            source_path: join(input.model_dir, "benchmarks", benchmark_file),
+            source_path: benchmark_source_path,
             generated_path: join(input.job_dir, "dist", "spice", "benchmarks", benchmark_id, "circuit.json"),
             saved_path: join(saved_root, benchmark_id, "circuit.json"),
           },
@@ -100,6 +164,37 @@ export async function preflightBenchmarkHarnesses(input: {
               exit_code: 1,
               failure_kind: "benchmark_structure",
               error_message: `datasheet application topology mismatch: ${application_errors.join("; ")}`,
+            }
+          }
+        }
+        if (result.exit_code === 0 && result.path) {
+          try {
+            const benchmark = benchmarks_by_id.get(benchmark_id)
+            if (!benchmark) throw new Error(`benchmarks.json has no ${benchmark_id} benchmark`)
+            const reference_points = await readCsvPoints(
+              resolveWorkspaceFile(input.model_dir, benchmark.reference_file),
+            )
+            const circuit_json: unknown = JSON.parse(await readFile(result.path, "utf8"))
+            const result_points = extractSimulationResultPoints(
+              circuit_json,
+              parseSimulationDefinition(benchmark.simulation),
+            )
+            const coverage_error = getBenchmarkRangeCoverageError({
+              reference_points,
+              result_points,
+              x_scale: benchmark.x_scale,
+            })
+            if (coverage_error) throw new Error(coverage_error)
+            const power_errors = getUnpoweredRequiredPinErrors(circuit_json, power_probe_names)
+            if (power_errors.length > 0) throw new Error(power_errors.join("; "))
+          } catch (error) {
+            result = {
+              ...result,
+              exit_code: 1,
+              failure_kind: "benchmark_structure",
+              error_message: `benchmark waveform preflight failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
             }
           }
         }

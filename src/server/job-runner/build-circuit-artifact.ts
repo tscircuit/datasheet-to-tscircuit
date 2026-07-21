@@ -2,7 +2,7 @@ import { mkdir, readdir, readFile, rm } from "node:fs/promises"
 import { join, relative } from "node:path"
 import type { AnyCircuitElement } from "circuit-json"
 import { getAllCircuitErrors } from "../model-simulation-validator"
-import { StreamProcessInput, streamProcess, throwIfCancelled } from "./stream-job-process"
+import { type StreamProcessInput, streamProcess, throwIfCancelled } from "./stream-job-process"
 
 async function findCircuitJsonFile(directory: string): Promise<string | undefined> {
   const entries = await readdir(directory, { withFileTypes: true }).catch(() => [])
@@ -35,27 +35,37 @@ export async function buildCircuitArtifact(input: {
   signal: AbortSignal
   append: StreamProcessInput["on_chunk"]
   render_outputs?: boolean
+  pcb_disabled?: boolean
   ignored_circuit_error_types?: string[]
+  required_checks?: Array<"netlist" | "placement" | "routing-difficulty">
 }): Promise<{ circuit_json: AnyCircuitElement[]; errors: string[] }> {
   const output_directory = join(input.job_dir, "dist", input.output_stem)
   const pcb_png_path = join(output_directory, "pcb.png")
   const schematic_svg_path = join(output_directory, "schematic.svg")
   const schematic_png_path = join(output_directory, "schematic.png")
-  const preserved_visuals = input.render_outputs
-    ? await Promise.all(
-        [pcb_png_path, schematic_svg_path, schematic_png_path].map((path) =>
-          readFile(path).catch(() => undefined),
-        ),
-      )
-    : []
   await rm(output_directory, { recursive: true, force: true })
+  const check_errors: string[] = []
+  for (const check of input.required_checks ?? []) {
+    await input.append("system", `Running server-owned tsci ${check} check for ${input.source_file}…\n`)
+    const check_exit_code = await streamProcess({
+      command: [input.tsci_bin, "check", check, input.source_file],
+      cwd: input.job_dir,
+      signal: input.signal,
+      on_chunk: input.append,
+    })
+    throwIfCancelled(input.signal)
+    if (check_exit_code !== 0) {
+      check_errors.push(`tsci check ${check} exited with code ${check_exit_code}`)
+    }
+  }
   const build_command = [
     input.tsci_bin,
     "build",
     input.source_file,
     "--ignore-errors",
     "--ignore-warnings",
-    ...(input.render_outputs ? ["--pcb-png", "--schematic-svgs"] : []),
+    ...(input.pcb_disabled ? ["--disable-pcb"] : []),
+    ...(input.render_outputs ? [...(input.pcb_disabled ? [] : ["--pcb-png"]), "--schematic-svgs"] : []),
   ]
   const build_exit_code = await streamProcess({
     command: build_command,
@@ -73,12 +83,6 @@ export async function buildCircuitArtifact(input: {
   const render_errors: string[] = []
   if (input.render_outputs) {
     await mkdir(output_directory, { recursive: true })
-    if (!(await Bun.file(pcb_png_path).exists()) && preserved_visuals[0]) {
-      await Bun.write(pcb_png_path, preserved_visuals[0])
-    }
-    if (!(await Bun.file(schematic_svg_path).exists()) && preserved_visuals[1]) {
-      await Bun.write(schematic_svg_path, preserved_visuals[1])
-    }
     if (await Bun.file(schematic_svg_path).exists()) {
       const render_exit_code = await streamProcess({
         command: [process.execPath, "render-svg-to-png.ts", relative(input.job_dir, schematic_svg_path)],
@@ -90,10 +94,12 @@ export async function buildCircuitArtifact(input: {
         render_errors.push(`schematic PNG renderer exited with code ${render_exit_code}`)
       }
     }
-    if (!(await Bun.file(schematic_png_path).exists()) && preserved_visuals[2]) {
-      await Bun.write(schematic_png_path, preserved_visuals[2])
+    if (!input.pcb_disabled && !(await Bun.file(pcb_png_path).exists())) {
+      render_errors.push("final PCB PNG was not produced")
     }
-    if (!(await Bun.file(pcb_png_path).exists())) render_errors.push("final PCB PNG was not produced")
+    if (input.pcb_disabled && (await Bun.file(pcb_png_path).exists())) {
+      render_errors.push("schematic-only build unexpectedly produced a PCB PNG")
+    }
     if (!(await Bun.file(schematic_png_path).exists())) {
       render_errors.push("final schematic PNG was not produced")
     }
@@ -101,9 +107,16 @@ export async function buildCircuitArtifact(input: {
   const circuit_errors = getAllCircuitErrors(parsed_json).filter(
     (error) => !input.ignored_circuit_error_types?.some((error_type) => error.startsWith(`${error_type}:`)),
   )
+  const schematic_only_errors = input.pcb_disabled
+    ? parsed_json.some((element) => element.type.startsWith("pcb_"))
+      ? ["schematic-only build unexpectedly produced PCB Circuit JSON elements"]
+      : []
+    : []
   const errors = [
+    ...check_errors,
     ...(build_exit_code === 0 ? [] : [`tsci build exited with code ${build_exit_code}`]),
     ...render_errors,
+    ...schematic_only_errors,
     ...circuit_errors,
   ]
   const unique_errors = [...new Set(errors)]

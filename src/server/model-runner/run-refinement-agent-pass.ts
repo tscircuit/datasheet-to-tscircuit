@@ -1,6 +1,6 @@
 import { hasBenchmarkManifest, verifyBenchmarkLock } from "../model-benchmark-lock"
 import { buildModelAgentPrompt } from "../model-scaffold"
-import { publishAvailableModelCheckpoint } from "./model-checkpoint"
+import { publishAvailableModelCheckpoint, restoreBestReportedModelCheckpoint } from "./model-checkpoint"
 import type { ModelExecution } from "./model-execution"
 import {
   captureProcessOutput,
@@ -110,6 +110,13 @@ export async function runRefinementAgentPass(
     return { was_cancelled: true, should_stop: true }
   }
 
+  const restored_reported_champion = await restoreBestReportedModelCheckpoint(execution.model_dir)
+  if (restored_reported_champion) {
+    await execution.append(
+      "system",
+      `Server checkpoint guard selected ${restored_reported_champion} from the agent's promoted candidates before independent validation.\n`,
+    )
+  }
   const checkpoint_available = await publishAvailableModelCheckpoint(
     { model_run_id: execution.model_run_id, model_dir: execution.model_dir },
     execution.context.model_run_store,

@@ -4,21 +4,23 @@ import type { AnyCircuitElement } from "circuit-json"
 import { getPinoutEvidenceErrors } from "../component-evidence"
 import { getComponentSchematicPlanErrors } from "../component-schematic-plan"
 import {
+  assertVisualInspectionSnapshotMatches,
+  captureVisualInspectionSnapshot,
   getFootprintPlanErrors,
-  validateVisualInspection,
   VisualInspectionInconclusiveError,
+  validateVisualInspection,
 } from "../job-artifact-validator"
 import { buildCircuitArtifact, buildComponentValidationBoard } from "./build-circuit-artifact"
 import { buildComponentPrompt } from "./build-component-prompt"
-import { assertNoDatasheetAccess } from "./get-forbidden-datasheet-accesses"
 import {
   generationWorkspaceWasModified,
   prepareGenerationWorkspace,
   publishGenerationWorkspace,
   restoreProtectedTree,
 } from "./generation-workspace"
+import { assertNoDatasheetAccess } from "./get-forbidden-datasheet-accesses"
+import type { JobExecution } from "./job-execution"
 import type { ApprovedJobEvidence } from "./run-evidence-phase"
-import { JobExecution } from "./job-execution"
 import { runStructuredAgentPhase } from "./run-structured-agent-phase"
 import { throwIfCancelled } from "./stream-job-process"
 
@@ -125,7 +127,14 @@ export async function runComponentGenerationPhase(
       "Component image inspection could not be completed automatically",
     )
   }
-  execution.updateValidation({ component_visual: "passed" })
+  const component_visual_snapshot = await captureVisualInspectionSnapshot({
+    job_dir: execution.job_dir,
+    expected_images: {
+      reference: "visual-reference/land-pattern.png",
+      pcb: "dist/index/pcb.png",
+      schematic: "dist/index/schematic.png",
+    },
+  })
 
   const component_path = join(execution.job_dir, "index.circuit.tsx")
   const component_code = await readFile(component_path, "utf8")
@@ -143,6 +152,7 @@ export async function runComponentGenerationPhase(
     signal: execution.cancellation_signal,
     append: execution.append.bind(execution),
     render_outputs: true,
+    required_checks: ["netlist"],
   })
   if (component_build.errors.length > 0) {
     execution.updateValidation({ component_build: "failed" })
@@ -153,6 +163,17 @@ export async function runComponentGenerationPhase(
     throw new Error(`Generated component failed clean build validation: ${component_build.errors.join("; ")}`)
   }
   execution.updateValidation({ component_build: "passed" })
+  try {
+    await assertVisualInspectionSnapshotMatches({
+      job_dir: execution.job_dir,
+      snapshot: component_visual_snapshot,
+    })
+  } catch (error) {
+    execution.updateValidation({ component_visual: "inconclusive" })
+    throw error
+  }
+  execution.updateValidation({ component_visual: "passed" })
+  await execution.append("system", "Authoritative component build reproduced the agent-inspected images.\n")
   const component_circuit_json = component_build.circuit_json
 
   const footprint_errors = getFootprintPlanErrors(evidence.footprint_plan, component_circuit_json)

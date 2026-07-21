@@ -40,6 +40,25 @@ export function getStubComponentPins(input: {
   return [...pins_by_number.entries()].sort(([left], [right]) => left - right).map(([, pin]) => pin)
 }
 
+export function getRequiredPowerPinLabels(component_circuit_json: unknown): string[] {
+  if (!isCircuitJson(component_circuit_json)) return []
+  const labels = new Set<string>()
+  for (const element of component_circuit_json) {
+    if (element.type !== "source_port") continue
+    const port = element as unknown as Record<string, unknown>
+    if (port.requires_power !== true) continue
+    const candidates = [
+      ...(typeof port.name === "string" ? [port.name] : []),
+      ...(Array.isArray(port.port_hints)
+        ? port.port_hints.filter((hint): hint is string => typeof hint === "string")
+        : []),
+    ]
+    const label = candidates.find((candidate) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(candidate))
+    if (label) labels.add(label)
+  }
+  return [...labels]
+}
+
 export function inferApplicationDutReference(plan: TypicalApplicationPlan): string {
   const endpoint_counts = new Map<string, number>()
   for (const connection of plan.connections) {

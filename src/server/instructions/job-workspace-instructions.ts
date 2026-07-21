@@ -32,13 +32,19 @@ The server controls three strictly separated phases:
 - Classify every pin by its documented electrical function as power_input, power_output, ground,
   input, output, bidirectional, passive, no_connect, or other. This is evidence about the pin, not
   a schematic-placement guess.
+- Record \`electrical_attributes.open_drain: true\` only when the pin documentation explicitly
+  identifies an open-drain output; do not infer it from the generic output role.
 - Record every electrical pin and every copper pad. Preserve repeated pads belonging to one pin.
   Use a null pin only for a mechanical copper pad with no electrical connection.
   Use millimeters and PCB-top coordinates about the land-pattern origin. For calculated centers,
   cite the inputs and record the formula in the source note.
-- Write typical-application plan schema version 3. If a systematic search finds no documented
+- Write typical-application plan schema version 4. If a systematic search finds no documented
   application, use \`availability: "not_present"\` with empty components and connections rather
   than inventing one.
+- Set \`pcb_implementation: "verified"\` only when every external component has an exact
+  datasheet-listed manufacturer part number and exact tscircuit footprint, each with its own
+  component-level source references. Otherwise use \`schematic_only\`; body dimensions alone never
+  justify mapping to a generic footprint.
 - List only referenced electrical parts as application components. Unlabeled open-circle terminals,
   rail arrows, and wire endpoints are interfaces, not \`power_port\` or terminal components.
 - Always include the target IC as component \`U1\`, use \`U1.port\` for its endpoints, and omit bare
@@ -57,13 +63,21 @@ The server controls three strictly separated phases:
 - Treat \`component-evidence.json\`, \`footprint-plan.json\`, and
   \`typical-application-plan.json\` as read-only.
 - Replace \`index.circuit.tsx\` with a self-contained, default-exported component implementing the
-  approved part number, complete pin table, orientation, and exact pad geometry.
+  approved ordering code when present (otherwise the approved part number), complete pin table,
+  orientation, and exact pad geometry.
+- Set \`pinAttributes\` from approved roles: \`power_input\` maps to \`requiresPower\`,
+  \`power_output\` maps to \`providesPower\`, and \`ground\` maps to \`requiresGround\`. Do not
+  assign those attributes to pins with other roles. Approved open-drain pins map to both
+  \`canUseOpenDrain\` and \`isUsingOpenDrain\`; do not set them for other pins.
 - Use built-in tscircuit elements. A generic footprinter is allowed only when its emitted geometry
   exactly matches approved evidence; do not add third-party package imports.
 - Treat the server-created component-schematic-plan.json as read-only and implement its
   schPinArrangement exactly. The server derives this stable layout from independently agreed roles.
 - Do not use \`placementDrcChecksDisabled\`, \`routingDisabled\`,
   \`--ignore-placement-drc\`, or similar suppression.
+- Before the final component build, run \`tsci check placement index.circuit.tsx\` and
+  \`tsci check routing-difficulty index.circuit.tsx\` separately. A nonzero command must be
+  inspected and corrected; do not chain validation commands or reinterpret a failure as warnings.
 - Build with \`tsci build index.circuit.tsx --ignore-warnings --pcb-png --schematic-svgs\`, render
   the schematic SVG with \`bun render-svg-to-png.ts <path>\`, and inspect the locked reference, PCB,
   and schematic PNGs after the final build.
@@ -78,12 +92,21 @@ The server controls three strictly separated phases:
   \`footprint-plan.json\`, and \`typical-application-plan.json\` as read-only.
 - Create a default-exported \`typical-application.circuit.tsx\` importing
   \`./index.circuit\`. Implement every planned component, value, and structured net.
+- For \`pcb_implementation: "verified"\`, use every approved manufacturer part number exactly. For
+  each external component, set literal \`manufacturerPartNumber\` and \`footprint\` JSX props to the
+  approved values. For \`schematic_only\`, omit all application footprint and PCB placement props and build with
+  \`--disable-pcb --schematic-svgs\`; inspect and report only the reference and schematic images.
 - Also treat component-schematic-plan.json as read-only.
 - Do not instantiate a standalone netlabel element. Net selectors such as net.* and sel.net.*,
   net-connected traces, trace schDisplayLabel props, and compiled schematic net-label records are allowed.
   Place components compactly by signal flow so traces stay short and readable.
-- Build with PCB and schematic outputs and inspect the locked application reference plus both final
-  renders. Write \`application-visual-inspection.json\` only after conclusive pixel inspection.
+- For verified PCB plans, build PCB and schematic outputs and inspect the locked application
+  reference plus both final renders. For schematic-only plans, inspect the reference and schematic
+  render only. Write \`application-visual-inspection.json\` only after conclusive pixel inspection.
+- Before the final application build, run \`tsci check netlist typical-application.circuit.tsx\`,
+  \`tsci check placement typical-application.circuit.tsx\`, and
+  \`tsci check routing-difficulty typical-application.circuit.tsx\` separately in that order. A
+  nonzero command must be inspected and corrected.
 - Do not suppress DRC, autorouting, placement, or clearance failures.
 
 After a final build in either generation phase, run no shell command except the one schematic

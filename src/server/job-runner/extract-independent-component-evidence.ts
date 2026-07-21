@@ -85,6 +85,11 @@ export async function extractIndependentComponentEvidence(input: {
       JSON.parse(application_raw_text),
       component_evidence.part_number.value,
     )
+    if (application_plan.version !== 4) {
+      throw new Error(
+        "New independent evidence extraction must use typical-application plan schema version 4",
+      )
+    }
     const footprint_plan = createFootprintPlanFromEvidence(component_evidence)
     await Promise.all([
       Bun.write(

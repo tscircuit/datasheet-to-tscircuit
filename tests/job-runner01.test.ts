@@ -5,8 +5,8 @@ import { join } from "node:path"
 import {
   buildAgentPrompt,
   buildComponentPrompt,
-  buildTypicalApplicationPrompt,
   buildTypicalApplicationEvidenceVerificationPrompt,
+  buildTypicalApplicationPrompt,
   getForbiddenDatasheetAccesses,
   getTypicalApplicationPlanAgreementErrors,
   parseTypicalApplicationPlan,
@@ -25,31 +25,35 @@ function emitAgentEvent(event) {
 function emitText(text) {
   emitAgentEvent({ type: "text_delta", text })
 }
+function emitThinking(text) {
+  emitAgentEvent({ type: "thinking_delta", text })
+}
 function finishAgent() {
   emitAgentEvent({ type: "agent_end", failed: false })
 }
 const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="), (character) => character.charCodeAt(0))
-async function recordVisualInspection(kind, status = "passed", resultHasImage = true) {
+async function recordVisualInspection(kind, status = "passed", resultHasImage = true, buildFlags = "") {
   const component = kind === "component"
+  const pcbDisabled = !component && buildFlags.includes("--disable-pcb")
   const reference = component ? "visual-reference/land-pattern.png" : "visual-reference/typical-application.png"
   const pcb = component ? "dist/index/pcb.png" : "dist/typical-application/pcb.png"
   const schematic = component ? "dist/index/schematic.png" : "dist/typical-application/schematic.png"
-  const build = component ? "tsci build index.circuit.tsx" : "tsci build typical-application.circuit.tsx"
+  const build = (component ? "tsci build index.circuit.tsx" : "tsci build typical-application.circuit.tsx") + buildFlags
   const { mkdir } = await import("node:fs/promises")
   await mkdir(dir + "/visual-reference", { recursive: true })
   await mkdir(dir + "/" + (component ? "dist/index" : "dist/typical-application"), { recursive: true })
   await Bun.write(dir + "/" + reference, png)
-  await Bun.write(dir + "/" + pcb, png)
+  if (!pcbDisabled) await Bun.write(dir + "/" + pcb, png)
   await Bun.write(dir + "/" + schematic, png)
   emitAgentEvent({ type: "tool_start", tool_call_id: "build", tool_name: "bash", args: { command: build } })
   emitAgentEvent({ type: "tool_end", tool_call_id: "build", tool_name: "bash", is_error: false, result_has_image: false })
   let readIndex = 0
-  for (const path of [reference, pcb, schematic]) {
+  for (const path of [reference, ...(pcbDisabled ? [] : [pcb]), schematic]) {
     const tool_call_id = "read-" + readIndex++
     emitAgentEvent({ type: "tool_start", tool_call_id, tool_name: "read", args: { path } })
     emitAgentEvent({ type: "tool_end", tool_call_id, tool_name: "read", is_error: false, result_has_image: resultHasImage })
   }
-  const report = { version: 1, status, reference_image: reference, pcb_image: pcb, schematic_image: schematic }
+  const report = { version: 1, status, reference_image: reference, ...(pcbDisabled ? {} : { pcb_image: pcb }), schematic_image: schematic }
   await Bun.write(dir + "/" + (component ? "component-visual-inspection.json" : "application-visual-inspection.json"), JSON.stringify(report))
 }
 async function recordEvidence(plan, options = {}) {
@@ -77,11 +81,27 @@ async function recordEvidence(plan, options = {}) {
     },
     unresolved_ambiguities: options.ambiguities ?? [],
   }
+  const availability = plan.availability ?? "documented"
+  const currentPlan = options.preserveLegacyPlan || plan.version === 4 ? plan : {
+    ...plan,
+    version: 4,
+    availability,
+    ...(availability === "documented" ? { pcb_implementation: "verified" } : {}),
+    components: plan.components.map((component) => component.reference.toLowerCase() === "u1"
+      ? component
+      : {
+          ...component,
+          manufacturer_part_number: "TEST-" + component.reference.toUpperCase(),
+          footprint: "0402",
+          source_references: [{ page: plan.source_references[0]?.page ?? 1 }],
+          footprint_source_references: [{ page: plan.source_references[0]?.page ?? 1 }],
+        }),
+  }
   await mkdir(dir + "/visual-reference", { recursive: true })
   await Bun.write(dir + "/" + reference, png)
   await Bun.write(dir + "/" + landReference, png)
   await Bun.write(dir + "/component-evidence.json", JSON.stringify(componentEvidence))
-  await Bun.write(dir + "/typical-application-plan.json", JSON.stringify(plan))
+  await Bun.write(dir + "/typical-application-plan.json", JSON.stringify(currentPlan))
   for (const [index, path] of [landReference, reference].entries()) {
     const tool_call_id = "reference-read-" + index
     emitAgentEvent({ type: "tool_start", tool_call_id, tool_name: "read", args: { path } })
@@ -98,6 +118,10 @@ test("prompts separate evidence extraction from build-verified TSX generation", 
   expect(prompt).toContain("exactly 200 DPI")
   expect(prompt).toContain('status": "resolved" | "unresolved"')
   expect(prompt).toContain("typical-application-plan.json")
+  expect(prompt).toContain('"version": 4')
+  expect(prompt).toContain('"pcb_implementation": "verified" | "schematic_only"')
+  expect(prompt).toContain("manufacturer_part_number")
+  expect(prompt).toContain("footprint_source_references")
   expect(prompt).toContain("Do not write footprint-plan.json")
   expect(prompt).toContain("Always include the target IC as component U1")
   expect(prompt).toContain("unresolved_ambiguities must be empty")
@@ -108,14 +132,26 @@ test("prompts separate evidence extraction from build-verified TSX generation", 
   expect(component_prompt).toContain("Do not open, extract, render, search")
   expect(component_prompt).toContain("tsci build")
   expect(component_prompt).toContain("placementDrcChecksDisabled")
+  expect(component_prompt).toContain("tsci check netlist index.circuit.tsx")
+  expect(component_prompt).toContain("tsci check placement index.circuit.tsx")
+  expect(component_prompt).toContain("tsci check routing-difficulty index.circuit.tsx")
+  expect(component_prompt).toContain("never chain checks")
+  expect(component_prompt).toContain("requiresPower")
+  expect(component_prompt).toContain("canUseOpenDrain")
   expect(component_prompt).toContain('"pcb_image": "dist/index/pcb.png"')
   const application_prompt = buildTypicalApplicationPrompt("Use the QFN package")
   expect(application_prompt).toContain("server has independently")
   expect(application_prompt).toContain('"./index.circuit"')
   expect(application_prompt).toContain("PCB and schematic")
   expect(application_prompt).toContain("do not suppress placement DRC")
+  expect(application_prompt).toContain("tsci check netlist typical-application.circuit.tsx")
+  expect(application_prompt).toContain("tsci check placement typical-application.circuit.tsx")
+  expect(application_prompt).toContain("tsci check routing-difficulty typical-application.circuit.tsx")
+  expect(application_prompt).toContain("JSX manufacturerPartNumber prop")
   expect(application_prompt).toContain("Do not modify `visual-reference/typical-application.png`")
   expect(application_prompt).toContain("Use the QFN package")
+  expect(buildTypicalApplicationPrompt(undefined, "schematic_only")).toContain("--disable-pcb")
+  expect(buildTypicalApplicationPrompt(undefined, "schematic_only")).toContain("omit pcb_image")
   expect(buildTypicalApplicationEvidenceVerificationPrompt("Use the QFN package")).toContain(
     "Use the QFN package",
   )
@@ -244,6 +280,186 @@ test("application agreement compares electrical semantics instead of agent-autho
   ).toEqual([])
 })
 
+test("schematic-only application agreement ignores packaging and optional sourcing detail", () => {
+  const primary = parseTypicalApplicationPlan(
+    {
+      version: 4,
+      availability: "documented",
+      pcb_implementation: "schematic_only",
+      title: "TPS63802 application",
+      description: "Primary extraction",
+      source_references: [{ page: 17 }],
+      components: [
+        {
+          reference: "U1",
+          kind: "buck-boost converter",
+          value: "TPS63802DLAT",
+          manufacturer_part_number: "TPS63802DLAT",
+        },
+        { reference: "L1", kind: "inductor", value: "0.47uH" },
+        { reference: "C1", kind: "capacitor", value: "10uF" },
+        { reference: "C2", kind: "capacitor", value: "22uF" },
+      ],
+      connections: [
+        { net: "SW", pins: ["U1.L1", "L1.1"] },
+        { net: "VIN", pins: ["U1.VIN", "C1.1"] },
+        { net: "VOUT", pins: ["U1.VOUT", "C2.1"] },
+      ],
+    },
+    "TPS63802",
+  )
+  const independent = parseTypicalApplicationPlan(
+    {
+      ...primary,
+      description: "Independent extraction",
+      components: primary.components.map((component) => {
+        if (component.reference === "U1") {
+          return {
+            ...component,
+            value: "TPS63802DLAR",
+            manufacturer_part_number: "TPS63802DLAR",
+          }
+        }
+        return {
+          ...component,
+          manufacturer_part_number: `SOURCED-${component.reference}`,
+          footprint: "0603",
+        }
+      }),
+    },
+    "TPS63802",
+  )
+
+  expect(
+    getTypicalApplicationPlanAgreementErrors({
+      primary,
+      independent,
+      target_part_number: "TPS63802",
+    }),
+  ).toEqual([])
+})
+
+test("verified application agreement still requires exact external sourcing detail", () => {
+  const base = {
+    version: 4,
+    availability: "documented",
+    pcb_implementation: "verified",
+    title: "Verified application",
+    description: "Verified PCB",
+    source_references: [{ page: 8 }],
+    components: [
+      { reference: "U1", kind: "integrated_circuit", value: "DEVICE-1-A" },
+      {
+        reference: "C1",
+        kind: "capacitor",
+        value: "1uF",
+        manufacturer_part_number: "CAP-A",
+        footprint: "0402",
+        source_references: [{ page: 8 }],
+        footprint_source_references: [{ page: 9 }],
+      },
+    ],
+    connections: [{ net: "VCC", pins: ["U1.VCC", "C1.1"] }],
+  } as const
+  const primary = parseTypicalApplicationPlan(base, "DEVICE-1")
+  const independent = parseTypicalApplicationPlan(
+    {
+      ...base,
+      components: base.components.map((component) =>
+        component.reference === "C1" ? { ...component, manufacturer_part_number: "CAP-B" } : component,
+      ),
+    },
+    "DEVICE-1",
+  )
+
+  expect(
+    getTypicalApplicationPlanAgreementErrors({
+      primary,
+      independent,
+      target_part_number: "DEVICE-1",
+    }),
+  ).toContain('typical-application component C1 manufacturer part number disagrees: "CAP-A" versus "CAP-B"')
+})
+
+test("version 4 application evidence requires sourced passives for a verified PCB", () => {
+  const base = {
+    version: 4,
+    availability: "documented",
+    title: "Typical application",
+    description: "Datasheet circuit",
+    source_references: [{ page: 8 }],
+    components: [
+      { reference: "U1", kind: "device" },
+      { reference: "L1", kind: "inductor", value: "0.47uH" },
+    ],
+    connections: [{ net: "SW", pins: ["U1.SW", "L1.pin1"] }],
+  }
+  expect(() => parseTypicalApplicationPlan({ ...base, pcb_implementation: "verified" }, "DEVICE-1")).toThrow(
+    "verified PCB component L1",
+  )
+  expect(() => parseTypicalApplicationPlan({ ...base, pcb_implementation: "maybe" })).toThrow(
+    "pcb_implementation must be verified or schematic_only",
+  )
+
+  const schematic_only = parseTypicalApplicationPlan({
+    ...base,
+    pcb_implementation: "schematic_only",
+  })
+  expect(schematic_only.pcb_implementation).toBe("schematic_only")
+
+  const verified = parseTypicalApplicationPlan({
+    ...base,
+    pcb_implementation: "verified",
+    components: [
+      { reference: "U1", kind: "device" },
+      {
+        reference: "L1",
+        kind: "inductor",
+        value: "0.47uH",
+        manufacturer_part_number: "DFE201612E-R47M",
+        footprint: "0805",
+        source_references: [{ page: 19, figure: "Recommended inductors" }],
+        footprint_source_references: [{ page: 20, figure: "DFE201612E land pattern" }],
+      },
+    ],
+  })
+  expect(verified.components[1]?.manufacturer_part_number).toBe("DFE201612E-R47M")
+})
+
+test("new evidence extraction rejects legacy application plans that bypass PCB sourcing", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-job-runner-legacy-plan-"))
+  await Bun.write(join(job_dir, "datasheet.pdf"), "fake datasheet")
+  const agent_path = join(job_dir, "legacy-plan-agent")
+  await Bun.write(
+    agent_path,
+    `#!/usr/bin/env bun
+const args = process.argv.slice(2)
+const dir = args[args.indexOf("--dir") + 1]
+const prompt = args[args.indexOf("--prompt") + 1]
+${fakeVisualInspectionHelpers}
+const plan = { version: 3, availability: "documented", title: "Legacy application", description: "Would bypass sourced part validation", source_references: [{ page: 8 }], components: [{ reference: "U1", kind: "device" }, { reference: "C1", kind: "capacitor", value: "1uF" }], connections: [{ net: "VCC", pins: ["U1.VCC", "C1.pin1"] }] }
+if (prompt.includes("evidence-extraction phase")) {
+  await recordEvidence(plan, { preserveLegacyPlan: true })
+} else {
+  await Bun.write(dir + "/unexpected-phase", "reached")
+}
+finishAgent()
+`,
+  )
+  await chmod(agent_path, 0o755)
+
+  const job_store = new JobStore()
+  job_store.createJob({ job_id: "job_legacy_plan", job_dir, file_name: "device.pdf" })
+  await runJob({ job_id: "job_legacy_plan" }, { job_store, agent_bin: agent_path, tsci_bin: "unused-tsci" })
+
+  const job = job_store.getJob("job_legacy_plan")
+  expect(job?.display_status).toBe("unsupported")
+  expect(job?.error_message).toContain("must use typical-application plan schema version 4")
+  expect(await Bun.file(join(job_dir, "unexpected-phase")).exists()).toBe(false)
+
+  await rm(job_dir, { recursive: true, force: true })
+})
+
 test("application plans discard invented interface-terminal pseudo-components", () => {
   const plan = parseTypicalApplicationPlan({
     version: 3,
@@ -355,6 +571,8 @@ if (prompt.includes("Independently extract")) {
   if (await Bun.file(dir + "/datasheet.pdf").exists()) throw new Error("raw datasheet leaked into component generation")
   if (await Bun.file(dir + "/visual-reference/pages/page-009.png").exists()) throw new Error("raw page render leaked into component generation")
   await Bun.write(dir + "/index.circuit.tsx", 'export default function Part() { return <chip name="U1" footprint="soic8" /> }\\n')
+  emitThinking("Checking component ")
+  emitThinking("geometry before the final build.\\n")
   await recordVisualInspection("component")
   emitText("component phase complete")
 } else {
@@ -362,7 +580,7 @@ if (prompt.includes("Independently extract")) {
   if (await Bun.file(dir + "/visual-reference/land-pattern.png").exists()) throw new Error("component evidence image leaked into application generation")
   if (!(await Bun.file(dir + "/dist/index/circuit.json").exists())) throw new Error("component was not built before application phase")
   if (!(await Bun.file(dir + "/component.circuit.tsx").exists())) throw new Error("component snapshot was not published")
-  await Bun.write(dir + "/typical-application.circuit.tsx", 'import Part from "./index.circuit"\\nexport default function TypicalApplication() { return <board><Part name="U1" /><capacitor name="C1" capacitance="1uF" /></board> }\\n')
+  await Bun.write(dir + "/typical-application.circuit.tsx", 'import Part from "./index.circuit"\\nexport default function TypicalApplication() { return <board><Part name="U1" /><capacitor name="C1" capacitance="1uF" manufacturerPartNumber="TEST-C1" footprint="0402" /></board> }\\n')
   await recordVisualInspection("application")
   emitText("application phase complete")
 }
@@ -377,13 +595,17 @@ const target = Bun.argv.slice(2)[1]
 const stem = target.replace(/\\.circuit\\.tsx$/, "")
 await appendFile(process.cwd() + "/build-targets.log", target + "\\n")
 await mkdir(process.cwd() + "/dist/" + stem, { recursive: true })
+const renderPng = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="), (character) => character.charCodeAt(0))
+await Bun.write(process.cwd() + "/dist/" + stem + "/pcb.png", renderPng)
+await Bun.write(process.cwd() + "/dist/" + stem + "/schematic.png", renderPng)
 const circuit = target === "index.circuit.tsx" || target === "component-validation.circuit.tsx"
-  ? [{ type: "source_component", source_component_id: "part", name: "U1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"] }, { type: "schematic_component", schematic_component_id: "sch1", source_component_id: "part", center: { x: 0, y: 0 } }, { type: "schematic_port", schematic_port_id: "sp1", schematic_component_id: "sch1", source_port_id: "u1_vcc", side_of_component: "top", center: { x: 0, y: 1 } }, { type: "pcb_smtpad", pcb_smtpad_id: "pad1", pcb_component_id: "pcb1", pcb_port_id: "port1", port_hints: ["1"], x: 0, y: 0, width: 0.6, height: 0.25 }]
+  ? [{ type: "source_component", source_component_id: "part", name: "U1", manufacturer_part_number: "SENSOR-1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"], requires_power: true }, { type: "schematic_component", schematic_component_id: "sch1", source_component_id: "part", center: { x: 0, y: 0 } }, { type: "schematic_port", schematic_port_id: "sp1", schematic_component_id: "sch1", source_port_id: "u1_vcc", side_of_component: "top", center: { x: 0, y: 1 } }, { type: "pcb_smtpad", pcb_smtpad_id: "pad1", pcb_component_id: "pcb1", pcb_port_id: "port1", port_hints: ["1"], x: 0, y: 0, width: 0.6, height: 0.25 }]
   : [
       { type: "source_component", source_component_id: "part", name: "U1" },
       { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", subcircuit_connectivity_map_key: "vcc" },
       { type: "source_port", source_port_id: "u1_gnd", source_component_id: "part", name: "GND", subcircuit_connectivity_map_key: "gnd" },
-      { type: "source_component", source_component_id: "cap", name: "C1", ftype: "simple_capacitor", capacitance: 0.000001 },
+      { type: "source_component", source_component_id: "cap", name: "C1", ftype: "simple_capacitor", capacitance: 0.000001, manufacturer_part_number: "TEST-C1" },
+      { type: "cad_component", cad_component_id: "cap-cad", pcb_component_id: "cap-pcb", source_component_id: "cap", footprinter_string: "0402", position: { x: 0, y: 0, z: 0 }, model_object_fit: "contain_within_bounds" },
       { type: "source_port", source_port_id: "c1_1", source_component_id: "cap", name: "pin1", pin_number: 1, subcircuit_connectivity_map_key: "vcc" },
       { type: "source_port", source_port_id: "c1_2", source_component_id: "cap", name: "pin2", pin_number: 2, subcircuit_connectivity_map_key: "gnd" },
       ...Array.from({ length: 7 }, (_, index) => ({ type: "schematic_component", schematic_component_id: "application-sch-" + index, center: { x: index, y: 0 } })),
@@ -439,6 +661,7 @@ await Bun.write(process.cwd() + "/dist/" + stem + "/circuit.json", JSON.stringif
   const agent_log = await Bun.file(join(job_dir, "agent.log")).text()
   expect(agent_log).toContain("[tool] read")
   expect(agent_log).toContain("Agent phase completed with")
+  expect(agent_log).toContain("Checking component geometry before the final build.")
   expect(agent_log).toContain("Schematic layout advisory")
   const persisted_job = JSON.parse(await Bun.file(join(job_dir, "job.json")).text())
   expect(persisted_job.version).toBe(2)
@@ -446,9 +669,75 @@ await Bun.write(process.cwd() + "/dist/" + stem + "/circuit.json", JSON.stringif
   expect(persisted_job.provenance.datasheet_sha256).toHaveLength(64)
   expect(persisted_job.provenance.prompt_sha256.component_generation).toHaveLength(64)
   expect(await Bun.file(join(job_dir, "build-targets.log")).text()).toBe(
-    "index.circuit.tsx\ncomponent-validation.circuit.tsx\ntypical-application.circuit.tsx\n",
+    "netlist\nindex.circuit.tsx\ncomponent-validation.circuit.tsx\nnetlist\ntypical-application.circuit.tsx\n",
   )
   expect(await Bun.file(join(job_dir, "photon_rs_bg.wasm")).exists()).toBe(false)
+
+  await rm(job_dir, { recursive: true, force: true })
+})
+
+test("schematic-only application evidence publishes no application PCB", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-job-runner-schematic-only-"))
+  await Bun.write(join(job_dir, "datasheet.pdf"), "fake datasheet")
+  const agent_path = join(job_dir, "schematic-only-agent")
+  const tsci_path = join(job_dir, "schematic-only-tsci")
+  await Promise.all([
+    Bun.write(
+      agent_path,
+      `#!/usr/bin/env bun
+const args = process.argv.slice(2)
+const dir = args[args.indexOf("--dir") + 1]
+const prompt = args[args.indexOf("--prompt") + 1]
+${fakeVisualInspectionHelpers}
+const plan = { version: 4, availability: "documented", pcb_implementation: "schematic_only", title: "Typical sensor application", description: "No sourced capacitor package", source_references: [{ page: 8 }], components: [{ reference: "U1", kind: "sensor" }, { reference: "C1", kind: "capacitor", value: "1uF" }], connections: [{ net: "VCC", pins: ["U1.VCC", "C1.pin1"] }] }
+if (prompt.includes("Independently extract") || prompt.includes("evidence-extraction phase")) {
+  await recordEvidence(plan)
+} else if (prompt.includes("Generate the reusable")) {
+  await Bun.write(dir + "/index.circuit.tsx", 'export default function Part() { return <chip name="U1" /> }\\n')
+  await recordVisualInspection("component")
+} else {
+  if (!prompt.includes("--disable-pcb")) throw new Error("schematic-only build instruction missing")
+  await Bun.write(dir + "/typical-application.circuit.tsx", 'import Part from "./index.circuit"\\nexport default function Application() { return <board><Part name="U1" /><capacitor name="C1" capacitance="1uF" /></board> }\\n')
+  await recordVisualInspection("application", "passed", true, " --disable-pcb --schematic-svgs")
+}
+finishAgent()
+`,
+    ),
+    Bun.write(
+      tsci_path,
+      `#!/usr/bin/env bun
+import { appendFile, mkdir } from "node:fs/promises"
+const args = Bun.argv.slice(2)
+const target = args[1]
+const stem = target.replace(/\\.circuit\\.tsx$/, "")
+const pcbDisabled = args.includes("--disable-pcb")
+await appendFile(process.cwd() + "/build-targets.log", target + (pcbDisabled ? " --disable-pcb" : "") + "\\n")
+await mkdir(process.cwd() + "/dist/" + stem, { recursive: true })
+const renderPng = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="), (character) => character.charCodeAt(0))
+if (!pcbDisabled) await Bun.write(process.cwd() + "/dist/" + stem + "/pcb.png", renderPng)
+await Bun.write(process.cwd() + "/dist/" + stem + "/schematic.png", renderPng)
+const circuit = target === "index.circuit.tsx" || target === "component-validation.circuit.tsx"
+  ? [{ type: "source_component", source_component_id: "part", name: "U1", manufacturer_part_number: "SENSOR-1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"], requires_power: true }, { type: "schematic_component", schematic_component_id: "sch1", source_component_id: "part", center: { x: 0, y: 0 } }, { type: "schematic_port", schematic_port_id: "sp1", schematic_component_id: "sch1", source_port_id: "u1_vcc", side_of_component: "top", center: { x: 0, y: 1 } }, { type: "pcb_smtpad", pcb_smtpad_id: "pad1", pcb_component_id: "pcb1", pcb_port_id: "port1", port_hints: ["1"], x: 0, y: 0, width: 0.6, height: 0.25 }]
+  : [{ type: "source_component", source_component_id: "part", name: "U1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", subcircuit_connectivity_map_key: "vcc" }, { type: "source_component", source_component_id: "cap", name: "C1", capacitance: 0.000001 }, { type: "source_port", source_port_id: "c1_1", source_component_id: "cap", name: "pin1", pin_number: 1, subcircuit_connectivity_map_key: "vcc" }, { type: "source_port", source_port_id: "c1_2", source_component_id: "cap", name: "pin2", pin_number: 2 }]
+await Bun.write(process.cwd() + "/dist/" + stem + "/circuit.json", JSON.stringify(circuit))
+`,
+    ),
+  ])
+  await Promise.all([chmod(agent_path, 0o755), chmod(tsci_path, 0o755)])
+
+  const job_store = new JobStore()
+  job_store.createJob({ job_id: "job_schematic_only", job_dir, file_name: "sensor.pdf" })
+  await runJob({ job_id: "job_schematic_only" }, { job_store, agent_bin: agent_path, tsci_bin: tsci_path })
+
+  const job = job_store.getJob("job_schematic_only")
+  expect(job?.display_status).toBe("complete")
+  expect(job?.validation?.application_build).toBe("passed")
+  expect(job?.validation?.application_visual).toBe("passed")
+  expect(await Bun.file(join(job_dir, "dist/typical-application/schematic.png")).exists()).toBe(true)
+  expect(await Bun.file(join(job_dir, "dist/typical-application/pcb.png")).exists()).toBe(false)
+  expect(await Bun.file(join(job_dir, "build-targets.log")).text()).toContain(
+    "typical-application.circuit.tsx --disable-pcb",
+  )
 
   await rm(job_dir, { recursive: true, force: true })
 })
@@ -473,7 +762,7 @@ if (prompt.includes("Independently extract") || prompt.includes("evidence-extrac
   await Bun.write(dir + "/index.circuit.tsx", 'export default function Part() { return <chip name="U1" footprint="soic8" /> }\\n')
   await recordVisualInspection("component")
 } else {
-  await Bun.write(dir + "/typical-application.circuit.tsx", 'import Part from "./index.circuit"\\nexport default function Application() { return <board><Part name="U1" /></board> }\\n')
+  await Bun.write(dir + "/typical-application.circuit.tsx", 'import Part from "./index.circuit"\\nexport default function Application() { return <board><Part name="U1" /><capacitor name="C1" capacitance="1uF" manufacturerPartNumber="TEST-C1" footprint="0402" /></board> }\\n')
   await recordVisualInspection("application")
 }
 finishAgent()
@@ -486,8 +775,11 @@ import { mkdir } from "node:fs/promises"
 const target = Bun.argv.slice(2)[1]
 const stem = target.replace(/\\.circuit\\.tsx$/, "")
 await mkdir(process.cwd() + "/dist/" + stem, { recursive: true })
+const renderPng = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="), (character) => character.charCodeAt(0))
+await Bun.write(process.cwd() + "/dist/" + stem + "/pcb.png", renderPng)
+await Bun.write(process.cwd() + "/dist/" + stem + "/schematic.png", renderPng)
 const circuit = target === "index.circuit.tsx" || target === "component-validation.circuit.tsx"
-  ? [{ type: "source_component", source_component_id: "part", name: "U1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"] }, { type: "schematic_component", schematic_component_id: "sch1", source_component_id: "part", center: { x: 0, y: 0 } }, { type: "schematic_port", schematic_port_id: "sp1", schematic_component_id: "sch1", source_port_id: "u1_vcc", side_of_component: "top", center: { x: 0, y: 1 } }, { type: "pcb_smtpad", pcb_smtpad_id: "pad1", pcb_component_id: "pcb1", pcb_port_id: "port1", port_hints: ["1"], x: 0, y: 0, width: 0.6, height: 0.25 }]
+  ? [{ type: "source_component", source_component_id: "part", name: "U1", manufacturer_part_number: "SENSOR-1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"], requires_power: true }, { type: "schematic_component", schematic_component_id: "sch1", source_component_id: "part", center: { x: 0, y: 0 } }, { type: "schematic_port", schematic_port_id: "sp1", schematic_component_id: "sch1", source_port_id: "u1_vcc", side_of_component: "top", center: { x: 0, y: 1 } }, { type: "pcb_smtpad", pcb_smtpad_id: "pad1", pcb_component_id: "pcb1", pcb_port_id: "port1", port_hints: ["1"], x: 0, y: 0, width: 0.6, height: 0.25 }]
   : [
       { type: "source_component", source_component_id: "application", name: "APP" },
       { type: "pcb_pad_pad_clearance_error", message: "C1 overlaps U1" },
@@ -545,14 +837,17 @@ import { mkdir } from "node:fs/promises"
 const target = Bun.argv.slice(2)[1]
 const stem = target.replace(/\\.circuit\\.tsx$/, "")
 await mkdir(process.cwd() + "/dist/" + stem, { recursive: true })
+const renderPng = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="), (character) => character.charCodeAt(0))
+await Bun.write(process.cwd() + "/dist/" + stem + "/pcb.png", renderPng)
+await Bun.write(process.cwd() + "/dist/" + stem + "/schematic.png", renderPng)
 const circuit = target === "component-validation.circuit.tsx"
   ? [
-      { type: "source_component", source_component_id: "part", name: "U1" },
-      { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"] },
+      { type: "source_component", source_component_id: "part", name: "U1", manufacturer_part_number: "SENSOR-1" },
+      { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"], requires_power: true },
       { type: "pcb_smtpad", pcb_smtpad_id: "pad1", pcb_component_id: "pcb1", pcb_port_id: "port1", port_hints: ["1"], x: 0, y: 0, width: 0.6, height: 0.25 },
       { type: "pcb_pad_pad_clearance_error", message: "U1.GND overlaps U1.L1" },
     ]
-  : [{ type: "source_component", source_component_id: "part", name: "U1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"] }, { type: "schematic_component", schematic_component_id: "sch1", source_component_id: "part", center: { x: 0, y: 0 } }, { type: "schematic_port", schematic_port_id: "sp1", schematic_component_id: "sch1", source_port_id: "u1_vcc", side_of_component: "top", center: { x: 0, y: 1 } }, { type: "pcb_smtpad", pcb_smtpad_id: "pad1", pcb_component_id: "pcb1", pcb_port_id: "port1", port_hints: ["1"], x: 0, y: 0, width: 0.6, height: 0.25 }]
+  : [{ type: "source_component", source_component_id: "part", name: "U1", manufacturer_part_number: "SENSOR-1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"], requires_power: true }, { type: "schematic_component", schematic_component_id: "sch1", source_component_id: "part", center: { x: 0, y: 0 } }, { type: "schematic_port", schematic_port_id: "sp1", schematic_component_id: "sch1", source_port_id: "u1_vcc", side_of_component: "top", center: { x: 0, y: 1 } }, { type: "pcb_smtpad", pcb_smtpad_id: "pad1", pcb_component_id: "pcb1", pcb_port_id: "port1", port_hints: ["1"], x: 0, y: 0, width: 0.6, height: 0.25 }]
 await Bun.write(process.cwd() + "/dist/" + stem + "/circuit.json", JSON.stringify(circuit))
 `,
     ),
@@ -573,7 +868,7 @@ await Bun.write(process.cwd() + "/dist/" + stem + "/circuit.json", JSON.stringif
   await rm(job_dir, { recursive: true, force: true })
 })
 
-test("independent geometry disagreement stops the job before TSX generation", async () => {
+test("two agreeing independent geometry extractions override an incorrect primary", async () => {
   const job_dir = await mkdtemp(join(tmpdir(), "datasheet-job-runner-evidence-disagreement-"))
   await Bun.write(join(job_dir, "datasheet.pdf"), "fake datasheet")
   const agent_path = join(job_dir, "disagreement-agent")
@@ -602,11 +897,17 @@ finishAgent()
   await runJob({ job_id: "job_disagreement" }, { job_store, agent_bin: agent_path, tsci_bin: "unused-tsci" })
 
   const job = job_store.getJob("job_disagreement")
-  expect(job?.display_status).toBe("unsupported")
-  expect(job?.validation?.evidence).toBe("unresolved")
-  expect(job?.error_message).toContain("did not converge automatically")
-  expect(job?.error_message).toContain("pin 1 width")
-  expect(await Bun.file(join(job_dir, "tsx-generation-reached")).exists()).toBe(false)
+  expect(job?.display_status).toBe("failed")
+  expect(job?.validation?.evidence).toBe("passed")
+  expect(job?.logs.map((log) => log.message).join("\n")).toContain(
+    "Independent evidence consensus overrode the primary extraction",
+  )
+  expect(job?.logs.map((log) => log.message).join("\n")).toContain(
+    "Generating the component from approved evidence only",
+  )
+  expect(
+    JSON.parse(await Bun.file(join(job_dir, "component-evidence.json")).text()).footprint.pads[0].width,
+  ).toBe(0.9)
   expect(await Bun.file(join(job_dir, "component-evidence.independent.json")).exists()).toBe(true)
   expect(
     await Bun.file(join(job_dir, "evidence-attempts/independent-1/component-evidence.json")).exists(),
@@ -617,6 +918,44 @@ finishAgent()
   expect(
     await Bun.file(join(job_dir, "evidence-attempts/independent-2/typical-application-plan.json")).text(),
   ).toContain('"title": "fresh verification"')
+
+  await rm(job_dir, { recursive: true, force: true })
+})
+
+test("three-way geometry disagreement remains unsupported", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-job-runner-no-consensus-"))
+  await Bun.write(join(job_dir, "datasheet.pdf"), "fake datasheet")
+  const agent_path = join(job_dir, "no-consensus-agent")
+  await Bun.write(
+    agent_path,
+    `#!/usr/bin/env bun
+const args = process.argv.slice(2)
+const dir = args[args.indexOf("--dir") + 1]
+const prompt = args[args.indexOf("--prompt") + 1]
+${fakeVisualInspectionHelpers}
+const plan = { version: 2, title: "Typical application", description: "Datasheet circuit", source_references: [{ page: 8 }], components: [{ reference: "U1", kind: "device" }, { reference: "C1", kind: "capacitor", value: "1uF" }], connections: [{ net: "VCC", pins: ["U1.VCC", "C1.pin1"] }] }
+if (prompt.includes("Independently extract")) {
+  await recordEvidence(plan, { padWidth: prompt.includes("prior independent extraction") ? 0.8 : 0.9 })
+} else if (prompt.includes("evidence-extraction phase")) {
+  await recordEvidence(plan, { padWidth: 0.6 })
+} else {
+  await Bun.write(dir + "/tsx-generation-reached", "unexpected")
+}
+finishAgent()
+`,
+  )
+  await chmod(agent_path, 0o755)
+
+  const job_store = new JobStore()
+  job_store.createJob({ job_id: "job_no_consensus", job_dir, file_name: "device.pdf" })
+  await runJob({ job_id: "job_no_consensus" }, { job_store, agent_bin: agent_path, tsci_bin: "unused-tsci" })
+
+  const job = job_store.getJob("job_no_consensus")
+  expect(job?.display_status).toBe("unsupported")
+  expect(job?.validation?.evidence).toBe("unresolved")
+  expect(job?.error_message).toContain("did not reach consensus")
+  expect(job?.error_message).toContain("independent-1 versus independent-2")
+  expect(await Bun.file(join(job_dir, "tsx-generation-reached")).exists()).toBe(false)
 
   await rm(job_dir, { recursive: true, force: true })
 })
@@ -830,7 +1169,10 @@ import { mkdir } from "node:fs/promises"
 const target = Bun.argv.slice(2)[1]
 const stem = target.replace(/\\.circuit\\.tsx$/, "")
 await mkdir(process.cwd() + "/dist/" + stem, { recursive: true })
-const circuit = [{ type: "source_component", source_component_id: "part", name: "U1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"] }, { type: "schematic_component", schematic_component_id: "sch1", source_component_id: "part", center: { x: 0, y: 0 } }, { type: "schematic_port", schematic_port_id: "sp1", schematic_component_id: "sch1", source_port_id: "u1_vcc", side_of_component: "top", center: { x: 0, y: 1 } }, { type: "pcb_smtpad", port_hints: ["1"], x: 0, y: 0, width: 0.6, height: 0.25 }]
+const renderPng = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="), (character) => character.charCodeAt(0))
+await Bun.write(process.cwd() + "/dist/" + stem + "/pcb.png", renderPng)
+await Bun.write(process.cwd() + "/dist/" + stem + "/schematic.png", renderPng)
+const circuit = [{ type: "source_component", source_component_id: "part", name: "U1", manufacturer_part_number: "SENSOR-1" }, { type: "source_port", source_port_id: "u1_vcc", source_component_id: "part", name: "VCC", pin_number: 1, port_hints: ["1", "VCC"], requires_power: true }, { type: "schematic_component", schematic_component_id: "sch1", source_component_id: "part", center: { x: 0, y: 0 } }, { type: "schematic_port", schematic_port_id: "sp1", schematic_component_id: "sch1", source_port_id: "u1_vcc", side_of_component: "top", center: { x: 0, y: 1 } }, { type: "pcb_smtpad", port_hints: ["1"], x: 0, y: 0, width: 0.6, height: 0.25 }]
 await Bun.write(process.cwd() + "/dist/" + stem + "/circuit.json", JSON.stringify(circuit))
 `,
     ),

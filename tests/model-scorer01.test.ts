@@ -2,13 +2,39 @@ import { expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { writeModelScaffold } from "@/server/model-scaffold"
 import {
+  getBenchmarkRangeCoverageError,
   parseBenchmarkManifest,
   renderModelBenchmarkComparisonSvg,
   scoreModelBenchmarks,
   scoreSingleModelBenchmark,
 } from "@/server/model-scorer"
-import { writeModelScaffold } from "@/server/model-scaffold"
+
+test("benchmark range coverage rejects a missing terminal sample but tolerates floating-point noise", () => {
+  const reference_points = [
+    { x: 0, y: 0 },
+    { x: 5, y: 1 },
+  ]
+  expect(
+    getBenchmarkRangeCoverageError({
+      reference_points,
+      result_points: [
+        { x: 0, y: 0 },
+        { x: 4.99, y: 1 },
+      ],
+    }),
+  ).toBe("simulation ends at x=4.99 but the reference requires x=5")
+  expect(
+    getBenchmarkRangeCoverageError({
+      reference_points,
+      result_points: [
+        { x: Number.EPSILON, y: 0 },
+        { x: 5 - 1e-14, y: 1 },
+      ],
+    }),
+  ).toBeUndefined()
+})
 
 test("model scorer evaluates every locked benchmark from numeric CSV data", async () => {
   const model_dir = await mkdtemp(join(tmpdir(), "datasheet-model-scorer-"))

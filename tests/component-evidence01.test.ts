@@ -1,13 +1,14 @@
 import { expect, test } from "bun:test"
 import type { AnyCircuitElement } from "circuit-json"
 import {
+  type ComponentEvidence,
   createFootprintPlanFromEvidence,
   getComponentEvidenceBlockingReasons,
   getFootprintEvidenceErrors,
+  getIndependentComponentEvidenceAcceptedDifferences,
   getIndependentComponentEvidenceErrors,
   getPinoutEvidenceErrors,
   parseComponentEvidence,
-  type ComponentEvidence,
 } from "@/server/component-evidence"
 
 const visualSource = {
@@ -119,12 +120,12 @@ test("exact package codes allow independent human-readable package-name wording"
 })
 
 test("packaging-only ordering-code differences do not block otherwise identical evidence", () => {
-  expect(
-    getIndependentComponentEvidenceErrors(
-      evidence({ ordering_code: "GENERIC-2-A" }),
-      evidence({ ordering_code: "GENERIC-2-B" }),
-    ),
-  ).toEqual([])
+  const primary = evidence({ ordering_code: "GENERIC-2-A" })
+  const independent = evidence({ ordering_code: "GENERIC-2-B" })
+  expect(getIndependentComponentEvidenceErrors(primary, independent)).toEqual([])
+  expect(getIndependentComponentEvidenceAcceptedDifferences(primary, independent)).toEqual([
+    'ordering code differs by a non-material packaging option: "GENERIC-2-A" versus "GENERIC-2-B"; the primary ordering code is retained',
+  ])
 })
 
 test("part-number disagreement still blocks evidence approval", () => {
@@ -145,6 +146,17 @@ test("independent electrical-role disagreement blocks schematic planning", () =>
   )
 })
 
+test("independent open-drain disagreement blocks evidence approval", () => {
+  const primary = evidence()
+  const independent = evidence()
+  primary.pinout.pins[0]!.role = "output"
+  independent.pinout.pins[0]!.role = "output"
+  primary.pinout.pins[0]!.electrical_attributes = { open_drain: true }
+  expect(getIndependentComponentEvidenceErrors(primary, independent)).toContain(
+    "pin 1 open-drain behavior disagrees: true versus false",
+  )
+})
+
 test("passive and other are equivalent for documented switch-node pins", () => {
   const primary = evidence()
   const independent = evidence()
@@ -157,6 +169,11 @@ test("passive and other are equivalent for documented switch-node pins", () => {
 
 test("pin-table validation checks both physical number and semantic label", () => {
   const circuit = [
+    {
+      type: "source_component",
+      source_component_id: "u1",
+      manufacturer_part_number: "GENERIC-2-A",
+    },
     {
       type: "source_port",
       source_port_id: "p1",
@@ -172,6 +189,7 @@ test("pin-table validation checks both physical number and semantic label", () =
       pin_number: 2,
       name: "OUTPUT",
       port_hints: ["2", "OUTPUT"],
+      requires_ground: true,
     },
   ] as unknown as AnyCircuitElement[]
   expect(getPinoutEvidenceErrors(evidence(), circuit)).toEqual([
@@ -183,6 +201,11 @@ test("pin-table validation preserves every documented alias", () => {
   const aliased = evidence()
   aliased.pinout.pins[0]!.labels = ["INPUT", "ENABLE"]
   const circuit = [
+    {
+      type: "source_component",
+      source_component_id: "u1",
+      manufacturer_part_number: "GENERIC-2-A",
+    },
     {
       type: "source_port",
       source_port_id: "p1",
@@ -198,6 +221,7 @@ test("pin-table validation preserves every documented alias", () => {
       pin_number: 2,
       name: "RETURN",
       port_hints: ["2", "RETURN"],
+      requires_ground: true,
     },
   ] as unknown as AnyCircuitElement[]
 
@@ -206,8 +230,84 @@ test("pin-table validation preserves every documented alias", () => {
   )
 })
 
+test("pin-table validation enforces exact ordering code and electrical role attributes", () => {
+  const circuit = [
+    {
+      type: "source_component",
+      source_component_id: "u1",
+      manufacturer_part_number: "GENERIC-2",
+    },
+    {
+      type: "source_port",
+      source_port_id: "p1",
+      source_component_id: "u1",
+      pin_number: 1,
+      name: "INPUT",
+      port_hints: ["1", "INPUT"],
+      requires_power: true,
+    },
+    {
+      type: "source_port",
+      source_port_id: "p2",
+      source_component_id: "u1",
+      pin_number: 2,
+      name: "RETURN",
+      port_hints: ["2", "RETURN"],
+    },
+  ] as unknown as AnyCircuitElement[]
+
+  expect(getPinoutEvidenceErrors(evidence(), circuit)).toEqual([
+    "component manufacturer part number GENERIC-2; expected GENERIC-2-A",
+    "pin 1 role input requires requires_power=false, found true",
+    "pin 2 role ground requires requires_ground=true, found false",
+  ])
+})
+
+test("pin-table validation enforces explicit open-drain evidence", () => {
+  const open_drain_evidence = evidence()
+  open_drain_evidence.pinout.pins[0]!.role = "output"
+  open_drain_evidence.pinout.pins[0]!.electrical_attributes = { open_drain: true }
+  const circuit = [
+    {
+      type: "source_component",
+      source_component_id: "u1",
+      manufacturer_part_number: "GENERIC-2-A",
+    },
+    {
+      type: "source_port",
+      source_port_id: "p1",
+      source_component_id: "u1",
+      pin_number: 1,
+      name: "INPUT",
+      port_hints: ["1", "INPUT"],
+      can_use_open_drain: true,
+    },
+    {
+      type: "source_port",
+      source_port_id: "p2",
+      source_component_id: "u1",
+      pin_number: 2,
+      name: "RETURN",
+      port_hints: ["2", "RETURN"],
+      requires_ground: true,
+    },
+  ] as unknown as AnyCircuitElement[]
+
+  expect(getPinoutEvidenceErrors(open_drain_evidence, circuit)).toContain(
+    "pin 1 open-drain evidence requires is_using_open_drain=true, found false",
+  )
+})
+
 test("visual evidence must use the deterministic renderer settings", () => {
   const invalid = JSON.parse(JSON.stringify(evidence()))
   invalid.footprint.drawing_orientation.sources[0].render_dpi = 150
   expect(() => parseComponentEvidence(invalid)).toThrow("exactly 200 DPI")
+})
+
+test("open-drain evidence requires an output-capable pin role", () => {
+  const invalid = JSON.parse(JSON.stringify(evidence()))
+  invalid.pinout.pins[0].electrical_attributes = { open_drain: true }
+  expect(() => parseComponentEvidence(invalid)).toThrow(
+    "electrical_attributes.open_drain requires an output or bidirectional role",
+  )
 })
