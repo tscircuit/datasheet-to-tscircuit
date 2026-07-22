@@ -8,16 +8,16 @@ import {
   parseComponentEvidence,
 } from "../component-evidence"
 import { type FootprintPlan, validateAgentImageReads } from "../job-artifact-validator"
-import { TypicalApplicationPlan, parseTypicalApplicationPlan } from "./parse-typical-application-plan"
+import { buildAgentPrompt } from "./build-agent-prompt"
+import { parseTypicalApplicationPlan, type TypicalApplicationPlan } from "./parse-typical-application-plan"
+import { runStructuredAgentPhase } from "./run-structured-agent-phase"
 import {
   AutomatedConversionUnavailableError,
   JobCancelledError,
-  JobRunnerContext,
-  StreamProcessInput,
+  type JobRunnerContext,
+  type StreamProcessInput,
   throwIfCancelled,
 } from "./stream-job-process"
-import { runStructuredAgentPhase } from "./run-structured-agent-phase"
-import { buildAgentPrompt } from "./build-agent-prompt"
 
 export interface PrimaryEvidenceExtraction {
   component_evidence: ComponentEvidence
@@ -101,6 +101,7 @@ export async function extractPrimaryEvidenceAttempt(input: {
   await validateAgentImageReads({
     job_dir: input.job_dir,
     events,
+    allow_identical_copies: true,
     expected_images: [
       "visual-reference/land-pattern.png",
       ...(typical_application_plan.availability === "documented"

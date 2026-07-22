@@ -119,6 +119,15 @@ test("exact package codes allow independent human-readable package-name wording"
   ).toEqual([])
 })
 
+test("base package codes agree with their full pin-count drawing identifiers", () => {
+  const primary = evidence({ package_code: "DGS0002A" })
+  const independent = evidence({ package_code: "DGS" })
+  expect(getIndependentComponentEvidenceErrors(primary, independent)).toEqual([])
+  expect(getIndependentComponentEvidenceAcceptedDifferences(primary, independent)).toContain(
+    'package code differs only by base code versus full drawing identifier: "DGS0002A" versus "DGS"; the primary package code is retained',
+  )
+})
+
 test("packaging-only ordering-code differences do not block otherwise identical evidence", () => {
   const primary = evidence({ ordering_code: "GENERIC-2-A" })
   const independent = evidence({ ordering_code: "GENERIC-2-B" })

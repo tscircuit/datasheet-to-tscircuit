@@ -568,3 +568,58 @@ test("visual gate accepts honest inconclusive reports but rejects unsupported pa
 
   await rm(job_dir, { recursive: true, force: true })
 })
+
+test("evidence image inspection accepts a byte-identical canonical copy", async () => {
+  const job_dir = await mkdtemp(join(tmpdir(), "datasheet-evidence-image-alias-"))
+  const png = Uint8Array.from(
+    atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="),
+    (character) => character.charCodeAt(0),
+  )
+  const rendered_page = "visual-reference/pages/page-036.png"
+  const canonical_reference = "visual-reference/land-pattern.png"
+  await mkdir(join(job_dir, "visual-reference/pages"), { recursive: true })
+  await Promise.all([
+    Bun.write(join(job_dir, rendered_page), png),
+    Bun.write(join(job_dir, canonical_reference), png),
+  ])
+  const events: TrustedAgentEvent[] = [
+    {
+      protocol: AGENT_EVENT_PROTOCOL,
+      sequence: 1,
+      type: "tool_start",
+      tool_call_id: "read-rendered-page",
+      tool_name: "read",
+      args: { path: rendered_page },
+    },
+    {
+      protocol: AGENT_EVENT_PROTOCOL,
+      sequence: 2,
+      type: "tool_end",
+      tool_call_id: "read-rendered-page",
+      tool_name: "read",
+      is_error: false,
+      result_has_image: true,
+    },
+  ]
+
+  await expect(
+    validateAgentImageReads({
+      job_dir,
+      events,
+      expected_images: [canonical_reference],
+      allow_identical_copies: true,
+    }),
+  ).resolves.toBeUndefined()
+
+  await Bun.write(join(job_dir, canonical_reference), Uint8Array.from([...png, 0]))
+  await expect(
+    validateAgentImageReads({
+      job_dir,
+      events,
+      expected_images: [canonical_reference],
+      allow_identical_copies: true,
+    }),
+  ).rejects.toThrow("was not successfully inspected as pixels")
+
+  await rm(job_dir, { recursive: true, force: true })
+})
