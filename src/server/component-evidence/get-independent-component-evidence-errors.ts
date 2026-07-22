@@ -1,22 +1,48 @@
 import { getPadAgreementErrors, normalizePin, normalizeText } from "./get-pad-agreement-errors"
 import type { ComponentEvidence } from "./types"
 
+function packageCodesAgree(left: string, right: string, pin_count: number): boolean {
+  const normalized_left = normalizeText(left)
+  const normalized_right = normalizeText(right)
+  if (normalized_left === normalized_right) return true
+
+  const drawingSuffix = new RegExp(`^0*${pin_count}[a-z]?$`)
+  const isBaseAndDrawing = (base: string, drawing: string): boolean =>
+    drawing.startsWith(base) && drawingSuffix.test(drawing.slice(base.length))
+  return (
+    isBaseAndDrawing(normalized_left, normalized_right) || isBaseAndDrawing(normalized_right, normalized_left)
+  )
+}
+
 export function getIndependentComponentEvidenceAcceptedDifferences(
   primary: ComponentEvidence,
   independent: ComponentEvidence,
 ): string[] {
+  const differences: string[] = []
   const primary_ordering_code = primary.ordering_code?.value
   const independent_ordering_code = independent.ordering_code?.value
   if (
-    !primary_ordering_code ||
-    !independent_ordering_code ||
-    normalizeText(primary_ordering_code) === normalizeText(independent_ordering_code)
+    primary_ordering_code &&
+    independent_ordering_code &&
+    normalizeText(primary_ordering_code) !== normalizeText(independent_ordering_code)
   ) {
-    return []
+    differences.push(
+      `ordering code differs by a non-material packaging option: ${JSON.stringify(primary_ordering_code)} versus ${JSON.stringify(independent_ordering_code)}; the primary ordering code is retained`,
+    )
   }
-  return [
-    `ordering code differs by a non-material packaging option: ${JSON.stringify(primary_ordering_code)} versus ${JSON.stringify(independent_ordering_code)}; the primary ordering code is retained`,
-  ]
+  const primary_package_code = primary.package.code?.value
+  const independent_package_code = independent.package.code?.value
+  if (
+    primary_package_code &&
+    independent_package_code &&
+    normalizeText(primary_package_code) !== normalizeText(independent_package_code) &&
+    packageCodesAgree(primary_package_code, independent_package_code, primary.package.pin_count.value)
+  ) {
+    differences.push(
+      `package code differs only by base code versus full drawing identifier: ${JSON.stringify(primary_package_code)} versus ${JSON.stringify(independent_package_code)}; the primary package code is retained`,
+    )
+  }
+  return differences
 }
 
 export function getIndependentComponentEvidenceErrors(
@@ -39,7 +65,7 @@ export function getIndependentComponentEvidenceErrors(
     if (
       !primary_package_code ||
       !independent_package_code ||
-      normalizeText(primary_package_code) !== normalizeText(independent_package_code)
+      !packageCodesAgree(primary_package_code, independent_package_code, primary.package.pin_count.value)
     ) {
       errors.push(
         `package code disagrees: ${JSON.stringify(primary_package_code ?? "missing")} versus ${JSON.stringify(independent_package_code ?? "missing")}`,

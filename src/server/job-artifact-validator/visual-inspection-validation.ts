@@ -200,25 +200,42 @@ export async function validateAgentImageReads(input: {
   events: TrustedAgentEvent[]
   expected_images: string[]
   after_sequence?: number
+  allow_identical_copies?: boolean
 }): Promise<void> {
   const vision_failure = hasVisionFailure(input.events)
   if (vision_failure) {
     throw new VisualInspectionInconclusiveError(`Image inspection was unavailable: ${vision_failure}`)
   }
-  const image_reads = new Set(
-    getSuccessfulImageReadPaths({
-      job_dir: input.job_dir,
-      events: input.events,
-      after_sequence: input.after_sequence,
-    }),
-  )
+  const image_read_paths = getSuccessfulImageReadPaths({
+    job_dir: input.job_dir,
+    events: input.events,
+    after_sequence: input.after_sequence,
+  })
+  const image_reads = new Set(image_read_paths)
   for (const expected_path of input.expected_images) {
     const absolute_expected = resolveInsideJob(input.job_dir, expected_path)
     if (!absolute_expected) {
       throw new Error(`Visual inspection image path escapes the job directory: ${expected_path}`)
     }
     await validatePng(absolute_expected)
-    if (!image_reads.has(absolute_expected)) {
+    if (image_reads.has(absolute_expected)) continue
+
+    if (!input.allow_identical_copies) {
+      throw new VisualInspectionInconclusiveError(`${expected_path} was not successfully inspected as pixels`)
+    }
+
+    const expected_bytes = await readFile(absolute_expected)
+    let inspected_identical_copy = false
+    for (const read_path of image_read_paths) {
+      const candidate_path = resolveInsideJob(input.job_dir, read_path)
+      if (!candidate_path) continue
+      const candidate_bytes = await readFile(candidate_path).catch(() => undefined)
+      if (candidate_bytes?.equals(expected_bytes)) {
+        inspected_identical_copy = true
+        break
+      }
+    }
+    if (!inspected_identical_copy) {
       throw new VisualInspectionInconclusiveError(`${expected_path} was not successfully inspected as pixels`)
     }
   }

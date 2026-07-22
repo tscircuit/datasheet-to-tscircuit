@@ -7,10 +7,10 @@ import {
   parseComponentEvidence,
 } from "../component-evidence"
 import { type FootprintPlan, validateAgentImageReads } from "../job-artifact-validator"
-import { JobRunnerContext, StreamProcessInput } from "./stream-job-process"
-import { TypicalApplicationPlan, parseTypicalApplicationPlan } from "./parse-typical-application-plan"
-import { runStructuredAgentPhase } from "./run-structured-agent-phase"
 import { buildTypicalApplicationEvidenceVerificationPrompt } from "./build-typical-application-evidence-verification-prompt"
+import { parseTypicalApplicationPlan, type TypicalApplicationPlan } from "./parse-typical-application-plan"
+import { runStructuredAgentPhase } from "./run-structured-agent-phase"
+import type { JobRunnerContext, StreamProcessInput } from "./stream-job-process"
 
 export async function retainEvidenceAttemptArtifacts(input: {
   source_dir: string
@@ -104,6 +104,7 @@ export async function extractIndependentComponentEvidence(input: {
     await validateAgentImageReads({
       job_dir: verification_dir,
       events,
+      allow_identical_copies: true,
       expected_images: [
         "visual-reference/land-pattern.png",
         ...(application_plan.availability === "documented"
