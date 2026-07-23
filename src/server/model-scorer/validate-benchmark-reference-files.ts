@@ -4,7 +4,7 @@ import { readCsvPoints, transform } from "./score-single-model-benchmark"
 export async function validateBenchmarkReferenceFiles(
   model_dir: string,
   manifest: BenchmarkManifest,
-): Promise<void> {
+): Promise<string[]> {
   const validated_series = await Promise.all(
     manifest.benchmarks.flatMap((benchmark) =>
       benchmark.series.map(async (series) => {
@@ -25,6 +25,7 @@ export async function validateBenchmarkReferenceFiles(
     ),
   )
   const response_curves = new Map<string, string>()
+  const warnings: string[] = []
   for (const { benchmark, series, points } of validated_series) {
     if (series.role !== "response") continue
     const signature = JSON.stringify({
@@ -35,10 +36,11 @@ export async function validateBenchmarkReferenceFiles(
     const previous = response_curves.get(signature)
     const current = `${benchmark.id}/${series.id}`
     if (previous && !previous.startsWith(`${benchmark.id}/`)) {
-      throw new Error(
+      warnings.push(
         `Response reference ${current} is an exact duplicate of ${previous}; independently digitize each datasheet figure instead of reusing one graph's channel for another`,
       )
     }
     response_curves.set(signature, current)
   }
+  return warnings
 }

@@ -46,6 +46,7 @@ export type ModelRunUpdate = Partial<
     | "is_complete"
     | "has_errors"
     | "error_message"
+    | "warnings"
     | "completed_at"
     | "iteration"
     | "model_source"
@@ -97,6 +98,7 @@ function getPublicModelRun(record: ModelRunRecord): ModelRun {
     is_complete: record.is_complete,
     has_errors: record.has_errors,
     error_message: record.error_message,
+    warnings: [...(record.warnings ?? [])],
     effort_multiplier: record.effort_multiplier,
     base_effort_ms: record.base_effort_ms,
     allocated_time_ms: record.allocated_time_ms,
@@ -132,6 +134,7 @@ export class ModelRunStore {
       status: "queued",
       is_complete: false,
       has_errors: false,
+      warnings: [],
       effort_multiplier: input.effort_multiplier,
       base_effort_ms: input.base_effort_ms,
       allocated_time_ms: input.base_effort_ms * input.effort_multiplier,
@@ -170,6 +173,7 @@ export class ModelRunStore {
       error_message: was_active
         ? "The server restarted while this model run was active. Retry to continue from its checkpoints."
         : input.model_run.error_message,
+      warnings: input.model_run.warnings ?? [],
       completed_at: was_active ? new Date().toISOString() : input.model_run.completed_at,
       elapsed_time_ms: Math.min(
         input.model_run.allocated_time_ms,

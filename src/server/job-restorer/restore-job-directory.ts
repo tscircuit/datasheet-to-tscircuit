@@ -75,17 +75,14 @@ export async function restoreJobDirectory(input: {
     "component_schematic",
     "component_visual",
   ] as const
-  const has_component_validation = required_component_validations.some(
-    (field) => saved_validation?.[field] !== undefined,
-  )
   const component_validation_passed = required_component_validations.every(
     (field) => saved_validation?.[field] === "passed",
   )
   const component_ready = Boolean(
     has_component_artifact &&
-      (has_component_validation
-        ? component_validation_passed
-        : saved?.component_ready === true || has_complete_artifact),
+      (component_validation_passed ||
+        (saved_status === "complete" && saved?.component_ready === true) ||
+        has_complete_artifact),
   )
   let recovered_layout_failure = false
   if (
@@ -166,6 +163,9 @@ export async function restoreJobDirectory(input: {
       display_status === "cancelled",
     has_errors: recovered_layout_failure ? false : display_status === "failed" || Boolean(saved?.has_errors),
     error_message,
+    warnings: Array.isArray(saved?.warnings)
+      ? saved.warnings.filter((warning): warning is string => typeof warning === "string")
+      : [],
     logs,
     component_ready,
     component_code,

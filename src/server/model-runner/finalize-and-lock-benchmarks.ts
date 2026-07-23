@@ -93,10 +93,21 @@ export async function finalizeAndLockBenchmarks(input: {
         if (await requiresCompleteTimeGraphInventory(input.model_dir)) {
           await validateFinalizedBenchmarksMatchDraft(input.model_dir)
         }
-        await validateBenchmarkSuiteForLock(input.model_dir, {
+        const reference_warnings = await validateBenchmarkSuiteForLock(input.model_dir, {
           require_source_images:
             !input.repair_lock && (await hasBenchmarkReferenceImageContract(input.model_dir)),
         })
+        if (reference_warnings.length > 0) {
+          const current_warnings =
+            input.context.model_run_store.getModelRun(input.model_run_id)?.warnings ?? []
+          const merged_warnings = [...new Set([...current_warnings, ...reference_warnings])]
+          input.context.model_run_store.updateModelRun(input.model_run_id, {
+            warnings: merged_warnings,
+          })
+          for (const warning of reference_warnings) {
+            await input.append("system", `Warning: ${warning}\n`)
+          }
+        }
         await validateBenchmarkSources({
           job_dir: input.job_dir,
           model_dir: input.model_dir,

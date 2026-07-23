@@ -379,7 +379,7 @@ export default () => <board>
   expect(() => assertBenchmarkSourceContract(sensed_probe, benchmark)).not.toThrow()
 })
 
-test("benchmark locks reject copied response digitization across different figures", async () => {
+test("benchmark locks warn about copied response digitization without withholding output", async () => {
   const job_dir = await mkdtemp(join(tmpdir(), "datasheet-benchmark-duplicate-response-"))
   const model_dir = join(job_dir, "spice")
   await Promise.all([
@@ -416,8 +416,8 @@ test("benchmark locks reject copied response digitization across different figur
     ),
   ])
 
-  await expect(validateBenchmarkSuiteForLock(model_dir)).rejects.toThrow(
-    "independently digitize each datasheet figure",
-  )
+  const warnings = await validateBenchmarkSuiteForLock(model_dir)
+  expect(warnings).toHaveLength(1)
+  expect(warnings[0]).toContain("independently digitize each datasheet figure")
   await rm(job_dir, { recursive: true, force: true })
 })

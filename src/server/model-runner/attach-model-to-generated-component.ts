@@ -47,28 +47,26 @@ export async function writeServerIntegratedComponent(input: {
   )
   await Bun.write(
     join(input.model_dir, "component-with-model.circuit.tsx"),
-    `import type { ComponentProps } from "react"
+    `import { cloneElement, type ComponentProps, type ReactElement, type ReactNode } from "react"
 import Component from "./component.circuit"
 
 const modelSource = ${JSON.stringify(input.model_source)}
-const ModelComponent = Component as import("react").ComponentType<
-  ComponentWithModelProps & { spiceModel: import("react").ReactNode }
->
-
 export type ComponentWithModelProps = ComponentProps<typeof Component>
+type ModelElementProps = ComponentWithModelProps & { name?: string; spiceModel?: ReactNode }
+const renderComponent = Component as unknown as (
+  props: ComponentWithModelProps,
+) => ReactElement<ModelElementProps>
 
 export default function ComponentWithModel(props: ComponentWithModelProps) {
-  return (
-    <ModelComponent
-      {...props}
-      spiceModel={
-        <spicemodel
-          source={modelSource}
-          spicePinMapping={${JSON.stringify(spice_pin_mapping, null, 2)}}
-        />
-      }
-    />
-  )
+  return cloneElement(renderComponent(props), {
+    ...props,
+    spiceModel: (
+      <spicemodel
+        source={modelSource}
+        spicePinMapping={${JSON.stringify(spice_pin_mapping, null, 2)}}
+      />
+    ),
+  })
 }
 `,
   )

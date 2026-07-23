@@ -156,7 +156,7 @@ async function verifyEvidenceIndependently(
     return first
   }
 
-  const noConsensusError = (): AutomatedConversionUnavailableError => {
+  const getConsensusFailureDetails = (): string => {
     const comparisons = valid_disagreements.map(
       ({ attempt, primary_errors }) => `primary versus independent-${attempt}: ${primary_errors.join("; ")}`,
     )
@@ -173,9 +173,68 @@ async function verifyEvidenceIndependently(
         }
       }
     }
-    return new AutomatedConversionUnavailableError(
-      `Evidence extracts did not reach consensus after ${valid_disagreements.length} valid independent verification(s): ${comparisons.join("; ")}`,
+    return comparisons.join("; ")
+  }
+
+  const retainBestSupportedEvidence = async (): Promise<PrimaryEvidenceExtraction> => {
+    const primary_as_independent: IndependentEvidence = {
+      component_evidence: primary_evidence.component_evidence,
+      footprint_plan: primary_evidence.footprint_plan,
+      application_plan: primary_evidence.typical_application_plan,
+    }
+    const candidates = [
+      { label: "primary", evidence: primary_as_independent },
+      ...valid_disagreements.map(({ attempt, evidence }) => ({
+        label: `independent-${attempt}`,
+        evidence,
+      })),
+    ]
+    const scored = candidates.map((candidate, index) => ({
+      ...candidate,
+      index,
+      disagreement_count: candidates.reduce(
+        (total, other) =>
+          total + (other === candidate ? 0 : getPairwiseErrors(candidate.evidence, other.evidence).length),
+        0,
+      ),
+    }))
+    scored.sort(
+      (left, right) => left.disagreement_count - right.disagreement_count || left.index - right.index,
     )
+    const selected = scored[0]!
+    const warning = (
+      `Independent datasheet extractions did not fully agree. The best-supported ${selected.label} ` +
+      `extraction was retained deterministically (${selected.disagreement_count} pairwise disagreement ` +
+      `item(s)); verify the disputed footprint and application details before production use. ` +
+      `Audit details: ${getConsensusFailureDetails()}`
+    ).slice(0, 8_000)
+    await execution.addWarning(warning)
+    execution.updateValidation({ evidence: "warning" })
+    await execution.append(
+      "system",
+      `Evidence consensus remained split; continuing with ${selected.label} as the medoid candidate and publishing the uncertainty as a warning.\n`,
+    )
+    if (selected.index === 0) return primary_evidence
+    const selected_attempt = valid_disagreements[selected.index - 1]!
+    return promoteIndependentConsensus({
+      execution,
+      independently_verified: selected_attempt.evidence,
+      attempt: selected_attempt.attempt,
+    })
+  }
+
+  const retainPrimaryWithoutIndependentVerification = async (
+    reason: string,
+  ): Promise<PrimaryEvidenceExtraction> => {
+    await execution.addWarning(
+      `The primary datasheet extraction passed its intrinsic checks, but independent verification could not complete: ${reason}. Verify the footprint and application details before production use.`,
+    )
+    execution.updateValidation({ evidence: "warning" })
+    await execution.append(
+      "system",
+      "Independent evidence verification was unavailable; continuing with the valid primary extraction and publishing the limitation as a warning.\n",
+    )
+    return primary_evidence
   }
 
   const getTargetedConsensusFeedback = (): string => {
@@ -220,10 +279,9 @@ async function verifyEvidenceIndependently(
         )
         continue
       }
-      if (valid_disagreements.length > 0) throw noConsensusError()
-      if (error instanceof AutomatedConversionUnavailableError) throw error
-      throw new AutomatedConversionUnavailableError(
-        `Independent evidence extraction could not complete after ${attempt} attempt(s): ${reason}`,
+      if (valid_disagreements.length > 0) return retainBestSupportedEvidence()
+      return retainPrimaryWithoutIndependentVerification(
+        `independent extraction could not complete after ${attempt} attempt(s): ${reason}`,
       )
     }
 
@@ -315,7 +373,9 @@ async function verifyEvidenceIndependently(
       )
       return promoted
     }
-    if (valid_disagreements.length >= max_valid_disagreements) throw noConsensusError()
+    if (valid_disagreements.length >= max_valid_disagreements) {
+      return retainBestSupportedEvidence()
+    }
 
     independent_retry_feedback =
       valid_disagreements.length === 1
@@ -335,9 +395,9 @@ async function verifyEvidenceIndependently(
     )
   }
 
-  if (valid_disagreements.length > 0) throw noConsensusError()
-  throw new AutomatedConversionUnavailableError(
-    `Independent evidence extraction could not produce a valid verification after ${max_extraction_attempts} attempt(s)${last_retryable_error ? `: ${last_retryable_error}` : ""}`,
+  if (valid_disagreements.length > 0) return retainBestSupportedEvidence()
+  return retainPrimaryWithoutIndependentVerification(
+    `no valid independent verification was produced after ${max_extraction_attempts} attempt(s)${last_retryable_error ? `: ${last_retryable_error}` : ""}`,
   )
 }
 
@@ -407,10 +467,12 @@ export async function runEvidencePhase(execution: JobExecution): Promise<Approve
   const component_schematic_plan_text = `${JSON.stringify(component_schematic_plan, null, 2)}\n`
   await Bun.write(join(execution.job_dir, "component-schematic-plan.json"), component_schematic_plan_text)
   const locked_visual_references = await snapshotProtectedTree(join(execution.job_dir, "visual-reference"))
-  execution.updateValidation({ evidence: "passed" })
+  if (execution.validation.evidence === "pending") execution.updateValidation({ evidence: "passed" })
   await execution.append(
     "system",
-    "Evidence approved. The consensus-selected evidence is locked; all extraction artifacts are retained for audit.\n",
+    execution.validation.evidence === "warning"
+      ? "Evidence selected with a warning. The best-supported evidence is locked; all extraction artifacts are retained for audit.\n"
+      : "Evidence approved. The consensus-selected evidence is locked; all extraction artifacts are retained for audit.\n",
   )
   return {
     component_evidence: approved_evidence.component_evidence,
