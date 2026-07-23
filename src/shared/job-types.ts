@@ -21,6 +21,7 @@ export interface JobLog {
 export type JobValidationStatus =
   | "pending"
   | "passed"
+  | "warning"
   | "failed"
   | "inconclusive"
   | "unresolved"
@@ -61,6 +62,7 @@ export interface Job {
   is_complete: boolean
   has_errors: boolean
   error_message?: string
+  warnings?: string[]
   logs: JobLog[]
   component_ready?: boolean
   component_code?: string
@@ -83,6 +85,7 @@ export type JobSummary = Pick<
   | "is_complete"
   | "has_errors"
   | "error_message"
+  | "warnings"
 >
 
 export type JobEvent =
@@ -294,6 +297,7 @@ export interface ModelRun {
   is_complete: boolean
   has_errors: boolean
   error_message?: string
+  warnings?: string[]
   effort_multiplier: number
   base_effort_ms: number
   allocated_time_ms: number

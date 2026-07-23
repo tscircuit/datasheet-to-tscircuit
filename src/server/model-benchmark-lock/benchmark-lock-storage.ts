@@ -29,6 +29,7 @@ export async function readCurrentLock(
 ): Promise<{
   benchmark_ids: string[]
   files: LockedFileContent[]
+  warnings: string[]
 }> {
   const manifest_text = await readFile(join(model_dir, "benchmarks.json"), "utf8")
   const manifest_value: unknown = JSON.parse(manifest_text)
@@ -46,7 +47,7 @@ export async function readCurrentLock(
     }
     if (record.source_image) assertEvidenceFile(model_dir, record.source_image)
   }
-  await validateBenchmarkReferenceFiles(model_dir, manifest)
+  const warnings = await validateBenchmarkReferenceFiles(model_dir, manifest)
   await validateSimulationDefinitions(
     model_dir,
     records.map((record) => record.id),
@@ -94,7 +95,7 @@ export async function readCurrentLock(
       }
     }
   }
-  return { benchmark_ids: records.map((record) => record.id).sort(), files }
+  return { benchmark_ids: records.map((record) => record.id).sort(), files, warnings }
 }
 
 export async function writeTextAtomically(file_path: string, text: string): Promise<void> {

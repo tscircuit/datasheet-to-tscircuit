@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test"
 import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, relative } from "node:path"
 import { getTypicalApplicationConnectivityErrors } from "@/server/job-artifact-validator"
 import { JobStore } from "@/server/job-store"
 import { ModelRunStore } from "@/server/model-run-store"
+import { writeServerIntegratedComponent } from "@/server/model-runner/attach-model-to-generated-component"
 import {
   classifyFatalSimulationFailure,
   compareTimeShiftedResults,
@@ -886,6 +887,70 @@ test("model manifests must select the first SUBCKT with exact pin names", () => 
   )
 })
 
+test("server model wrapper overrides hardcoded component names for DUT selectors", async () => {
+  const tmp_root = join(process.cwd(), "tmp")
+  await mkdir(tmp_root, { recursive: true })
+  const model_dir = await mkdtemp(join(tmp_root, "datasheet-model-wrapper-props-"))
+  const output_dir = join(process.cwd(), "dist", relative(process.cwd(), model_dir))
+  try {
+    await Bun.write(
+      join(model_dir, "component.circuit.tsx"),
+      'export default function Component() { return <chip name="U1" footprint="soic8" /> }\n',
+    )
+    await writeServerIntegratedComponent({
+      model_dir,
+      model_source: ".SUBCKT PART IN OUT\nR1 IN OUT 1G\n.ENDS PART\n",
+      manifest: {
+        version: 1,
+        part_number: "PART",
+        dialect: "portable",
+        entry_name: "PART",
+        model_file: "model.lib",
+        revision: "r0001",
+        simulator: "ngspice",
+        generated_at: new Date().toISOString(),
+        pins: [
+          { component_pin: "pin1", spice_node: "IN" },
+          { component_pin: "pin2", spice_node: "OUT" },
+        ],
+      },
+    })
+    const wrapper = await Bun.file(join(model_dir, "component-with-model.circuit.tsx")).text()
+    expect(wrapper).toContain("cloneElement(renderComponent(props)")
+    expect(wrapper).toContain("...props")
+    expect(wrapper).not.toContain("<ModelComponent")
+    await Bun.write(
+      join(model_dir, "index.circuit.tsx"),
+      'import Component from "./component-with-model.circuit"\nexport default () => <Component name="DUT" />\n',
+    )
+    const build = Bun.spawn(
+      [
+        join(process.cwd(), "node_modules", ".bin", "tsci"),
+        "build",
+        "index.circuit.tsx",
+        "--ignore-warnings",
+      ],
+      { cwd: model_dir, stdout: "pipe", stderr: "pipe" },
+    )
+    const [exit_code, stderr] = await Promise.all([build.exited, new Response(build.stderr).text()])
+    expect(exit_code, stderr).toBe(0)
+    const circuit = (await Bun.file(join(output_dir, "index", "circuit.json")).json()) as Array<
+      Record<string, unknown>
+    >
+    expect(circuit.some((element) => element.type === "source_component" && element.name === "DUT")).toBe(
+      true,
+    )
+    expect(circuit.some((element) => element.type === "source_component" && element.name === "U1")).toBe(
+      false,
+    )
+  } finally {
+    await Promise.all([
+      rm(model_dir, { recursive: true, force: true }),
+      rm(output_dir, { recursive: true, force: true }),
+    ])
+  }
+})
+
 test("benchmark finalization cannot create model artifacts before the server lock", async () => {
   const job_dir = await mkdtemp(join(tmpdir(), "datasheet-model-prelock-"))
   const model_dir = join(job_dir, "spice")
@@ -930,9 +995,10 @@ await Bun.write(dir + "/model.lib", ".subckt TOO_EARLY IN OUT\\nR1 IN OUT 1k\\n.
   )
 
   const run = model_run_store.getModelRun("model_prelock")
-  expect(run?.status).toBe("failed")
+  expect(run?.status).toBe("complete")
   expect(run?.elapsed_time_ms).toBe(0)
-  expect(run?.error_message).toContain("forbidden model artifacts")
+  expect(run?.error_message).toBeUndefined()
+  expect(run?.warnings?.join("\n")).toContain("forbidden model artifacts")
   expect(await Bun.file(join(job_dir, ".model-benchmark-lock", "lock.json")).exists()).toBe(false)
   await rm(job_dir, { recursive: true, force: true })
 })
@@ -982,12 +1048,12 @@ process.exit(8)
 
   const context = { job_store, model_run_store, agent_bin: agent_path, tsci_bin: tsci_path }
   await runModel({ model_run_id: "model_benchmark_retry" }, context)
-  expect(model_run_store.getModelRun("model_benchmark_retry")?.error_message).toContain("code 7")
-  expect(model_run_store.retryModelRun("model_benchmark_retry")).toBe("retried")
+  expect(model_run_store.getModelRun("model_benchmark_retry")?.warnings?.join("\n")).toContain("code 7")
+  expect(model_run_store.extendModelRun("model_benchmark_retry", 1).should_start).toBe(true)
   await runModel({ model_run_id: "model_benchmark_retry" }, context)
 
   expect(await Bun.file(join(job_dir, "benchmark-attempt.txt")).text()).toBe("2")
-  expect(model_run_store.getModelRun("model_benchmark_retry")?.error_message).toContain("code 8")
+  expect(model_run_store.getModelRun("model_benchmark_retry")?.warnings?.join("\n")).toContain("code 8")
   expect(await Bun.file(join(job_dir, ".model-benchmark-lock", "lock.json")).exists()).toBe(false)
   await rm(job_dir, { recursive: true, force: true })
 })
@@ -1698,12 +1764,13 @@ await Bun.sleep(30_000)
   )
 
   const recovered_run = model_run_store.getModelRun("model_recovery")
-  expect(recovered_run?.status).toBe("timed_out")
+  expect(recovered_run?.status).toBe("complete")
   expect(recovered_run?.model_source).toContain(".subckt RECOVERED")
   expect(await Bun.file(join(model_dir, "model.lib")).text()).toContain(".subckt RECOVERED")
   expect(recovered_run?.elapsed_time_ms).toBeGreaterThanOrEqual(900)
   expect(recovered_run?.elapsed_time_ms).toBeLessThan(1_250)
-  expect(recovered_run?.error_message).toContain("every benchmark could be verified")
+  expect(recovered_run?.error_message).toBeUndefined()
+  expect(recovered_run?.warnings?.join("\n")).toContain("every benchmark could be verified")
 
   await rm(job_dir, { recursive: true, force: true })
 }, 10_000)

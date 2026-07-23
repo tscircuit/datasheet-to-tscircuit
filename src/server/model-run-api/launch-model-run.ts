@@ -1,5 +1,7 @@
 import { join } from "node:path"
 import { runModel } from "../model-runner"
+import { handleModelExecutionError } from "../model-runner/handle-model-execution-error"
+import { ModelExecution } from "../model-runner/model-execution"
 import { ModelRunApiContext } from "./model-run-api-context"
 import { createModelRun } from "./create-model-run"
 import { getModelRun } from "./get-model-run"
@@ -27,6 +29,24 @@ export async function launchModelRun(
     message: `Created a ${input.effort_multiplier}× SPICE behavioral-model run validated with ngspice. Evidence setup, component waiting, and benchmark locking are untimed; effort applies only to refinement.\n`,
   })
   const runner = context.run_model ?? runModel
-  void runner({ model_run_id }, context)
+  const recoverUnexpectedFailure = async (error: unknown) => {
+    const model_run = context.model_run_store.getModelRun(model_run_id)
+    const cancellation_signal = context.model_run_store.getCancellationSignal(model_run_id)
+    if (!model_run || !cancellation_signal || model_run.is_complete) return
+    const execution = new ModelExecution({
+      model_run_id,
+      model_run,
+      job_dir: input.job_dir,
+      model_dir: join(input.job_dir, "spice"),
+      cancellation_signal,
+      context,
+    })
+    await handleModelExecutionError(error, execution).catch(() => undefined)
+  }
+  try {
+    void runner({ model_run_id }, context).catch(recoverUnexpectedFailure)
+  } catch (error) {
+    void recoverUnexpectedFailure(error)
+  }
   return context.model_run_store.getModelRun(model_run_id)!
 }

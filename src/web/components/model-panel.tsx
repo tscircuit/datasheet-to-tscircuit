@@ -35,6 +35,9 @@ const STATUS_COPY: Record<ModelRunStatus, string> = {
 }
 
 function getStatusCopy(model_run: ModelRun): string {
+  if (model_run.status === "complete" && (model_run.warnings?.length ?? 0) > 0) {
+    return "Available with warnings"
+  }
   if (model_run.status === "timed_out" && model_run.error_message?.toLowerCase().includes("no output")) {
     return "Timed out"
   }

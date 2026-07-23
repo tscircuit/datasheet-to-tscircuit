@@ -38,6 +38,7 @@ export interface RestoreJobInput extends CreateJobInput {
   is_complete: boolean
   has_errors: boolean
   error_message?: string
+  warnings: string[]
   logs: JobLog[]
   component_ready?: boolean
   component_code?: string
@@ -57,6 +58,7 @@ export type JobUpdate = Partial<
     | "is_complete"
     | "has_errors"
     | "error_message"
+    | "warnings"
     | "completed_at"
     | "component_ready"
     | "component_code"
@@ -80,6 +82,7 @@ function getPublicJob(job_record: JobRecord): Job {
     is_complete: job_record.is_complete,
     has_errors: job_record.has_errors,
     error_message: job_record.error_message,
+    warnings: [...(job_record.warnings ?? [])],
     logs: [...job_record.logs],
     component_ready: job_record.component_ready,
     component_code: job_record.component_code,
@@ -103,6 +106,7 @@ function getJobSummary(job_record: JobRecord): JobSummary {
     is_complete: job_record.is_complete,
     has_errors: job_record.has_errors,
     error_message: job_record.error_message,
+    warnings: [...(job_record.warnings ?? [])],
   }
 }
 
@@ -121,6 +125,7 @@ export class JobStore {
       display_status: "queued",
       is_complete: false,
       has_errors: false,
+      warnings: [],
       logs: [],
       cancellation_controller: new AbortController(),
       subscriber_set: new Set(),
@@ -272,6 +277,7 @@ export class JobStore {
           is_complete: job_record.is_complete,
           has_errors: job_record.has_errors,
           error_message: job_record.error_message,
+          warnings: job_record.warnings,
           additional_instructions: job_record.additional_instructions,
           retry_source_job_id: job_record.retry_source_job_id,
           component_ready: job_record.component_ready,
